@@ -88,12 +88,11 @@ typedef enum dt_iop_local_contrast_rgb_filter_t
 typedef struct dt_iop_local_contrast_rgb_params_t
 {
   // Local contrast scaling factor
-  float detail_scale;   // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.0 $DESCRIPTION: "detail boost"
+  float detail_scale;   // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.5 $DESCRIPTION: "detail boost"
 
   // Masking parameters
   float blending;       // $MIN: 0.01 $MAX: 100.0 $DEFAULT: 5.0 $DESCRIPTION: "smoothing diameter"
-  float feathering;     // $MIN: 0.01 $MAX: 10000.0 $DEFAULT: 1.0 $DESCRIPTION: "edges refinement/feathering"
-  float quantization;   // $MIN: 0.0 $MAX: 2.0 $DEFAULT: 0.0 $DESCRIPTION: "mask quantization"
+  float feathering;     // $MIN: 0.01 $MAX: 10000.0 $DEFAULT: 15.0 $DESCRIPTION: "edges refinement/feathering"
 
   dt_iop_local_contrast_rgb_filter_t details; // $DEFAULT: DT_LC_EIGF $DESCRIPTION: "preserve details"
   dt_iop_luminance_mask_method_t method;      // $DEFAULT: DT_TONEEQ_NORM_2 $DESCRIPTION: "luminance estimator"
@@ -104,7 +103,7 @@ typedef struct dt_iop_local_contrast_rgb_params_t
 typedef struct dt_iop_local_contrast_rgb_data_t
 {
   float detail_scale;
-  float blending, feathering, quantization;
+  float blending, feathering;
   float scale;
   int radius;
   int iterations;
@@ -146,7 +145,7 @@ typedef struct dt_iop_local_contrast_rgb_gui_data_t
 
   // GTK widgets
   GtkWidget *detail_scale;
-  GtkWidget *blending, *quantization;
+  GtkWidget *blending;
   GtkWidget *method;
   GtkWidget *details, *feathering, *iterations;
   GtkWidget *show_luminance_mask;
@@ -252,7 +251,7 @@ static inline void compute_smoothed_luminance_mask(const float *const restrict i
     case(DT_LC_AVG_GUIDED):
     {
       fast_surface_blur(luminance, width, height, d->radius, d->feathering, d->iterations,
-                        DT_GF_BLENDING_GEOMEAN, d->scale, d->quantization,
+                        DT_GF_BLENDING_GEOMEAN, d->scale, 0.0f,
                         exp2f(-14.0f), 4.0f);
       break;
     }
@@ -260,7 +259,7 @@ static inline void compute_smoothed_luminance_mask(const float *const restrict i
     case(DT_LC_GUIDED):
     {
       fast_surface_blur(luminance, width, height, d->radius, d->feathering, d->iterations,
-                        DT_GF_BLENDING_LINEAR, d->scale, d->quantization,
+                        DT_GF_BLENDING_LINEAR, d->scale, 0.0f,
                         exp2f(-14.0f), 4.0f);
       break;
     }
@@ -270,7 +269,7 @@ static inline void compute_smoothed_luminance_mask(const float *const restrict i
       fast_eigf_surface_blur(luminance, width, height,
                              d->radius, d->feathering, d->iterations,
                              DT_GF_BLENDING_GEOMEAN, d->scale,
-                             d->quantization, exp2f(-14.0f), 4.0f);
+                             0.0f, exp2f(-14.0f), 4.0f);
       break;
     }
 
@@ -279,7 +278,7 @@ static inline void compute_smoothed_luminance_mask(const float *const restrict i
       fast_eigf_surface_blur(luminance, width, height,
                              d->radius, d->feathering, d->iterations,
                              DT_GF_BLENDING_LINEAR, d->scale,
-                             d->quantization, exp2f(-14.0f), 4.0f);
+                             0.0f, exp2f(-14.0f), 4.0f);
       break;
     }
   }
@@ -608,7 +607,6 @@ void commit_params(dt_iop_module_t *self,
   d->method = p->method;
   d->details = p->details;
   d->iterations = p->iterations;
-  d->quantization = p->quantization;
   d->detail_scale = p->detail_scale;
 
   // UI blending param is set in % of the largest image dimension
@@ -671,7 +669,6 @@ static void show_guiding_controls(const dt_iop_module_t *self)
   gtk_widget_set_visible(g->blending, TRUE);
   gtk_widget_set_visible(g->feathering, TRUE);
   gtk_widget_set_visible(g->iterations, TRUE);
-  gtk_widget_set_visible(g->quantization, TRUE);
 }
 
 
@@ -696,7 +693,6 @@ void gui_changed(dt_iop_module_t *self,
      || w == g->blending
      || w == g->feathering
      || w == g->iterations
-     || w == g->quantization
      || w == g->details)
   {
     invalidate_luminance_cache(self);
@@ -785,7 +781,7 @@ void gui_init(dt_iop_module_t *self)
 
   // Detail boost slider
   g->detail_scale = dt_bauhaus_slider_from_params(self, "detail_scale");
-  dt_bauhaus_slider_set_soft_range(g->detail_scale, 0.5, 2.0);
+  dt_bauhaus_slider_set_soft_range(g->detail_scale, 0.25, 3.0);
   dt_bauhaus_slider_set_digits(g->detail_scale, 2);
   gtk_widget_set_tooltip_text
     (g->detail_scale,
@@ -838,13 +834,6 @@ void gui_init(dt_iop_module_t *self)
      _("edge sensitivity of the filter\n"
        "higher = better edge preservation\n"
        "lower = smoother transitions"));
-
-  g->quantization = dt_bauhaus_slider_from_params(self, "quantization");
-  dt_bauhaus_slider_set_format(g->quantization, _(" EV"));
-  gtk_widget_set_tooltip_text
-    (g->quantization,
-     _("posterize the luminance mask to help create piece-wise smooth regions\n"
-       "0 = disabled"));
 
   // Display mask toggle
   g->show_luminance_mask = dt_iop_togglebutton_new
