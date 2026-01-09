@@ -1,0 +1,7 @@
+.ci
+.github
+.vscode
+.cursorignore
+.gitignore
+.data
+.packaging

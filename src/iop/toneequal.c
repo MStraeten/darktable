@@ -789,14 +789,31 @@ static inline void apply_toneequalizer(const float *const restrict in,
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
   {
+
+    // compute per-pixel luminance using l2 rgb norm
+    // TODO: must calculate with exposure boost and contrast boost applied!
+    // How to handle this properly to still get the exposure difference without the boost?
+    // boost is only used to spread the histogram for the exposure correction factor calculation!
+    const float lum = sqrtf(in[4 * k + 0] * in[4 * k + 0]
+                          + in[4 * k + 1] * in[4 * k + 1]
+                          + in[4 * k + 2] * in[4 * k + 2]);
+
+    // Difference between pixel luminance and luminance mask
+    const float n_stops_exposure_difference = log2f(lum / luminance[k]);
+    
+
     // The radial-basis interpolation is valid in [-8; 0] EV and can quickly diverge outside.
     // Note: not doing an explicit lut[index] check is safe as long we take care of proper
     // DT_TONEEQ_MIN_EV and DT_TONEEQ_MAX_EV and allocated lut size LUT_RESOLUTION+1
     const float exposure = fast_clamp(log2f(luminance[k]), DT_TONEEQ_MIN_EV, DT_TONEEQ_MAX_EV);
-    const float correction = lut[(unsigned)roundf((exposure - DT_TONEEQ_MIN_EV) * lutres)];
+    const float correction_factor = lut[(unsigned)roundf((exposure - DT_TONEEQ_MIN_EV) * lutres)];
+
+    const float n_stops_desired_exposure_difference = correction_factor * n_stops_exposure_difference;
+    const float n_stops_correction = n_stops_desired_exposure_difference - n_stops_exposure_difference;
+
     // apply correction
     for_each_channel(c)
-      out[4 * k + c] = correction * in[4 * k + c];
+      out[4 * k + c] = in[4 * k + c] * exp2f(n_stops_correction);
   }
 }
 
