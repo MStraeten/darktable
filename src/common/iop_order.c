@@ -103,6 +103,7 @@ const dt_iop_order_entry_t legacy_order[] = {
   { {20.0f }, "flip", 0},
   { {20.5f }, "enlargecanvas", 0},
   { {21.0f }, "clipping", 0},
+  { {21.5f }, "local_contrast_rgb", 0},
   { {21.5f }, "toneequal", 0},
   { {21.7f }, "crop", 0},
   { {21.9f }, "overlay", 0},
@@ -207,6 +208,7 @@ const dt_iop_order_entry_t v30_order[] = {
   { {21.0f }, "exposure", 0},
   { {22.0f }, "mask_manager", 0},
   { {23.0f }, "tonemap", 0},
+  { {23.5f }, "local_contrast_rgb", 0},
   { {24.0f }, "toneequal", 0},       // last module that need enlarged
                                      // roi_in
   { {24.5f }, "crop", 0},            // should go after all modules
@@ -325,6 +327,7 @@ const dt_iop_order_entry_t v50_order[] = {
   { {21.0f }, "exposure", 0},
   { {22.0f }, "mask_manager", 0},
   { {23.0f }, "tonemap", 0},
+  { {23.5f }, "local_contrast_rgb", 0},
   { {24.0f }, "toneequal", 0},       // last module that need enlarged
                                      // roi_in
   { {24.5f }, "crop", 0},            // should go after all modules
@@ -445,6 +448,7 @@ const dt_iop_order_entry_t v30_jpg_order[] = {
   { { 28.0f }, "exposure", 0},
   { { 28.0f }, "mask_manager", 0},
   { { 28.0f }, "tonemap", 0},
+  { { 28.0f }, "local_contrast_rgb", 0},
   { { 28.0f }, "toneequal", 0},       // last module that need enlarged roi_in
   { { 28.0f }, "crop", 0},            // should go after all modules
                                       // that may need a wider roi_in
@@ -566,6 +570,7 @@ const dt_iop_order_entry_t v50_jpg_order[] = {
   { { 28.0f }, "exposure", 0},
   { { 28.0f }, "mask_manager", 0},
   { { 28.0f }, "tonemap", 0},
+  { { 28.0f }, "local_contrast_rgb", 0},
   { { 28.0f }, "toneequal", 0},       // last module that need enlarged roi_in
   { { 28.0f }, "crop", 0},            // should go after all modules
                                       // that may need a wider roi_in

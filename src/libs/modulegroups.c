@@ -1574,6 +1574,7 @@ void init_presets(dt_lib_module_t *self)
   AM("shadhi");
   AM("temperature");
   AM("toneequal");
+  AM("local_contrast_rgb");
 
   SMG(C_("modulegroup", "tone"), "tone");
   AM("agx");
