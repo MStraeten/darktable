@@ -92,7 +92,7 @@ typedef struct dt_iop_local_contrast_rgb_params_t
 
   // Masking parameters
   float blending;       // $MIN: 0.01 $MAX: 100.0 $DEFAULT: 5.0 $DESCRIPTION: "smoothing diameter"
-  float feathering;     // $MIN: 0.01 $MAX: 10000.0 $DEFAULT: 15.0 $DESCRIPTION: "edges refinement/feathering"
+  float feathering;     // $MIN: 0.01 $MAX: 10000.0 $DEFAULT: 5.0 $DESCRIPTION: "edges refinement/feathering"
 
   dt_iop_local_contrast_rgb_filter_t details; // $DEFAULT: DT_LC_EIGF $DESCRIPTION: "preserve details"
   dt_iop_luminance_mask_method_t method;      // $DEFAULT: DT_TONEEQ_NORM_2 $DESCRIPTION: "luminance estimator"
@@ -330,46 +330,38 @@ static inline void apply_local_contrast(const float *const restrict in,
 
 /**
  * Display the detail mask (difference between pixel and smoothed luminance)
+ * Output is a grayscale image normalized to [0, 1] where:
+ * - 0.5 = no local detail (pixel matches neighborhood)
+ * - < 0.5 = pixel darker than neighborhood
+ * - > 0.5 = pixel brighter than neighborhood
  **/
 __DT_CLONE_TARGETS__
-static inline void display_detail_mask(const float *const restrict in,
-                                       const float *const restrict luminance_pixel,
+static inline void display_detail_mask(const float *const restrict luminance_pixel,
                                        const float *const restrict luminance_smoothed,
                                        float *const restrict out,
-                                       const dt_iop_roi_t *const roi_in,
-                                       const dt_iop_roi_t *const roi_out)
+                                       const size_t width,
+                                       const size_t height)
 {
-  const size_t offset_x = (roi_in->x < roi_out->x) ? -roi_in->x + roi_out->x : 0;
-  const size_t offset_y = (roi_in->y < roi_out->y) ? -roi_in->y + roi_out->y : 0;
+  const size_t npixels = width * height;
 
-  const size_t in_width = roi_in->width;
-  const size_t out_width = (roi_in->width > roi_out->width) ? roi_out->width : roi_in->width;
-  const size_t out_height = (roi_in->height > roi_out->height) ? roi_out->height : roi_in->height;
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npixels; k++)
+  {
+    const float lum_pixel = fmaxf(luminance_pixel[k], MIN_FLOAT);
+    const float lum_smoothed = fmaxf(luminance_smoothed[k], MIN_FLOAT);
 
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < out_height; ++i)
-    for(size_t j = 0; j < out_width; ++j)
-    {
-      const size_t in_idx = (i + offset_y) * in_width + (j + offset_x);
-      const float lum_pixel = fmaxf(luminance_pixel[in_idx], MIN_FLOAT);
-      const float lum_smoothed = fmaxf(luminance_smoothed[in_idx], MIN_FLOAT);
+    // Detail in log space, mapped to [0, 1] for display
+    // Detail range roughly [-4, +4] EV mapped to [0, 1]
+    const float detail_ev = log2f(lum_pixel / lum_smoothed);
+    const float intensity = fminf(fmaxf(detail_ev / 8.0f + 0.5f, 0.0f), 1.0f);
 
-      // Detail in log space, mapped to [0, 1] for display
-      // Detail range roughly [-4, +4] EV mapped to [0, 1]
-      // 0.5 = no detail, < 0.5 = darker than neighborhood, > 0.5 = brighter
-      const float detail_ev = log2f(lum_pixel / lum_smoothed);
-      const float intensity = fminf(fmaxf(detail_ev / 8.0f + 0.5f, 0.0f), 1.0f);
-
-      const size_t out_idx = (i * out_width + j) * 4;
-
-      // Set gray level for the detail mask
-      for_each_channel(c, aligned(out))
-      {
-        out[out_idx + c] = intensity;
-      }
-      // Copy alpha channel
-      out[out_idx + 3] = in[((i + offset_y) * in_width + (j + offset_x)) * 4 + 3];
-    }
+    // Set all RGB channels to the same intensity (grayscale)
+    out[4 * k + 0] = intensity;
+    out[4 * k + 1] = intensity;
+    out[4 * k + 2] = intensity;
+    // Full opacity
+    out[4 * k + 3] = 1.0f;
+  }
 }
 
 
@@ -537,7 +529,7 @@ static void local_contrast_process(dt_iop_module_t *self,
   {
     if(g->mask_display)
     {
-      display_detail_mask(in, luminance_pixel, luminance_smoothed, out, roi_in, roi_out);
+      display_detail_mask(luminance_pixel, luminance_smoothed, out, width, height);
       piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
     }
     else
