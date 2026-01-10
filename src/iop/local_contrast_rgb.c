@@ -353,9 +353,9 @@ static inline void display_detail_mask(const float *const restrict luminance_pix
     const float lum_smoothed = fmaxf(luminance_smoothed[k], MIN_FLOAT);
 
     // Detail in log space, mapped to [0, 1] for display
-    // Detail range roughly [-4, +4] EV mapped to [0, 1]
+    // Detail range roughly [-2, +2] EV mapped to [0, 1]
     const float detail_ev = log2f(lum_pixel / lum_smoothed);
-    const float intensity = fminf(fmaxf(detail_ev / 8.0f + 0.5f, 0.0f), 1.0f);
+    const float intensity = fminf(fmaxf(detail_ev / 4.0f + 0.5f, 0.0f), 1.0f);
 
     // Set all RGB channels to the same intensity (grayscale)
     out[4 * k + 0] = intensity;
