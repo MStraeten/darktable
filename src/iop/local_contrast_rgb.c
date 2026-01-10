@@ -93,7 +93,8 @@ typedef struct dt_iop_local_contrast_rgb_params_t
   float detail_scale;   // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.5 $DESCRIPTION: "detail boost"
 
   // Masking parameters
-  float blending;       // $MIN: 0.01 $MAX: 100.0 $DEFAULT: 1.6 $DESCRIPTION: "smoothing diameter"
+  // Blending is log-encoded because changes in small values are more noticeable
+  float blending;       // $MIN: 0.01 $MAX: 100.0 $DEFAULT: 12.0 $DESCRIPTION: "smoothing diameter"
   float feathering;     // $MIN: 0.01 $MAX: 10000.0 $DEFAULT: 5.0 $DESCRIPTION: "edges refinement/feathering"
 
   dt_iop_local_contrast_rgb_filter_t details; // $DEFAULT: DT_LC_EIGF $DESCRIPTION: "preserve details"
@@ -603,8 +604,11 @@ void commit_params(dt_iop_module_t *self,
   d->iterations = p->iterations;
   d->detail_scale = p->detail_scale;
 
-  // UI blending param is set in % of the largest image dimension
-  d->blending = p->blending / 100.0f;
+  // UI blending param is the square root of the actual blending parameter
+  // to make it more sensitive to small values that represent the most important value domain.
+  // UI parameter is given in percentage of maximum blending value.
+  // The actual blending parameter represents the fraction of the largest image dimension.
+  d->blending = p->blending * p->blending / 10000.0f;
 
   // UI guided filter feathering param increases edge taping
   // but actual regularization behaves inversely
@@ -813,7 +817,7 @@ void gui_init(dt_iop_module_t *self)
        "more iterations = smoother result but slower"));
 
   g->blending = dt_bauhaus_slider_from_params(self, "blending");
-  dt_bauhaus_slider_set_soft_range(g->blending, 0.5, 10.0);
+  dt_bauhaus_slider_set_soft_range(g->blending, 0.1, 100.0);
   dt_bauhaus_slider_set_format(g->blending, "%");
   gtk_widget_set_tooltip_text
     (g->blending,
