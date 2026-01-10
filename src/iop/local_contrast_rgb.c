@@ -33,6 +33,8 @@
  *
  ***/
 
+ // TODO: blending parameter should be sqrt or log or so because it is very sensitive to small changes 
+
 #include "common/extra_optimizations.h"
 
 #include <assert.h>
@@ -91,7 +93,7 @@ typedef struct dt_iop_local_contrast_rgb_params_t
   float detail_scale;   // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.5 $DESCRIPTION: "detail boost"
 
   // Masking parameters
-  float blending;       // $MIN: 0.01 $MAX: 100.0 $DEFAULT: 5.0 $DESCRIPTION: "smoothing diameter"
+  float blending;       // $MIN: 0.01 $MAX: 100.0 $DEFAULT: 1.6 $DESCRIPTION: "smoothing diameter"
   float feathering;     // $MIN: 0.01 $MAX: 10000.0 $DEFAULT: 5.0 $DESCRIPTION: "edges refinement/feathering"
 
   dt_iop_local_contrast_rgb_filter_t details; // $DEFAULT: DT_LC_EIGF $DESCRIPTION: "preserve details"
@@ -154,7 +156,7 @@ typedef struct dt_iop_local_contrast_rgb_gui_data_t
 
 const char *name()
 {
-  return _("local contrast (RGB)");
+  return _("local contrast rgb");
 }
 
 const char *aliases()
@@ -811,7 +813,7 @@ void gui_init(dt_iop_module_t *self)
        "more iterations = smoother result but slower"));
 
   g->blending = dt_bauhaus_slider_from_params(self, "blending");
-  dt_bauhaus_slider_set_soft_range(g->blending, 1.0, 45.0);
+  dt_bauhaus_slider_set_soft_range(g->blending, 0.5, 10.0);
   dt_bauhaus_slider_set_format(g->blending, "%");
   gtk_widget_set_tooltip_text
     (g->blending,
