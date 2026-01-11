@@ -1574,7 +1574,6 @@ void init_presets(dt_lib_module_t *self)
   AM("shadhi");
   AM("temperature");
   AM("toneequal");
-  AM("local_contrast_rgb");
 
   SMG(C_("modulegroup", "tone"), "tone");
   AM("agx");
@@ -1641,6 +1640,8 @@ void init_presets(dt_lib_module_t *self)
   AM("censorize");
   AM("blurs");
   AM("diffuse");
+  AM("local_contrast_rgb");
+
 
   dt_lib_presets_add(_("modules: all"),
                      self->plugin_name, self->version(), tx, strlen(tx), TRUE, 0);
@@ -1787,6 +1788,7 @@ void init_presets(dt_lib_module_t *self)
   AM("censorize");
   AM("blurs");
   AM("diffuse");
+  AM("local_contrast_rgb");
 
   dt_lib_presets_add(_("workflow: scene-referred"),
                      self->plugin_name, self->version(), tx, strlen(tx), TRUE, 0);
