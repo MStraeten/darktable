@@ -1,6 +1,6 @@
 /*
     This file is part of darktable,
-    Copyright (C) 2010-2025 darktable developers.
+    Copyright (C) 2010-2026 darktable developers.
 
     darktable is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -388,7 +388,7 @@ gboolean dt_opencl_read_device_config(const int devid)
            &event_handles, &asyncmode, &disabled, &dummy, &advantage, &unified_fraction);
 
     // some rudimentary safety checking if string seems to be ok
-    safety_ok = (wd > 1) && (wd < 513) && (ht > 1) && (ht < 513);
+    safety_ok = (wd > 1) && (wd < 513) && (ht > 1) && (ht < 513) && (advantage >= 0.0f) && (advantage <= 10000.0f);
 
     if(safety_ok)
     {
@@ -420,14 +420,14 @@ gboolean dt_opencl_read_device_config(const int devid)
     cldid->clroundup_ht = 16;
   if(cldid->event_handles < 0)
     cldid->event_handles = 0x40000000;
+  if((cldid->advantage < 0.0f) || (cldid->advantage > 10000.0f))
+    cldid->advantage = 0.0f;
 
-  cldid->use_events = cldid->event_handles ? TRUE : FALSE;
+  cldid->use_events = cldid->event_handles > 0;
   cldid->asyncmode =  cldid->asyncmode ? TRUE : FALSE;
   cldid->disabled = cldid->disabled ? TRUE : FALSE;
   cldid->avoid_atomics = cldid->avoid_atomics ? TRUE : FALSE;
   cldid->pinned_memory = cldid->pinned_memory ? TRUE : FALSE;
-
-  cldid->advantage = fmaxf(0.0f, cldid->advantage);
 
   // Also take care of extended device data, these are not only device
   // specific but also depend on the devid
@@ -473,6 +473,8 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   cl->dev[dev].used_global_mem = 0;
   cl->dev[dev].max_mem_constant = 0;
   cl->dev[dev].alignsize = 0;
+  cl->dev[dev].compute_units = 0;
+  cl->dev[dev].workgroup_size = 0;
   cl->dev[dev].nvidia_sm_20 = FALSE;
   cl->dev[dev].fullname = NULL;
   cl->dev[dev].platform = NULL;
@@ -522,7 +524,6 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   char *deviceversion = NULL;
   size_t deviceversion_size;
 
-  size_t infoint;
   size_t *infointtab = NULL;
   cl_device_type type;
   cl_bool image_support = 0;
@@ -702,6 +703,12 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   (cl->dlocl->symbols->dt_clGetDeviceInfo)(devid, CL_DEVICE_MEM_BASE_ADDR_ALIGN,
                                            sizeof(cl_uint),
                                            &(cl->dev[dev].alignsize), NULL);
+  (cl->dlocl->symbols->dt_clGetDeviceInfo)(devid, CL_DEVICE_MAX_COMPUTE_UNITS,
+                                           sizeof(cl_uint),
+                                           &(cl->dev[dev].compute_units), NULL);
+  (cl->dlocl->symbols->dt_clGetDeviceInfo)(devid, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                                           sizeof(size_t),
+                                           &(cl->dev[dev].workgroup_size), NULL);
 
   // FIXME This test is deprecated for post 1.2 versions so if we do some cl version bump
   // we would want to use CL_DEVICE_SVM_CAPABILITIES instead
@@ -826,15 +833,16 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
                "   MAX CONSTANT BUFFER:      %.0f KB\n", (double)cl->dev[dev].max_mem_constant / 1024.0);
   dt_print_nts(DT_DEBUG_OPENCL,
                "   ADDRESS ALIGN:            %d\n", cl->dev[dev].alignsize / 8);
+  dt_print_nts(DT_DEBUG_OPENCL,
+               "   COMPUTE UNITS:            %d\n", cl->dev[dev].compute_units);
+  dt_print_nts(DT_DEBUG_OPENCL,
+               "   MAX WORK GROUP SIZE:      %zu\n", cl->dev[dev].workgroup_size);
 
-  (cl->dlocl->symbols->dt_clGetDeviceInfo)
-    (devid, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(infoint), &infoint, NULL);
-  dt_print_nts(DT_DEBUG_OPENCL,
-               "   MAX WORK GROUP SIZE:      %zu\n", infoint);
+  cl_uint max_item_dimension = 0;  
   (cl->dlocl->symbols->dt_clGetDeviceInfo)(devid, CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS,
-                                           sizeof(infoint), &infoint, NULL);
+                                           sizeof(max_item_dimension), &max_item_dimension, NULL);
   dt_print_nts(DT_DEBUG_OPENCL,
-               "   MAX WORK ITEM DIMENSIONS: %zu\n", infoint);
+               "   MAX WORK ITEM DIMENSIONS: %d\n", max_item_dimension);
 
   size_t infointtab_size;
   err = dt_opencl_get_device_info(cl, devid, CL_DEVICE_MAX_WORK_ITEM_SIZES,
@@ -843,7 +851,7 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   {
     dt_print_nts(DT_DEBUG_OPENCL,
                  "   MAX WORK ITEM SIZES:      [ ");
-    for(size_t i = 0; i < infoint; i++)
+    for(size_t i = 0; i < max_item_dimension; i++)
       dt_print_nts(DT_DEBUG_OPENCL, "%zu ", infointtab[i]);
     free(infointtab);
     infointtab = NULL;
@@ -953,7 +961,7 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   const char* compile_opt = NULL;
 
   if(dt_conf_key_exists(compile_option_name_cname)
-     && (dt_conf_get_int("performance_configuration_version_completed") > 15))
+     && (dt_conf_get_int("performance_configuration_version_completed") > 17))
     compile_opt = dt_conf_get_string_const(compile_option_name_cname);
   else
   {
@@ -962,6 +970,8 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
     else if(!strcmp("apple", pname))
       compile_opt = DT_OPENCL_DEFAULT_COMPILE_OPTI;
     else if(!strcmp("amdacceleratedparallelprocessing", pname))
+      compile_opt = DT_OPENCL_DEFAULT_COMPILE_OPTI;
+    else if(!strncmp("rusticl", pname, 7))
       compile_opt = DT_OPENCL_DEFAULT_COMPILE_OPTI;
     else
       compile_opt = DT_OPENCL_DEFAULT_COMPILE_DEFAULT;
@@ -3152,12 +3162,16 @@ void *dt_opencl_copy_host_to_device_constant(const int devid,
   cl_mem dev = (darktable.opencl->dlocl->symbols->dt_clCreateBuffer)
     (darktable.opencl->dev[devid].context, mode, size, host, &err);
 
-  if(err != CL_SUCCESS || oversize)
+  if(err != CL_SUCCESS)
     dt_print(DT_DEBUG_OPENCL,
              "[opencl copy_host_to_device_constant]"
-             " could not allocate %sbuffer on device '%s' id=%d: %s",
-             oversize ? "oversize " : "",
+             " could not allocate buffer on device '%s' id=%d: %s",
              darktable.opencl->dev[devid].fullname, devid, cl_errstr(err));
+  if(oversize)
+    dt_print(DT_DEBUG_OPENCL | DT_DEBUG_VERBOSE,
+             "[opencl copy_host_to_device_constant]"
+             " fallback to non-const buffer on device '%s' id=%d",
+             darktable.opencl->dev[devid].fullname, devid);
 
   dt_opencl_memory_statistics(devid, dev, OPENCL_MEMORY_ADD);
 
@@ -4155,9 +4169,10 @@ static int _nextpow2(const int n)
 
 // utility function to calculate optimal work group dimensions for a given kernel
 // taking device specific restrictions and local memory limitations into account
-int dt_opencl_local_buffer_opt(const int devid,
-                               const int kernel,
-                               dt_opencl_local_buffer_t *factors)
+// returns TRUE in case of success
+gboolean dt_opencl_local_buffer_opt(const int devid,
+                                    const int kernel,
+                                    dt_opencl_local_buffer_t *factors)
 {
   dt_opencl_t *cl = darktable.opencl;
   if(!cl->inited || devid < 0) return FALSE;
