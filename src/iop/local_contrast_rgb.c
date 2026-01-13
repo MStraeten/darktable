@@ -792,30 +792,6 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_margin_top(dt_ui_section_label_new(C_("section", "masking")), DT_PIXEL_APPLY_DPI(10));
   dt_gui_box_add(self->widget, dt_ui_section_label_new(C_("section", "masking")));
 
-  // Luminance estimator
-  g->method = dt_bauhaus_combobox_from_params(self, "method");
-  gtk_widget_set_tooltip_text
-    (g->method,
-     _("method used to estimate pixel luminance from RGB values\n"
-       "choose the one that gives best contrast between details and surroundings"));
-
-  // Detail preservation filter
-  g->details = dt_bauhaus_combobox_from_params(self, N_("details"));
-  gtk_widget_set_tooltip_text
-    (g->details,
-     _("edge-aware filter used to smooth the luminance mask\n"
-       "'guided filter' is good for general use\n"
-       "'EIGF' (exposure-independent guided filter) treats shadows and highlights equally\n"
-       "'averaged' variants blend with unfiltered for softer effect"));
-
-  // Filter parameters
-  g->iterations = dt_bauhaus_slider_from_params(self, "iterations");
-  dt_bauhaus_slider_set_soft_max(g->iterations, 5);
-  gtk_widget_set_tooltip_text
-    (g->iterations,
-     _("number of filter passes\n"
-       "more iterations = smoother result but slower"));
-
   g->blending = dt_bauhaus_slider_from_params(self, "blending");
   dt_bauhaus_slider_set_soft_range(g->blending, 0.1, 100.0);
   dt_bauhaus_slider_set_format(g->blending, "%");
@@ -831,7 +807,31 @@ void gui_init(dt_iop_module_t *self)
     (g->feathering,
      _("edge sensitivity of the filter\n"
        "higher = better edge preservation\n"
-       "lower = smoother transitions"));
+       "lower = smoother transitions, but may lead to halos around edges"));
+
+  // Filter parameters
+  g->iterations = dt_bauhaus_slider_from_params(self, "iterations");
+  dt_bauhaus_slider_set_soft_max(g->iterations, 5);
+  gtk_widget_set_tooltip_text
+    (g->iterations,
+     _("number of filter passes\n"
+       "more iterations = smoother result but slower"));
+
+  // Luminance estimator
+  g->method = dt_bauhaus_combobox_from_params(self, "method");
+  gtk_widget_set_tooltip_text
+    (g->method,
+     _("method used to estimate pixel luminance from RGB values\n"
+       "choose the one that gives best contrast between details and surroundings"));
+
+  // Detail preservation filter
+  g->details = dt_bauhaus_combobox_from_params(self, N_("details"));
+  gtk_widget_set_tooltip_text
+    (g->details,
+     _("edge-aware filter used to smooth the luminance mask\n"
+       "'guided filter' is good for general use\n"
+       "'EIGF' (exposure-independent guided filter) treats shadows and highlights equally\n"
+       "'averaged' variants blend with unfiltered for softer effect"));
 
   // Display mask toggle
   g->show_luminance_mask = dt_iop_togglebutton_new
