@@ -839,6 +839,18 @@ void cleanup_global(dt_iop_module_so_t *self)
 }
 
 
+void reload_defaults(dt_iop_module_t *self)
+{
+  dt_iop_local_contrast_rgb_params_t *d = self->default_params;
+
+  // Set first scale to have a visible effect by default
+  // Other scales remain at 1.0 (no effect)
+  d->detail_scale[0] = 1.5f;
+  for(int s = 1; s < N_SCALES; s++)
+    d->detail_scale[s] = 1.0f;
+}
+
+
 void commit_params(dt_iop_module_t *self,
                    dt_iop_params_t *p1,
                    dt_dev_pixelpipe_t *pipe,
