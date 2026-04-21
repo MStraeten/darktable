@@ -172,6 +172,15 @@ changes (where available).
   history stacks from instead of requiring XMP sidecar files, for people
   who do not use XMP sidecar files.
 
+- Added display name to the available sort options for film rolls.
+
+- When creating a new workspace from the workspace dialog, settings
+  can optionally be copied from an existing workspace as a template.
+  The workspace-specific configuration is duplicated with paths,
+  labels, collection history, and similar keys cleared so the new
+  workspace keeps its own library database instead of reusing the
+  source library.
+
 ## Performance Improvements
 
 - Increased performance for OpenCL guided filter by internal tiling.
@@ -320,6 +329,9 @@ changes (where available).
 
 - Fixed a rare bug which appeared when scale-pixels module was moved above
   the tone-mapper while applying a shift in "rotate and perspective" module.
+
+- Fixed white and middle-grey patches being swapped for Datacolor
+  SpyderCheckr 48 in the Color Calibration module.
 
 ## Lua
 
