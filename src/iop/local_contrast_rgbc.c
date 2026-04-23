@@ -545,7 +545,7 @@ static void local_contrast_process(dt_iop_module_t *self,
         compute_smoothed_luminance_mask(in, luminance_smoothed, width, height, d);
         g->luminance_valid = TRUE;
         dt_iop_gui_leave_critical_section(self);
-        dt_dev_pixelpipe_cache_invalidate_later(piece->pipe, self->iop_order);
+        dt_dev_pixelpipe_cache_invalidate_later(piece->pipe, self->iop_order, "local contrast rgb: ");
       }
     }
     else
