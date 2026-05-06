@@ -549,6 +549,31 @@ int dt_ai_ort_probe_library_full(const char *path, char **out_version, char **ou
   return TRUE;
 }
 
+// find libonnxruntime.so.* recursively, skip auditwheel *.libs/ peers
+static gchar *_scan_for_ort_lib(const char *root)
+{
+  GDir *d = g_dir_open(root, 0, NULL);
+  if(!d) return NULL;
+  gchar *result = NULL;
+  const gchar *name;
+  while((name = g_dir_read_name(d)) && !result)
+  {
+    gchar *p = g_build_filename(root, name, NULL);
+    if(g_file_test(p, G_FILE_TEST_IS_DIR))
+    {
+      if(!g_str_has_suffix(name, ".libs"))
+        result = _scan_for_ort_lib(p);
+    }
+    else if(g_str_has_prefix(name, "libonnxruntime.so."))
+    {
+      result = g_strdup(p);
+    }
+    g_free(p);
+  }
+  g_dir_close(d);
+  return result;
+}
+
 // Scan system and user-space paths for valid ORT libraries.
 // Returns a GList of dt_ai_ort_found_t (caller owns list and contents).
 GList *dt_ai_ort_find_libraries(void)
@@ -624,20 +649,8 @@ GList *dt_ai_ort_find_libraries(void)
       else
       {
         g_free(exact);
-        GDir *d = g_dir_open(dir, 0, NULL);
-        if(d)
-        {
-          const gchar *name;
-          while((name = g_dir_read_name(d)))
-          {
-            if(g_str_has_prefix(name, "libonnxruntime.so."))
-            {
-              user_paths[i] = g_build_filename(dir, name, NULL);
-              break;
-            }
-          }
-          g_dir_close(d);
-        }
+        // preserve_layout puts the lib in onnxruntime/capi/
+        user_paths[i] = _scan_for_ort_lib(dir);
       }
 #endif
     }
@@ -848,6 +861,24 @@ done:
   return (gpointer)api;
 }
 
+// query ORT for whether a given execution provider was compiled into
+// the loaded library; safe to call before CreateEnv — GetAvailableProviders
+// just lists statically-linked / loadable providers, it does not load them
+static gboolean _ort_has_provider(const char *name)
+{
+  if(!g_ort || !g_ort->GetAvailableProviders) return FALSE;
+  char **providers = NULL;
+  int n = 0;
+  if(g_ort->GetAvailableProviders(&providers, &n) != NULL || !providers)
+    return FALSE;
+  gboolean found = FALSE;
+  for(int i = 0; i < n && !found; i++)
+    if(g_strcmp0(providers[i], name) == 0) found = TRUE;
+  if(g_ort->ReleaseAvailableProviders)
+    g_ort->ReleaseAvailableProviders(providers, n);
+  return found;
+}
+
 #if defined(__linux__)
 // configure AMD GPU caches (MIOpen kernel db + MIGraphX compiled-program
 // cache) via environment variables. these MUST be set before any ORT
@@ -866,7 +897,7 @@ done:
 // keep control
 static void _setup_amd_caches(void)
 {
-  if(!g_file_test("/opt/rocm", G_FILE_TEST_IS_DIR))
+  if(!_ort_has_provider("MIGraphXExecutionProvider"))
     return;
 
   char cachedir[PATH_MAX] = { 0 };
@@ -896,7 +927,8 @@ static void _setup_amd_caches(void)
 // writes .blob files to cache_dir for instant reload on subsequent runs
 static gboolean _try_openvino_with_cache(OrtSessionOptions *session_opts)
 {
-  if(!g_ort || !g_ort->SessionOptionsAppendExecutionProvider_OpenVINO_V2)
+  if(!_ort_has_provider("OpenVINOExecutionProvider")
+     || !g_ort->SessionOptionsAppendExecutionProvider_OpenVINO_V2)
     return FALSE;
 
   char cachedir[PATH_MAX] = { 0 };
