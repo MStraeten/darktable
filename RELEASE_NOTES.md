@@ -248,16 +248,21 @@ changes (where available).
 - Added `--library` option to `darktable-cli` to use the image library
   instead of XMP files for reading processing history.
 
-<<<<<<< Updated upstream
 - Exif tags which are added to the metadata editor are now read from
   the image file on import. For already imported images this can be
-  performed by an exif refresh.
-=======
+  performed by an Exif refresh.
+
 - The active preset name is now displayed in the header of suitable
   library modules (import, export). This can be turned off in the
   "miscellaneous" section in the preferences ("automatically update
   module name").
->>>>>>> Stashed changes
+
+- A new log history viewer has been added to the bottom toolbar,
+  providing a persistent record of all dt_control_log messages (e.g.,
+  export progress, library updates, warnings). Click the speech-bubble
+  icon in the center-bottom-right area to open a scrollable popover
+  showing all logged messages with timestamps, automatically
+  deduplicating consecutive identical entries.
 
 ## Bug Fixes
 
