@@ -342,7 +342,9 @@ void dt_opencl_write_device_config(const int devid)
   g_snprintf(dat, 510, "%i %i %i %i %i %.3f %.3f",
     cl->dev[devid].micro_nap,
     cl->dev[devid].pinned_memory,
-    cl->dev[devid].use_events ? DT_OPENCL_EVENTS : 0,
+
+    // this used to define the number of slots, now a bool and using DT_OPENCL_EVENTS if true
+    cl->dev[devid].use_events ? 1 : 0,
     cl->dev[devid].asyncmode,
     cl->dev[devid].disabled,
     cl->dev[devid].advantage,
@@ -3503,7 +3505,7 @@ void *dt_opencl_duplicate_image(const int devid, const cl_mem src)
   cl_mem new = dt_opencl_alloc_device(devid, width, height, el);
   if(new == NULL) return NULL;
 
-  size_t region[] = { width, height };
+  const size_t region[2] = { width, height };
   const cl_int err = dt_opencl_enqueue_copy_image(devid, src, new, CLIMG_ORIGIN, CLIMG_ORIGIN, region);
   if(err != CL_SUCCESS)
   {
