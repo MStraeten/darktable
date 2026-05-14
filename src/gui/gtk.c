@@ -779,7 +779,8 @@ static gboolean _input_event(GtkWidget *widget,
              "[touchpad] pinch x=%.2f y=%.2f phase=%d scale=%.6f state=0x%x",
              pinch->x, pinch->y, pinch->phase, pinch->scale, pinch->state);
     if(dt_view_manager_gesture_pinch(darktable.view_manager, pinch->x, pinch->y,
-                                     pinch->phase, pinch->scale, pinch->state & 0xf))
+                                     pinch->dx, pinch->dy, pinch->phase,
+                                     pinch->scale, pinch->state & 0xf))
     {
       gtk_widget_queue_draw(widget);
       return TRUE;
@@ -805,13 +806,36 @@ static gboolean _scrolled(GtkWidget *widget,
   GdkDevice *device = gdk_event_get_source_device((GdkEvent *)event);
   const gboolean touchpad_enabled = _touchpad_gestures_enabled();
   const gboolean ctrl_pressed = dt_modifier_is(event->state, GDK_CONTROL_MASK);
+
+  dt_print(DT_DEBUG_INPUT,
+           "[scroll] direction=%d smooth=%s stop=%s ctrl=%s"
+           " x=%.1f y=%.1f dx=%.3f dy=%.3f state=0x%x"
+           " device='%s' source-type=%d",
+           event->direction,
+           event->direction == GDK_SCROLL_SMOOTH ? "yes" : "no",
+           event->is_stop ? "yes" : "no",
+           ctrl_pressed ? "yes" : "no",
+           event->x, event->y, event->delta_x, event->delta_y, event->state,
+           device ? gdk_device_get_name(device) : "<none>",
+           device ? (int)gdk_device_get_source(device) : -1);
   const gboolean is_touchpad_source = device && gdk_device_get_source(device) == GDK_SOURCE_TOUCHPAD;
   const gboolean matches_last_gesture_device = (device == _touchpad);
 
-  if(touchpad_enabled
-     && !ctrl_pressed
-     && (is_touchpad_source || matches_last_gesture_device)
-     && event->direction == GDK_SCROLL_SMOOTH && !event->is_stop)
+  const gboolean is_smooth = event->direction == GDK_SCROLL_SMOOTH && !event->is_stop;
+#ifdef GDK_WINDOWING_QUARTZ
+  // On macOS/Quartz, the built-in trackpad reports as GDK_SOURCE_MOUSE, not
+  // GDK_SOURCE_TOUCHPAD.  Route every non-ctrl smooth scroll to gesture_pan so
+  // that two-finger panning works in views like darkroom (both standalone and
+  // interleaved with a pinch-zoom gesture whose translational component macOS
+  // delivers as a separate scroll stream).
+  const gboolean route_as_pan = touchpad_enabled && !ctrl_pressed && is_smooth;
+#else
+  const gboolean route_as_pan = touchpad_enabled
+                                && !ctrl_pressed
+                                && (is_touchpad_source || matches_last_gesture_device)
+                                && is_smooth;
+#endif
+  if(route_as_pan)
   {
     gdouble delta_x = 0.0, delta_y = 0.0;
     if(!dt_gui_get_scroll_deltas(event, &delta_x, &delta_y))
@@ -844,14 +868,15 @@ static gboolean _scrolled(GtkWidget *widget,
                delta_x, delta_y);
     }
   }
-  else if(event->direction == GDK_SCROLL_SMOOTH && !event->is_stop)
+  else if(is_smooth)
   {
     dt_print(DT_DEBUG_INPUT,
-             "[touchpad] smooth scroll not treated as pan: enabled=%d ctrl=%d touchpad_source=%d matches_last_gesture=%d source='%s' source_type=%d",
+             "[touchpad] smooth scroll not treated as pan: enabled=%d ctrl=%d touchpad_source=%d matches_last_gesture=%d route_as_pan=%d source='%s' source_type=%d",
              touchpad_enabled,
              ctrl_pressed,
              is_touchpad_source,
              matches_last_gesture_device,
+             route_as_pan,
              device ? gdk_device_get_name(device) : "<none>",
              device ? gdk_device_get_source(device) : -1);
   }
@@ -893,7 +918,7 @@ static void _panel_scrolled(GtkEventControllerScroll *controller,
 static void _scrollbar_changed(GtkWidget *widget,
                                gpointer user_data)
 {
-  if(darktable.gui->reset) return;
+  DT_GUARD_GUI_UPDATE();
 
   GtkAdjustment *adjustment_x =
     gtk_range_get_adjustment(GTK_RANGE(darktable.gui->scrollbars.hscrollbar));
@@ -1726,7 +1751,7 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
                      dt_shortcuts_reinitialise,
                      GDK_KEY_I, GDK_CONTROL_MASK | GDK_SHIFT_MASK | GDK_MOD1_MASK);
 
-  darktable.gui->reset = 0;
+  DT_CLEAR_GUI_UPDATE();
 
   // let's try to support pressure sensitive input devices like tablets for mask drawing
   dt_print(DT_DEBUG_INPUT, "[input device] Input devices found:\n");
@@ -2297,7 +2322,7 @@ void dt_ui_update_scrollbars(dt_ui_t *ui)
   /* update scrollbars for current view */
   const dt_view_t *cv = dt_view_manager_get_current_view(darktable.view_manager);
 
-  ++darktable.gui->reset;
+  DT_ENTER_GUI_UPDATE();
   if(cv->vscroll_size > cv->vscroll_viewport_size)
   {
     gtk_adjustment_configure
@@ -2315,7 +2340,7 @@ void dt_ui_update_scrollbars(dt_ui_t *ui)
        cv->hscroll_viewport_size,
        cv->hscroll_viewport_size);
   }
-  --darktable.gui->reset;
+  DT_LEAVE_GUI_UPDATE();
 
   gtk_widget_set_visible(darktable.gui->scrollbars.vscrollbar,
                          cv->vscroll_size > cv->vscroll_viewport_size);
@@ -2359,7 +2384,7 @@ static void _handle_panel_widths(const dt_ui_panel_t p)
   GtkWidget *main_window = dt_ui_main_window(darktable.gui->ui);
   gtk_window_get_size(GTK_WINDOW(main_window), &app_window_width, NULL);
 
-  // calculate total used width 
+  // calculate total used width
   int used_w = 0;
   used_w += gtk_widget_get_allocated_width(darktable.gui->ui->panels[other_panel]);
 
