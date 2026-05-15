@@ -145,9 +145,14 @@ changes (where available).
 - Added a welcome screen to help users understand and set the most
   relevant configuration options on the first run.
 
-- Added touchpad gestures in darkroom, including pinch zoom in/out
-  and two-finger panning. Follow-up fixes refined input source
-  handling to keep panning limited to touchpad smooth-scroll input.
+- Added touchpad gestures to darkroom and lighttable culling layouts,
+  including pinch zooming and two-finger panning.
+  Follow-up fixes refined input-source handling to keep panning
+  limited to touchpad smooth-scroll input.
+  Smartphone-like simultaneous pinch zooming and two-finger panning
+  are now possible on Linux and Windows.
+  Zooming gestures are limited to 100%, additionally pressing CTRL
+  enables zooming up to 1600%.
 
 - Enabled shortcuts for some existing buttons in duplicate manager,
   snapshots, and AgX modules.
@@ -247,9 +252,6 @@ changes (where available).
 
 - Added a new option to filter images by capture month in collections
   and collection filters.
-
-- Added `--library` option to `darktable-cli` to use the image library
-  instead of XMP files for reading processing history.
 
 - Exif tags which are added to the metadata editor are now read from
   the image file on import. For already imported images this can be
@@ -360,7 +362,13 @@ changes (where available).
 
 ### New Features
 
-- N/A
+- Added Lua AI API (`darktable.ai`) for scripting AI model inference.
+  Provides tensor creation, model loading with GPU provider selection,
+  and two calling conventions for inference (pre-allocated and
+  auto-allocated outputs). Image I/O includes loading from file or
+  darktable library (full pipeline export), raw CFA sensor data
+  access, and DNG output with EXIF preservation. Enables Lua scripts
+  to implement custom AI workflows such as raw denoise or upscale.
 
 ### Bug Fixes
 
