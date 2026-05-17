@@ -425,6 +425,13 @@
     <longdescription>GitHub repository for downloading AI models (format: owner/repo)</longdescription>
   </dtconfig>
   <dtconfig>
+    <name>plugins/ai/models_path</name>
+    <type>string</type>
+    <default></default>
+    <shortdescription>custom AI models folder</shortdescription>
+    <longdescription>folder where AI models are stored. leave empty for the default location. existing models in the default location are not migrated automatically</longdescription>
+  </dtconfig>
+  <dtconfig>
     <name>plugins/ai/cuda_device_id</name>
     <type min="0" max="15">int</type>
     <default>0</default>
@@ -3027,6 +3034,47 @@
     <type min="0" max="3">int</type>
     <default>0</default>
     <shortdescription>AVIF chroma subsampling</shortdescription>
+    <longdescription/>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/imageio/format/heif/bitdepth</name>
+    <type>
+      <enum>
+        <option>8</option>
+        <option>10</option>
+        <option>12</option>
+      </enum>
+    </type>
+    <default>8</default>
+    <shortdescription>HEIF bit depth (bpc)</shortdescription>
+    <longdescription/>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/imageio/format/heif/color_mode</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription/>
+    <longdescription/>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/imageio/format/heif/compression_type</name>
+    <type min="0" max="1">int</type>
+    <default>1</default>
+    <shortdescription/>
+    <longdescription/>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/imageio/format/heif/quality</name>
+    <type min="0" max="100">int</type>
+    <default>50</default>
+    <shortdescription/>
+    <longdescription/>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/imageio/format/heif/subsample</name>
+    <type min="0" max="3">int</type>
+    <default>0</default>
+    <shortdescription>HEIF chroma subsampling</shortdescription>
     <longdescription/>
   </dtconfig>
   <dtconfig>
