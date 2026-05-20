@@ -18,7 +18,6 @@
 
 #include "backend.h"
 #include "common/darktable.h"
-#include "common/file_location.h"
 #include "control/conf.h"
 #include <glib.h>
 #include <onnxruntime_c_api.h>
@@ -85,7 +84,15 @@ static int g_loaded_dml_device_id      = -1;
 // snapshot of the provider config string at ORT load. NULL until captured
 static gchar *g_loaded_provider = NULL;
 
+// loaded ORT version string, used in the cache fingerprint to
+// invalidate stale compiled artifacts after an ORT upgrade
+static gchar *g_ort_version = NULL;
+
 static int _device_id_from_conf(const char *conf_key, const char *env_var);
+static gchar *_lookup_device_name(const dt_ai_provider_t provider,
+                                  const int device_id);
+static gchar *_backend_cache_fingerprint(dt_ai_provider_t provider,
+                                         int device_id);
 
 #if defined(__linux__)
 // check that the CUDA driver supports the installed CUDA runtime version;
@@ -769,6 +776,8 @@ static const OrtApi *_ort_api_from_module(GModule *mod, const char *label)
   }
   const OrtApiBase *base = get_api_base();
   const char *lib_version = base->GetVersionString();
+  g_free(g_ort_version);
+  g_ort_version = g_strdup(lib_version ? lib_version : "unknown");
   dt_print(DT_DEBUG_AI, "[darktable_ai] loaded ORT %s from '%s'", lib_version, label);
 
   // try the compiled API version first, then fall back to lower versions
@@ -882,8 +891,10 @@ static gpointer _init_ort_api(gpointer data)
   {
     // Windows/macOS: use the directly linked ORT library (DirectML/CoreML).
     const OrtApiBase *base = OrtGetApiBase();
-    dt_print(DT_DEBUG_AI, "[darktable_ai] loaded ORT %s (bundled)",
-             base->GetVersionString());
+    const char *bundled_version = base->GetVersionString();
+    g_free(g_ort_version);
+    g_ort_version = g_strdup(bundled_version ? bundled_version : "unknown");
+    dt_print(DT_DEBUG_AI, "[darktable_ai] loaded ORT %s (bundled)", bundled_version);
     api = base->GetApi(ORT_API_VERSION);
   }
 #endif
@@ -947,22 +958,32 @@ static void _setup_amd_caches(void)
   if(!_ort_has_provider("MIGraphXExecutionProvider"))
     return;
 
-  char cachedir[PATH_MAX] = { 0 };
-  dt_loc_get_user_cache_dir(cachedir, sizeof(cachedir));
+  const int dev = _device_id_from_conf("plugins/ai/migraphx_device_id",
+                                       "DT_MIGRAPHX_DEVICE_ID");
+  gchar *fp = _backend_cache_fingerprint(DT_AI_PROVIDER_MIGRAPHX, dev);
 
-  gchar *miopen_dir = g_build_filename(cachedir, "ai", "amd", "miopen", NULL);
-  g_mkdir_with_parents(miopen_dir, 0700);
-  g_setenv("MIOPEN_USER_DB_PATH", miopen_dir, FALSE);
-  g_setenv("MIOPEN_CUSTOM_CACHE_DIR", miopen_dir, FALSE);
-  dt_print(DT_DEBUG_AI, "[darktable_ai] MIOpen cache: %s", miopen_dir);
-  g_free(miopen_dir);
+  // two independent sub-caches (MIOpen kernel DB + MIGraphX engine
+  // cache). reserved model-id names "_miopen" / "_migraphx" give each
+  // its own subdir; invalidate-by-model never matches these because
+  // real model_ids don't start with underscore
+  char miopen_dir[PATH_MAX] = { 0 };
+  if(dt_ai_backend_cache_dir(DT_AI_PROVIDER_MIGRAPHX, fp,
+                             "_miopen", miopen_dir, sizeof(miopen_dir)))
+  {
+    g_setenv("MIOPEN_USER_DB_PATH", miopen_dir, FALSE);
+    g_setenv("MIOPEN_CUSTOM_CACHE_DIR", miopen_dir, FALSE);
+    dt_print(DT_DEBUG_AI, "[darktable_ai] MIOpen cache: %s", miopen_dir);
+  }
 
-  gchar *migraphx_dir = g_build_filename(cachedir, "ai", "amd", "migraphx", NULL);
-  g_mkdir_with_parents(migraphx_dir, 0700);
-  g_setenv("ORT_MIGRAPHX_CACHE_PATH", migraphx_dir, FALSE);
-  g_setenv("ORT_MIGRAPHX_MODEL_CACHE_PATH", migraphx_dir, FALSE);
-  dt_print(DT_DEBUG_AI, "[darktable_ai] MIGraphX cache: %s", migraphx_dir);
-  g_free(migraphx_dir);
+  char migraphx_dir[PATH_MAX] = { 0 };
+  if(dt_ai_backend_cache_dir(DT_AI_PROVIDER_MIGRAPHX, fp,
+                             "_migraphx", migraphx_dir, sizeof(migraphx_dir)))
+  {
+    g_setenv("ORT_MIGRAPHX_CACHE_PATH", migraphx_dir, FALSE);
+    g_setenv("ORT_MIGRAPHX_MODEL_CACHE_PATH", migraphx_dir, FALSE);
+    dt_print(DT_DEBUG_AI, "[darktable_ai] MIGraphX cache: %s", migraphx_dir);
+  }
+  g_free(fp);
 }
 #endif
 
@@ -978,10 +999,13 @@ static gboolean _try_openvino_with_cache(OrtSessionOptions *session_opts)
      || !g_ort->SessionOptionsAppendExecutionProvider_OpenVINO_V2)
     return FALSE;
 
-  char cachedir[PATH_MAX] = { 0 };
-  dt_loc_get_user_cache_dir(cachedir, sizeof(cachedir));
-  gchar *ov_dir = g_build_filename(cachedir, "ai", "intel", "openvino", NULL);
-  g_mkdir_with_parents(ov_dir, 0700);
+  // process-global (no per-model id at session-creation time)
+  gchar *fp = _backend_cache_fingerprint(DT_AI_PROVIDER_OPENVINO, -1);
+  char ov_dir[PATH_MAX] = { 0 };
+  const gboolean ok = dt_ai_backend_cache_dir(
+    DT_AI_PROVIDER_OPENVINO, fp, "_shared", ov_dir, sizeof(ov_dir));
+  g_free(fp);
+  if(!ok) return FALSE;
 
   dt_print(DT_DEBUG_AI,
            "[darktable_ai] attempting Intel OpenVINO (cache: %s)...", ov_dir);
@@ -997,11 +1021,9 @@ static gboolean _try_openvino_with_cache(OrtSessionOptions *session_opts)
              "[darktable_ai] OpenVINO (with cache) failed: %s",
              g_ort->GetErrorMessage(status));
     g_ort->ReleaseStatus(status);
-    g_free(ov_dir);
     return FALSE;
   }
   dt_print(DT_DEBUG_AI, "[darktable_ai] Intel OpenVINO enabled with disk cache.");
-  g_free(ov_dir);
   return TRUE;
 }
 
@@ -1221,6 +1243,77 @@ static gchar *_lookup_device_name(const dt_ai_provider_t provider,
   return name;
 }
 
+// strip non-alphanumeric chars in place so the result is safe to embed
+// in a directory name
+static void _alnum_inplace(char *s)
+{
+  if(!s) return;
+  char *r = s, *w = s;
+  while(*r)
+  {
+    if(g_ascii_isalnum(*r)) *w++ = *r;
+    r++;
+  }
+  *w = '\0';
+}
+
+// hardware fingerprint for the per-EP cache subdir. for device-aware
+// EPs (CUDA/DirectML/MIGraphX) the fingerprint is the alphanumeric
+// device name so different GPUs get different cache slots.
+// driver-version is left out for now; bump DT_AI_CACHE_SCHEMA if the
+// compiled-artifact format ever changes incompatibly
+static gchar *_backend_cache_fingerprint(dt_ai_provider_t provider,
+                                         int device_id)
+{
+  gchar *base = NULL;
+  switch(provider)
+  {
+    case DT_AI_PROVIDER_COREML:
+#if defined(__aarch64__) || defined(__arm64__)
+      base = g_strdup("arm64");
+#elif defined(__x86_64__) || defined(_M_X64)
+      base = g_strdup("x86_64");
+#else
+      base = g_strdup("default");
+#endif
+      break;
+
+    case DT_AI_PROVIDER_OPENVINO:
+      // OpenVINO uses device_type="AUTO" everywhere we call it; no
+      // per-device id concept at the session level
+      base = g_strdup("auto");
+      break;
+
+    case DT_AI_PROVIDER_CUDA:
+    case DT_AI_PROVIDER_DIRECTML:
+    case DT_AI_PROVIDER_MIGRAPHX:
+    {
+      gchar *name = _lookup_device_name(provider, device_id);
+      if(name) _alnum_inplace(name);
+      if(name && name[0])
+        base = name;  // ownership transfers to base
+      else
+      {
+        g_free(name);
+        base = g_strdup("default");
+      }
+      break;
+    }
+
+    default:
+      base = g_strdup("default");
+      break;
+  }
+
+  // suffix ORT version so an upgrade invalidates stale artifacts
+  gchar *ort = g_ort_version ? g_strdup(g_ort_version) : g_strdup("ortunknown");
+  _alnum_inplace(ort);
+  gchar *full = g_strdup_printf("%s_ort%s", base, ort);
+  g_free(base);
+  g_free(ort);
+  return full;
+}
+
 // try to find and call an ORT execution provider function at runtime via
 // dynamic symbol lookup (GModule/dlsym).  returns TRUE if the provider was
 // enabled successfully, FALSE otherwise.
@@ -1316,6 +1409,50 @@ static gboolean _try_provider(OrtSessionOptions *session_opts,
 
   return ok;
 }
+
+#if defined(__APPLE__)
+// V2 keyed-options attach for CoreML. translates ep_flags into named
+// options and wires ModelCacheDirectory for persistent compile cache
+static gboolean _try_coreml_v2(OrtSessionOptions *session_opts,
+                               uint32_t ep_flags,
+                               const char *cache_dir)
+{
+  if(!g_ort || !g_ort->SessionOptionsAppendExecutionProvider) return FALSE;
+
+  const char *keys[8];
+  const char *vals[8];
+  size_t n = 0;
+
+  keys[n] = "ModelFormat";
+  vals[n] = (ep_flags & 16) ? "MLProgram" : "NeuralNetwork";
+  n++;
+
+  keys[n] = "MLComputeUnits";
+  vals[n] = (ep_flags & 1) ? "CPUOnly" : "ALL";
+  n++;
+
+  if(cache_dir && cache_dir[0])
+  {
+    keys[n] = "ModelCacheDirectory";
+    vals[n] = cache_dir;
+    n++;
+  }
+
+  dt_print(DT_DEBUG_AI, "[darktable_ai] attempting to enable Apple CoreML (V2)...");
+  OrtStatus *status = g_ort->SessionOptionsAppendExecutionProvider(
+    session_opts, "CoreML", keys, vals, n);
+  if(status)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[darktable_ai] Apple CoreML (V2) enable failed: %s",
+             g_ort->GetErrorMessage(status));
+    g_ort->ReleaseStatus(status);
+    return FALSE;
+  }
+  dt_print(DT_DEBUG_AI, "[darktable_ai] Apple CoreML (V2) enabled successfully.");
+  return TRUE;
+}
+#endif  // __APPLE__
 
 // pick a GPU device_id: env var wins, then conf, fallback to 0.
 // each multi-GPU-capable EP has its own conf key + env var so users
@@ -1481,10 +1618,23 @@ _enable_acceleration(OrtSessionOptions *session_opts,
 
   case DT_AI_PROVIDER_COREML:
 #if defined(__APPLE__)
-    _try_provider(
-      session_opts,
-      "OrtSessionOptionsAppendExecutionProvider_CoreML",
-      "Apple CoreML", NULL, coreml_flags, DT_AI_PROVIDER_COREML);
+  {
+    dt_print(DT_DEBUG_AI,
+             "[darktable_ai] CoreML format: %s%s",
+             (coreml_flags & 16) ? "MLProgram" : "NeuralNetwork",
+             (coreml_flags & 1) ? " (CPU compute units)" : "");
+    gchar *fp = _backend_cache_fingerprint(DT_AI_PROVIDER_COREML, -1);
+    char coreml_cache[PATH_MAX] = { 0 };
+    const gboolean have_cache = dt_ai_backend_cache_dir(
+      DT_AI_PROVIDER_COREML, fp, "_shared", coreml_cache, sizeof(coreml_cache));
+    g_free(fp);
+    if(!_try_coreml_v2(session_opts, coreml_flags,
+                       have_cache ? coreml_cache : NULL))
+      _try_provider(
+        session_opts,
+        "OrtSessionOptionsAppendExecutionProvider_CoreML",
+        "Apple CoreML", NULL, coreml_flags, DT_AI_PROVIDER_COREML);
+  }
 #else
     dt_print(DT_DEBUG_AI, "[darktable_ai] apple CoreML not available on this platform");
 #endif
@@ -1537,46 +1687,11 @@ _enable_acceleration(OrtSessionOptions *session_opts,
 
   case DT_AI_PROVIDER_AUTO:
   default:
-    // auto-detect best provider based on platform
-#if defined(__APPLE__)
-    _try_provider(
-      session_opts,
-      "OrtSessionOptionsAppendExecutionProvider_CoreML",
-      "Apple CoreML", NULL, coreml_flags, DT_AI_PROVIDER_COREML);
-#elif defined(_WIN32)
-    {
-      const int dev = _device_id_from_conf("plugins/ai/dml_device_id",
-                                           "DT_DML_DEVICE_ID");
-      _try_provider(session_opts,
-                    "OrtSessionOptionsAppendExecutionProvider_DML",
-                    "Windows DirectML", NULL, (uint32_t)dev, DT_AI_PROVIDER_DIRECTML);
-    }
-#elif defined(__linux__)
-    // try CUDA first, then MIGraphX (cache configured at env init)
-    {
-      const int cuda_dev = _device_id_from_conf("plugins/ai/cuda_device_id",
-                                                "DT_CUDA_DEVICE_ID");
-      const int amd_dev  = _device_id_from_conf("plugins/ai/migraphx_device_id",
-                                                "DT_MIGRAPHX_DEVICE_ID");
-      const gboolean cuda_ok =
-        _try_cuda_v2(session_opts, cuda_dev)
-        || _try_provider(session_opts,
-                         "OrtSessionOptionsAppendExecutionProvider_CUDA",
-                         "NVIDIA CUDA", NULL, (uint32_t)cuda_dev,
-                         DT_AI_PROVIDER_CUDA);
-      if(!cuda_ok)
-      {
-        if(!_try_provider(
-             session_opts,
-             "OrtSessionOptionsAppendExecutionProvider_MIGraphX",
-             "AMD MIGraphX", NULL, (uint32_t)amd_dev, DT_AI_PROVIDER_MIGRAPHX))
-          _try_provider(
-            session_opts,
-            "OrtSessionOptionsAppendExecutionProvider_ROCM",
-            "AMD ROCm (legacy)", NULL, (uint32_t)amd_dev, DT_AI_PROVIDER_MIGRAPHX);
-      }
-    }
-#endif
+    // unreachable: dt_ai_load_model_ext resolves AUTO/CONFIGURED to a
+    // concrete EP before this point. log and fall through to CPU
+    dt_print(DT_DEBUG_AI,
+             "[darktable_ai] unexpected provider %d at _enable_acceleration "
+             "— falling back to CPU", provider);
     break;
   }
 }
@@ -1592,6 +1707,18 @@ int dt_ai_probe_provider(dt_ai_provider_t provider)
   // refuse to probe when AI is disabled
   if(!dt_conf_get_bool("plugins/ai/enabled"))
     return 0;
+
+  // memoize the result per EP. ORT availability doesn't change within
+  // a process (lib loads once at startup), so a real attach is needed
+  // only on the first call. -1 = unknown, 0 = no, 1 = yes. atomic
+  // access avoids racing concurrent first-callers; the worst case is
+  // two threads both probing — both reach the same answer, both store
+  static gint s_cache[DT_AI_PROVIDER_COUNT] = { -1, -1, -1, -1, -1, -1, -1 };
+  if(provider < DT_AI_PROVIDER_COUNT)
+  {
+    const gint cached = g_atomic_int_get(&s_cache[provider]);
+    if(cached >= 0) return cached;
+  }
 
   // ensure ORT API is initialized
   g_once(&g_ort_once, _init_ort_api, NULL);
@@ -1652,7 +1779,10 @@ int dt_ai_probe_provider(dt_ai_provider_t provider)
   }
 
   g_ort->ReleaseSessionOptions(opts);
-  return ok ? 1 : 0;
+  const int result = ok ? 1 : 0;
+  if(provider < DT_AI_PROVIDER_COUNT)
+    g_atomic_int_set(&s_cache[provider], result);
+  return result;
 }
 
 // ONNX Model Loading
