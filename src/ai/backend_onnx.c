@@ -32,6 +32,11 @@
 #include <initguid.h>
 #include <io.h>
 #include <fcntl.h>
+#include <d3d12.h>
+#include "dml_provider_factory.h"
+// IDMLDevice IID — declared inline; MSYS2 ucrt64 doesn't ship <DirectML.h>
+DEFINE_GUID(DT_IID_IDMLDevice,
+            0x6dbd6437, 0x96fd, 0x423f, 0xa9, 0x8c, 0xae, 0x5e, 0x7c, 0x2a, 0x57, 0x3f);
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -88,6 +93,7 @@ static struct {
   int    cuda_device_id;
   int    migraphx_device_id;
   int    dml_device_id;
+  gboolean taken;
 } g_conf_snapshot = {
   .cuda_device_id     = -1,
   .migraphx_device_id = -1,
@@ -130,19 +136,80 @@ static gboolean _check_cuda_driver_compat(void)
   if(drv_fn && rt_fn)
   {
     int drv = 0, rt = 0;
-    drv_fn(&drv);
-    rt_fn(&rt);
-    dt_print(DT_DEBUG_AI,
-             "[darktable_ai] CUDA driver %d.%d, runtime %d.%d",
-             drv / 1000, (drv % 1000) / 10,
-             rt / 1000, (rt % 1000) / 10);
-    if(drv < rt)
+    // cudaSuccess == 0 — anything else means we couldn't read the version
+    // (no driver, init failure, no devices). conservatively treat that
+    // as incompatible so we don't try to enable CUDA on a broken stack
+    const int drv_rc = drv_fn(&drv);
+    const int rt_rc = rt_fn(&rt);
+    if(drv_rc != 0 || rt_rc != 0)
     {
       dt_print(DT_DEBUG_AI,
-               "[darktable_ai] CUDA driver %d.%d is too old for runtime %d.%d — "
-               "disabling CUDA to prevent crash. Update your NVIDIA driver.",
+               "[darktable_ai] CUDA version query failed (drv rc=%d, "
+               "rt rc=%d) — disabling CUDA",
+               drv_rc, rt_rc);
+      cached = 0;
+    }
+    else
+    {
+      dt_print(DT_DEBUG_AI,
+               "[darktable_ai] CUDA driver %d.%d, runtime %d.%d",
                drv / 1000, (drv % 1000) / 10,
                rt / 1000, (rt % 1000) / 10);
+      if(drv < rt)
+      {
+        dt_print(DT_DEBUG_AI,
+                 "[darktable_ai] CUDA driver %d.%d is too old for runtime %d.%d — "
+                 "disabling CUDA to prevent crash. Update your NVIDIA driver.",
+                 drv / 1000, (drv % 1000) / 10,
+                 rt / 1000, (rt % 1000) / 10);
+        cached = 0;
+      }
+    }
+  }
+  g_module_close(mod);
+  return cached == 1;
+}
+
+// check that the ROCm runtime is loadable AND reports at least one
+// HIP device; ORT's MIGraphX/ROCm EP can abort() during load if the
+// kernel HSA support is missing or no GPU agent is available.
+// result is cached — the check runs only once per process
+static gboolean _check_rocm_runtime(void)
+{
+  static int cached = -1;  // -1 = unchecked, 0 = unusable, 1 = ok
+  if(cached >= 0) return cached == 1;
+
+  cached = 1;  // assume ok until proven otherwise
+
+  // try unversioned first, then probe versioned names from high to low
+  GModule *mod = g_module_open("libamdhip64.so",
+                               G_MODULE_BIND_LAZY | G_MODULE_BIND_LOCAL);
+  for(int v = 8; !mod && v >= 5; v--)
+  {
+    char name[32];
+    snprintf(name, sizeof(name), "libamdhip64.so.%d", v);
+    mod = g_module_open(name, G_MODULE_BIND_LAZY | G_MODULE_BIND_LOCAL);
+  }
+  if(!mod) return TRUE;  // can't check — assume compatible
+
+  typedef int (*hip_count_fn)(int *);
+  hip_count_fn count_fn = NULL;
+  g_module_symbol(mod, "hipGetDeviceCount", (gpointer *)&count_fn);
+
+  if(count_fn)
+  {
+    int n = 0;
+    const int rc = count_fn(&n);
+    if(rc == 0 && n > 0)
+    {
+      dt_print(DT_DEBUG_AI,
+               "[darktable_ai] ROCm: %d HIP device(s) detected", n);
+    }
+    else
+    {
+      dt_print(DT_DEBUG_AI,
+               "[darktable_ai] ROCm: hipGetDeviceCount rc=%d n=%d — "
+               "disabling MIGraphX/ROCm to prevent crash", rc, n);
       cached = 0;
     }
   }
@@ -223,11 +290,24 @@ char *dt_ai_ort_probe_library(const char *path)
 // both out params are caller-owned (g_free). Returns FALSE if not a valid ORT.
 // FALSE before ORT is loaded (no comparison reference yet)
 // snapshot the conf values that determine which library / EP / device
-// the in-process ORT will be bound to. called eagerly at darktable
-// startup so the *_changed_since_load() helpers have a stable reference
-// independent of when ORT is lazily initialized
+// the in-process ORT will be bound to. idempotent — subsequent calls
+// are no-ops so the snapshot reflects whichever state existed first.
+// callers should still call eagerly at darktable startup; if they
+// forget, the *_changed_since_load() helpers auto-snapshot on first
+// use so they always have a reference to compare against
 void dt_ai_snapshot_conf_state(void)
 {
+  // serialise first-init: racing threads must not both run the body
+  // and leak each other's g_strdup'd strings
+  static GMutex snapshot_lock;
+  g_mutex_lock(&snapshot_lock);
+  if(g_conf_snapshot.taken)
+  {
+    g_mutex_unlock(&snapshot_lock);
+    return;
+  }
+  g_conf_snapshot.taken = TRUE;
+
   gchar *ort_conf = dt_conf_get_string("plugins/ai/ort_library_path");
   g_free(g_conf_snapshot.ort_path);
   g_conf_snapshot.ort_path = g_strdup(ort_conf ? ort_conf : "");
@@ -243,6 +323,8 @@ void dt_ai_snapshot_conf_state(void)
                                                      "DT_MIGRAPHX_DEVICE_ID");
   g_conf_snapshot.dml_device_id      = _device_id_from_conf("plugins/ai/dml_device_id",
                                                      "DT_DML_DEVICE_ID");
+
+  g_mutex_unlock(&snapshot_lock);
 }
 
 void dt_ai_backend_cleanup_globals(void)
@@ -250,10 +332,12 @@ void dt_ai_backend_cleanup_globals(void)
   g_free(g_ort.version);            g_ort.version = NULL;
   g_free(g_conf_snapshot.ort_path); g_conf_snapshot.ort_path = NULL;
   g_free(g_conf_snapshot.provider); g_conf_snapshot.provider = NULL;
+  g_conf_snapshot.taken = FALSE;  // allow re-init on plugin/test reload
 }
 
 gboolean dt_ai_ort_path_changed_since_load(void)
 {
+  dt_ai_snapshot_conf_state();  // no-op if already taken
   if(!g_conf_snapshot.ort_path) return FALSE;
   gchar *cur = dt_conf_get_string("plugins/ai/ort_library_path");
   const gboolean changed
@@ -264,6 +348,7 @@ gboolean dt_ai_ort_path_changed_since_load(void)
 
 gboolean dt_ai_provider_changed_since_load(void)
 {
+  dt_ai_snapshot_conf_state();  // no-op if already taken
   if(!g_conf_snapshot.provider) return FALSE;
   gchar *cur = dt_conf_get_string(DT_AI_CONF_PROVIDER);
   const gboolean changed
@@ -295,6 +380,7 @@ gboolean dt_ai_device_id_changed_since_load(const dt_ai_provider_t provider)
 {
   const char *key = dt_ai_device_conf_key_for_provider(provider);
   if(!key) return FALSE;
+  dt_ai_snapshot_conf_state();  // no-op if already taken
   int loaded;
   switch(provider)
   {
@@ -467,8 +553,16 @@ static GList *_enum_migraphx_devices(void)
 // DirectML device enumeration via DXGI. uses EnumAdapterByGpuPreference
 // (DXGI 1.6, Windows 10 1803+) with HIGH_PERFORMANCE so dGPUs come
 // before iGPUs. dedupes by AdapterLuid and skips software adapters.
-// id is the index in the returned list, which is what DirectML's EP
-// takes as device_id
+// id is the index in the returned list. LUIDs are cached so _try_dml
+// can bind ORT to the exact adapter; ORT's legacy device_id path uses
+// EnumAdapters (different order) and mis-binds on hybrid laptops
+#ifdef _WIN32
+#define DT_AI_MAX_DML_DEVICES 8
+G_LOCK_DEFINE_STATIC(dml_luid_cache);
+static LUID g_dml_luid_cache[DT_AI_MAX_DML_DEVICES];
+static int g_dml_luid_count = 0;
+#endif
+
 static GList *_enum_directml_devices(void)
 {
 #ifndef _WIN32
@@ -519,6 +613,12 @@ static GList *_enum_directml_devices(void)
     }
     adapter->lpVtbl->Release(adapter);
   }
+  // commit LUIDs to the global cache for _try_dml lookup
+  G_LOCK(dml_luid_cache);
+  g_dml_luid_count = MIN((int)seen_luids->len, DT_AI_MAX_DML_DEVICES);
+  for(int k = 0; k < g_dml_luid_count; k++)
+    g_dml_luid_cache[k] = g_array_index(seen_luids, LUID, k);
+  G_UNLOCK(dml_luid_cache);
   g_array_free(seen_luids, TRUE);
   factory->lpVtbl->Release(factory);
   return result;
@@ -585,7 +685,19 @@ int dt_ai_ort_probe_library_full(const char *path, char **out_version, char **ou
     {
       char **providers = NULL;
       int n_providers = 0;
-      if(probe_api->GetAvailableProviders(&providers, &n_providers) == NULL && providers)
+      OrtStatus *gap_st
+        = probe_api->GetAvailableProviders(&providers, &n_providers);
+      if(gap_st)
+      {
+        probe_api->ReleaseStatus(gap_st);
+        if(providers && probe_api->ReleaseAvailableProviders)
+        {
+          OrtStatus *rs
+            = probe_api->ReleaseAvailableProviders(providers, n_providers);
+          if(rs) probe_api->ReleaseStatus(rs);
+        }
+      }
+      else if(providers)
       {
         // map ORT provider names to short labels
         static const struct { const char *ort_name; const char *label; } map[] = {
@@ -828,11 +940,11 @@ static const OrtApi *_ort_api_from_module(GModule *mod, const char *label)
 
   if(api && picked_version != ORT_API_VERSION)
     dt_print(DT_DEBUG_AI,
-             "[darktable_ai] ORT %s: using API version %d (compiled for %d)",
+             "[darktable_ai] ONNX Runtime %s: using API version %d (compiled for %d)",
              lib_version, picked_version, ORT_API_VERSION);
   if(!api)
     dt_print(DT_DEBUG_AI,
-             "[darktable_ai] ORT %s does not support any compatible API version",
+             "[darktable_ai] ONNX Runtime %s does not support any compatible API version",
              lib_version);
   return api;
 }
@@ -878,12 +990,19 @@ static gpointer _init_ort_api(gpointer data)
     if(!ort_mod)
     {
       dt_print(DT_DEBUG_AI,
-               "[darktable_ai] failed to load ORT library '%s': %s",
+               "[darktable_ai] failed to load ONNX Runtime library '%s': %s",
                ort_override, g_module_error());
       goto done;
     }
-    g_ort.module = ort_mod;  // keep handle for _try_provider EP lookups
     api = _ort_api_from_module(ort_mod, ort_override);
+    if(!api)
+    {
+      // api probe failed (version too old / not an ORT lib): close the
+      // handle so we don't keep a non-functional library mapped
+      g_module_close(ort_mod);
+      goto done;
+    }
+    g_ort.module = ort_mod;  // keep handle for _try_provider EP lookups
   }
 #ifdef ORT_LAZY_LOAD
   else
@@ -912,11 +1031,17 @@ static gpointer _init_ort_api(gpointer data)
     if(!ort_mod)
     {
       dt_print(DT_DEBUG_AI,
-               "[darktable_ai] failed to load ORT library '%s': %s",
+               "[darktable_ai] failed to load ONNX Runtime library '%s': %s",
                ORT_LIBRARY_PATH, g_module_error());
       goto done;
     }
     api = _ort_api_from_module(ort_mod, ORT_LIBRARY_PATH);
+    if(!api)
+    {
+      g_module_close(ort_mod);
+      goto done;
+    }
+    g_ort.module = ort_mod;  // keep handle for _try_provider EP lookups
   }
 #else
   else
@@ -956,8 +1081,19 @@ static gboolean _ort_has_provider(const char *name)
   if(!g_ort.api || !g_ort.api->GetAvailableProviders) return FALSE;
   char **providers = NULL;
   int n = 0;
-  if(g_ort.api->GetAvailableProviders(&providers, &n) != NULL || !providers)
+  OrtStatus *st = g_ort.api->GetAvailableProviders(&providers, &n);
+  if(st)
+  {
+    g_ort.api->ReleaseStatus(st);
+    // ORT may have partially populated providers before erroring
+    if(providers && g_ort.api->ReleaseAvailableProviders)
+    {
+      OrtStatus *rs = g_ort.api->ReleaseAvailableProviders(providers, n);
+      if(rs) g_ort.api->ReleaseStatus(rs);
+    }
     return FALSE;
+  }
+  if(!providers) return FALSE;
   gboolean found = FALSE;
   for(int i = 0; i < n && !found; i++)
     if(g_strcmp0(providers[i], name) == 0) found = TRUE;
@@ -1077,7 +1213,7 @@ static gpointer _init_ort_env(gpointer data)
   if(status)
   {
     dt_print(DT_DEBUG_AI,
-             "[darktable_ai] failed to create ORT environment: %s",
+             "[darktable_ai] failed to create ONNX Runtime environment: %s",
              g_ort.api->GetErrorMessage(status));
     g_ort.api->ReleaseStatus(status);
     return NULL;
@@ -1386,6 +1522,11 @@ static gboolean _try_provider(OrtSessionOptions *session_opts,
   // a driver/runtime version mismatch causes ORT to abort() during inference
   if(strstr(symbol_name, "CUDA") && !_check_cuda_driver_compat())
     return FALSE;
+  // same guard for MIGraphX/ROCm: kernel HSA mismatch or missing GPU
+  // agent causes ORT to abort() during provider load
+  if((strstr(symbol_name, "MIGraphX") || strstr(symbol_name, "ROCM"))
+     && !_check_rocm_runtime())
+    return FALSE;
 #endif
   GModule *mod = g_module_open(NULL, 0);
   void *func_ptr = NULL;
@@ -1456,11 +1597,11 @@ static gboolean _try_coreml_v2(OrtSessionOptions *session_opts,
   size_t n = 0;
 
   keys[n] = "ModelFormat";
-  vals[n] = (ep_flags & 16) ? "MLProgram" : "NeuralNetwork";
+  vals[n] = (ep_flags & DT_COREML_FLAG_CREATE_MLPROGRAM) ? "MLProgram" : "NeuralNetwork";
   n++;
 
   keys[n] = "MLComputeUnits";
-  vals[n] = (ep_flags & 1) ? "CPUOnly" : "ALL";
+  vals[n] = (ep_flags & DT_COREML_FLAG_USE_CPU_ONLY) ? "CPUOnly" : "ALL";
   n++;
 
   if(cache_dir && cache_dir[0])
@@ -1636,6 +1777,170 @@ static gboolean _try_cuda_v2(OrtSessionOptions *session_opts, int device_id)
   return TRUE;
 }
 
+#ifdef _WIN32
+// resolve cached LUID for device_id; runs a one-shot enumeration if
+// the cache hasn't been populated (e.g. preferences never opened)
+static gboolean _get_dml_luid(int device_id, LUID *out)
+{
+  G_LOCK(dml_luid_cache);
+  if(g_dml_luid_count == 0)
+  {
+    // release while enumerating; _enum_directml_devices re-acquires
+    // on write. avoids holding the lock across DXGI calls
+    G_UNLOCK(dml_luid_cache);
+    g_list_free_full(_enum_directml_devices(), dt_ai_device_free);
+    G_LOCK(dml_luid_cache);
+  }
+  const gboolean ok = device_id >= 0 && device_id < g_dml_luid_count;
+  if(ok) *out = g_dml_luid_cache[device_id];
+  G_UNLOCK(dml_luid_cache);
+  return ok;
+}
+
+// bind ORT to the exact adapter matching the cached LUID for device_id
+// via OrtDmlApi::SessionOptionsAppendExecutionProvider_DML1
+static gboolean _try_dml(OrtSessionOptions *session_opts, int device_id)
+{
+  dt_print(DT_DEBUG_AI,
+           "[darktable_ai] attempting to enable Windows DirectML ...");
+
+  if(!g_ort.api || !g_ort.api->GetExecutionProviderApi)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] DirectML: GetExecutionProviderApi unavailable");
+    return FALSE;
+  }
+
+  const OrtDmlApi *dml_api = NULL;
+  OrtStatus *st = g_ort.api->GetExecutionProviderApi(
+    "DML", ORT_API_VERSION, (const void **)&dml_api);
+  if(st || !dml_api || !dml_api->SessionOptionsAppendExecutionProvider_DML1)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] DirectML: OrtDmlApi not exposed by this ONNX Runtime");
+    if(st) g_ort.api->ReleaseStatus(st);
+    return FALSE;
+  }
+
+  LUID luid = { 0 };
+  if(!_get_dml_luid(device_id, &luid))
+  {
+    dt_print(DT_DEBUG_AI,
+             "[darktable_ai] DML: no cached LUID for device_id=%d",
+             device_id);
+    return FALSE;
+  }
+
+  // resolve the adapter by LUID (IDXGIFactory4+)
+  IDXGIFactory4 *factory4 = NULL;
+  HRESULT hr = CreateDXGIFactory2(0, &IID_IDXGIFactory4, (void **)&factory4);
+  if(FAILED(hr) || !factory4)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] DirectML: CreateDXGIFactory2 failed (hr=0x%lx)",
+             (unsigned long)hr);
+    return FALSE;
+  }
+
+  IDXGIAdapter1 *adapter = NULL;
+  hr = factory4->lpVtbl->EnumAdapterByLuid(
+    factory4, luid, &IID_IDXGIAdapter1, (void **)&adapter);
+  factory4->lpVtbl->Release(factory4);
+  if(FAILED(hr) || !adapter)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] DirectML: EnumAdapterByLuid failed (hr=0x%lx)",
+             (unsigned long)hr);
+    return FALSE;
+  }
+
+  // build the D3D12 device + command queue on this exact adapter
+  ID3D12Device *d3d12_dev = NULL;
+  hr = D3D12CreateDevice((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0,
+                         &IID_ID3D12Device, (void **)&d3d12_dev);
+  adapter->lpVtbl->Release(adapter);
+  if(FAILED(hr) || !d3d12_dev)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] DirectML: D3D12CreateDevice failed (hr=0x%lx)",
+             (unsigned long)hr);
+    return FALSE;
+  }
+
+  // DMLCreateDevice from DirectML.dll. resolved once per process and
+  // kept loaded — FreeLibrary would unpin the vtable that the
+  // IDMLDevice (and ORT's strong ref) point into, causing AV later
+  typedef HRESULT (WINAPI *DMLCreateDeviceFn)(
+    ID3D12Device *, UINT, REFIID, void **);
+  static DMLCreateDeviceFn pDMLCreateDevice = NULL;
+  static gsize dml_once = 0;
+  if(g_once_init_enter(&dml_once))
+  {
+    HMODULE dml_dll = LoadLibraryA("DirectML.dll");
+    if(dml_dll)
+      pDMLCreateDevice = (DMLCreateDeviceFn)(void *)
+        GetProcAddress(dml_dll, "DMLCreateDevice");
+    g_once_init_leave(&dml_once, 1);
+  }
+  if(!pDMLCreateDevice)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] DirectML: DirectML.dll / DMLCreateDevice unavailable");
+    d3d12_dev->lpVtbl->Release(d3d12_dev);
+    return FALSE;
+  }
+
+  IDMLDevice *dml_dev = NULL;
+  hr = pDMLCreateDevice(d3d12_dev, 0 /* DML_CREATE_DEVICE_FLAG_NONE */,
+                        &DT_IID_IDMLDevice, (void **)&dml_dev);
+  if(FAILED(hr) || !dml_dev)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] DirectML: DMLCreateDevice failed (hr=0x%lx)",
+             (unsigned long)hr);
+    d3d12_dev->lpVtbl->Release(d3d12_dev);
+    return FALSE;
+  }
+
+  D3D12_COMMAND_QUEUE_DESC q_desc = {
+    .Type = D3D12_COMMAND_LIST_TYPE_DIRECT,
+    .Priority = 0,
+    .Flags = D3D12_COMMAND_QUEUE_FLAG_NONE,
+    .NodeMask = 0,
+  };
+  ID3D12CommandQueue *cmd_queue = NULL;
+  hr = d3d12_dev->lpVtbl->CreateCommandQueue(
+    d3d12_dev, &q_desc, &IID_ID3D12CommandQueue, (void **)&cmd_queue);
+  // DML device + command queue hold their own refs on d3d12_dev
+  d3d12_dev->lpVtbl->Release(d3d12_dev);
+  // IDMLDevice is opaque in C mode — release via the IUnknown vtable
+  IUnknown *dml_unk = (IUnknown *)dml_dev;
+  if(FAILED(hr) || !cmd_queue)
+  {
+    dt_print(DT_DEBUG_AI, "[darktable_ai] DirectML: CreateCommandQueue failed (hr=0x%lx)",
+             (unsigned long)hr);
+    dml_unk->lpVtbl->Release(dml_unk);
+    return FALSE;
+  }
+
+  st = dml_api->SessionOptionsAppendExecutionProvider_DML1(
+    session_opts, dml_dev, cmd_queue);
+  // ORT takes its own refs on success; release ours unconditionally
+  dml_unk->lpVtbl->Release(dml_unk);
+  cmd_queue->lpVtbl->Release(cmd_queue);
+  if(st)
+  {
+    dt_print(DT_DEBUG_AI,
+             "[darktable_ai] DML append failed: %s",
+             g_ort.api->GetErrorMessage(st));
+    g_ort.api->ReleaseStatus(st);
+    return FALSE;
+  }
+
+  gchar *dev_name = _lookup_device_name(DT_AI_PROVIDER_DIRECTML, device_id);
+  dt_print(DT_DEBUG_AI,
+           "[darktable_ai] Windows DirectML enabled on device %d: %s "
+           "(LUID %lu:%ld)",
+           device_id, dev_name ? dev_name : "?",
+           (unsigned long)luid.LowPart, (long)luid.HighPart);
+  g_free(dev_name);
+  return TRUE;
+}
+#endif  // _WIN32
+
 static void
 _enable_acceleration(OrtSessionOptions *session_opts,
                      dt_ai_provider_t provider,
@@ -1653,8 +1958,8 @@ _enable_acceleration(OrtSessionOptions *session_opts,
   {
     dt_print(DT_DEBUG_AI,
              "[darktable_ai] CoreML format: %s%s",
-             (coreml_flags & 16) ? "MLProgram" : "NeuralNetwork",
-             (coreml_flags & 1) ? " (CPU compute units)" : "");
+             (coreml_flags & DT_COREML_FLAG_CREATE_MLPROGRAM) ? "MLProgram" : "NeuralNetwork",
+             (coreml_flags & DT_COREML_FLAG_USE_CPU_ONLY) ? " (CPU compute units)" : "");
     gchar *fp = _backend_cache_fingerprint(DT_AI_PROVIDER_COREML, -1);
     char coreml_cache[PATH_MAX] = { 0 };
     const gboolean have_cache = dt_ai_backend_cache_dir(
@@ -1708,9 +2013,10 @@ _enable_acceleration(OrtSessionOptions *session_opts,
   {
     const int dev = _device_id_from_conf("plugins/ai/dml_device_id",
                                          "DT_DML_DEVICE_ID");
-    _try_provider(session_opts,
-                  "OrtSessionOptionsAppendExecutionProvider_DML",
-                  "Windows DirectML", NULL, (uint32_t)dev, DT_AI_PROVIDER_DIRECTML);
+    if(!_try_dml(session_opts, dev))
+      _try_provider(session_opts,
+                    "OrtSessionOptionsAppendExecutionProvider_DML",
+                    "Windows DirectML", NULL, (uint32_t)dev, DT_AI_PROVIDER_DIRECTML);
   }
 #else
     dt_print(DT_DEBUG_AI, "[darktable_ai] windows DirectML not available on this platform");
@@ -2161,7 +2467,7 @@ dt_ai_onnx_load_ext(const char *model_dir, const char *model_file,
         {
           ctx->dynamic_outputs = TRUE;
           dt_print(DT_DEBUG_AI,
-                   "[darktable_ai] output[%zu] has dynamic dims — using ORT-allocated outputs",
+                   "[darktable_ai] output[%zu] has dynamic dims — using ONNX Runtime-allocated outputs",
                    i);
           break;
         }
@@ -2376,7 +2682,8 @@ int dt_ai_run(
                  "[darktable_ai] GetTensorMutableData output[%d] failed: %s",
                  i, g_ort.api->GetErrorMessage(status));
         g_ort.api->ReleaseStatus(status);
-        continue;
+        ret = -3;
+        break;
       }
 
       // query ORT's actual tensor size to avoid reading past its allocation.
@@ -2389,7 +2696,8 @@ int dt_ai_run(
         dt_print(DT_DEBUG_AI, "[darktable_ai] GetTensorTypeAndShape output[%d] failed: %s",
                  i, g_ort.api->GetErrorMessage(status));
         g_ort.api->ReleaseStatus(status);
-        continue;
+        ret = -3;
+        break;
       }
       // update caller's shape array with actual ORT output dimensions.
       // this is essential for dynamic-shape models where the caller's
@@ -2414,7 +2722,8 @@ int dt_ai_run(
         dt_print(DT_DEBUG_AI, "[darktable_ai] GetTensorShapeElementCount output[%d] failed: %s",
                  i, g_ort.api->GetErrorMessage(status));
         g_ort.api->ReleaseStatus(status);
-        continue;
+        ret = -3;
+        break;
       }
 
       const int64_t caller_count
@@ -2423,7 +2732,8 @@ int dt_ai_run(
       {
         dt_print(DT_DEBUG_AI,
                  "[darktable_ai] invalid shape for output[%d] post-copy", i);
-        continue;
+        ret = -3;
+        break;
       }
 
       // use the smaller of ORT's actual size and caller's expected size
@@ -2434,7 +2744,7 @@ int dt_ai_run(
       if(element_count != caller_count)
       {
         dt_print(DT_DEBUG_AI,
-                 "[darktable_ai] output[%d] shape mismatch: ORT has %zu elements, "
+                 "[darktable_ai] output[%d] shape mismatch: ONNX Runtime has %zu elements, "
                  "caller expects %" PRId64,
                  i, ort_element_count, caller_count);
       }
@@ -2450,7 +2760,8 @@ int dt_ai_run(
           dt_print(DT_DEBUG_AI,
                    "[darktable_ai] unknown dtype %d for output[%d]",
                    outputs[i].type, i);
-          continue;
+          ret = -3;
+          break;
         }
         outputs[i].data = g_try_malloc(ort_element_count * type_size);
         if(!outputs[i].data)
@@ -2458,7 +2769,8 @@ int dt_ai_run(
           dt_print(DT_DEBUG_AI,
                    "[darktable_ai] failed to allocate output[%d] (%zu elements)",
                    i, ort_element_count);
-          continue;
+          ret = -3;
+          break;
         }
       }
 
@@ -2480,7 +2792,8 @@ int dt_ai_run(
           dt_print(DT_DEBUG_AI,
                    "[darktable_ai] unknown dtype %d for output[%d] post-copy",
                    outputs[i].type, i);
-          continue;
+          ret = -3;
+          break;
         }
         memcpy(outputs[i].data, raw_data, element_count * type_size);
       }

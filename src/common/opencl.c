@@ -341,21 +341,17 @@ unsigned int dt_opencl_tiling_align(const int devid)
   return 4;
 }
 
-void dt_opencl_write_device_config(const int devid)
+static void _opencl_write_device_config(const int devid)
 {
   if(devid <= DT_DEVICE_CPU) return;
 
-  /* As we have floats as per-device parameters we keep track of current locale
-     and do conversions via "C" here and while reading device config
-  */
-  gchar *locale = g_strdup(setlocale(LC_ALL, NULL));
-  setlocale(LC_NUMERIC, "C");
-
   dt_opencl_t *cl = darktable.opencl;
+  const float adv = floorf(cl->dev[devid].advantage);
+
   gchar key[256] = { 0 };
   gchar dat[512] = { 0 };
   g_snprintf(key, 254, "%s%s", DT_CLDEVICE_HEAD, cl->dev[devid].cname);
-  g_snprintf(dat, 510, "%i %i %i %i %i %.3f %.3f",
+  g_snprintf(dat, 510, "%i %i %i %i %i %i.%03i 0.%03i",
     cl->dev[devid].micro_nap,
     cl->dev[devid].pinned_memory,
 
@@ -363,12 +359,12 @@ void dt_opencl_write_device_config(const int devid)
     cl->dev[devid].use_events ? 1 : 0,
     cl->dev[devid].asyncmode,
     cl->dev[devid].disabled,
-    cl->dev[devid].advantage,
-    cl->dev[devid].unified_fraction);
+    (int)(adv),
+    (int)(1000.0f * (cl->dev[devid].advantage - adv)),
+    (int)(1000.0f * cl->dev[devid].unified_fraction));
   dt_print_nts(DT_DEBUG_OPENCL | DT_DEBUG_VERBOSE,
-           "\n[dt_opencl_write_device_config] writing data '%s' for '%s'\n", dat, key);
+           "\n[opencl_write_device_config] writing data '%s' for '%s'\n", dat, key);
   dt_conf_set_string(key, dat);
-  setlocale(LC_NUMERIC, locale);
 
   // Also take care of extended device data, these are not only device
   // specific but also depend on the devid to support systems with two
@@ -376,16 +372,13 @@ void dt_opencl_write_device_config(const int devid)
   g_snprintf(key, 254, "%s%s_id%i", DT_CLDEVICE_HEAD, cl->dev[devid].cname, devid);
   g_snprintf(dat, 510, "%i", cl->dev[devid].headroom);
   dt_print_nts(DT_DEBUG_OPENCL | DT_DEBUG_VERBOSE,
-           "[dt_opencl_write_device_config] writing data '%s' for '%s'\n", dat, key);
+           "[opencl_write_device_config] writing data '%s' for '%s'\n", dat, key);
   dt_conf_set_string(key, dat);
 }
 
-gboolean dt_opencl_read_device_config(const int devid)
+static gboolean _opencl_read_device_config(const int devid)
 {
   if(devid <= DT_DEVICE_CPU) return FALSE;
-
-  gchar *locale = g_strdup(setlocale(LC_ALL, NULL));
-  setlocale(LC_NUMERIC, "C");
 
   dt_opencl_t *cl = darktable.opencl;
   dt_opencl_device_t *cldid = &cl->dev[devid];
@@ -396,27 +389,32 @@ gboolean dt_opencl_read_device_config(const int devid)
   gboolean safety_ok = TRUE;
   if(existing_device)
   {
+    /* The per-device conf string includes two floats, to avoid conflicts with
+       the different dot/comma representations depending on current locale we
+       read the different parts of the float string as ints using dummys for
+       separation. Also see the conf writing equivalent above.
+    */
     const gchar *dat = dt_conf_get_string_const(key);
+    char dummy;
     int micro_nap;
     int pinned_memory;
     int events;
     int asyncmode;
     int disabled;
-    float advantage;
-    float unified_fraction;
-    sscanf(dat, "%i %i %i %i %i %f %f",
-           &micro_nap, &pinned_memory, &events, &asyncmode, &disabled, &advantage, &unified_fraction);
+    int advantage1;
+    int advantage2;
+    int unified_fraction;
+    sscanf(dat, "%i %i %i %i %i %d %c %d %c %c %d",
+           &micro_nap, &pinned_memory, &events, &asyncmode, &disabled, &advantage1, &dummy, &advantage2, &dummy, &dummy, &unified_fraction);
 
     cldid->use_events = events ? TRUE : FALSE;
     cldid->micro_nap = micro_nap;
     cldid->pinned_memory = pinned_memory ? TRUE : FALSE;
     cldid->asyncmode = asyncmode ? TRUE : FALSE;
     cldid->disabled = disabled ? TRUE : FALSE;
-    cldid->advantage = advantage;
-    cldid->unified_fraction = unified_fraction;
-    setlocale(LC_NUMERIC, locale);
+    cldid->advantage = (float)advantage1 + 0.001f * (float)advantage2;
+    cldid->unified_fraction = 0.001f * (float)unified_fraction;
   }
-
 
   // do some safety housekeeping
   if((cldid->unified_fraction < 0.05f) || (cldid->unified_fraction > 0.5f))
@@ -439,7 +437,7 @@ gboolean dt_opencl_read_device_config(const int devid)
   else // this is used if updating to 4.0 or fresh installs; see
        // commenting _opencl_get_unused_device_mem()
     cldid->headroom = DT_OPENCL_DEFAULT_HEADROOM;
-  dt_opencl_write_device_config(devid);
+  _opencl_write_device_config(devid);
   return !existing_device || !safety_ok;
 }
 
@@ -642,7 +640,7 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   cl->dev[dev].cname = strdup(cname);
   cl->dev[dev].vendor_id = vendor_id;
 
-  const gboolean newdevice = dt_opencl_read_device_config(dev);
+  const gboolean newdevice = _opencl_read_device_config(dev);
   dt_print_nts(DT_DEBUG_OPENCL,
                "\n   DEVICE:                   %d: '%s'%s\n",
                k, device_name, (newdevice) ? ", NEW" : "" );
@@ -1026,11 +1024,9 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   char *includemd5[DT_OPENCL_MAX_INCLUDES] = { NULL };
   _opencl_md5sum(clincludes, includemd5);
 
-  if(newdevice) // so far the device seems to be ok. Make sure to
-                // write&export the conf database to
+  if(newdevice)
   {
-    dt_opencl_write_device_config(dev);
-    dt_conf_save(darktable.conf);
+    _opencl_write_device_config(dev);
   }
 
   // now load all darktable cl kernels.
@@ -1098,8 +1094,7 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
          && _opencl_build_program(dev, prog, binname, cachedir, md5sum, loaded_cached))
       {
         dt_print_nts(DT_DEBUG_OPENCL,
-                 "[dt_opencl_device_init] failed to compile program `%s'\n",
-                 programname);
+                 "[dt_opencl_device_init] failed to compile program `%s'\n", programname);
         fclose(f);
         g_strfreev(tokens);
         res = TRUE;
@@ -1125,7 +1120,7 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
 
 end:
   // we always write the device config to keep track of disabled devices
-  dt_opencl_write_device_config(dev);
+  _opencl_write_device_config(dev);
 
   if(res)
     dt_pthread_mutex_destroy(&cl->dev[dev].lock);
@@ -1585,8 +1580,9 @@ finally:
         cl->dev[i].max_global_mem = reserved;
         cl->dev[i].max_mem_alloc = MIN(cl->dev[i].max_mem_alloc, reserved);
         dt_print_nts(DT_DEBUG_OPENCL,
-               "   UNIFIED MEM SIZE:         %.0f MB reserved for '%s' id=%d\n",
-               (double)reserved / 1024.0 / 1024.0, cl->dev[i].cname, i);
+               "   UNIFIED MEM SIZE:         %.0f MB (%i%%) reserved for '%s' id=%d\n",
+               (double)reserved / 1024.0 / 1024.0, (int)(100.0f * cl->dev[i].unified_fraction),
+               cl->dev[i].cname, i);
         res->total_memory -= reserved;
       }
     }
@@ -1747,7 +1743,6 @@ static int _take_from_list(int *list,
 
   return result;
 }
-
 
 static int _device_by_cname(const char *name)
 {
@@ -2410,24 +2405,40 @@ static gboolean _opencl_build_program(const int dev,
 {
   if(prog < 0 || prog > DT_OPENCL_MAX_PROGRAMS) return TRUE;
 
-  // work-around to fix a bug in some AMD OpenCL compilers, which
-  // would fail parsing certain numerical constants if locale is
-  // different from "C".  we save the current locale, set locale to
-  // "C", and restore the previous setting after OpenCL is initialized
-  char *locale = strdup(setlocale(LC_ALL, NULL));
-  if(dt_conf_key_exists("opencl_force_c_locale"))
-    setlocale(LC_ALL, "C");
-
   dt_opencl_t *cl = darktable.opencl;
   cl_program program = cl->dev[dev].program[prog];
+
+  /*  work-around for some AMD OpenCL compilers which would fail parsing certain
+      numerical constants if locale is different from "C".
+      Note: for safety we must either
+        - use thread-safe glibc functions newlocale(), uselocale() freelocale()
+        - do the locale switching for the current thread only,
+          on Windows where there is no implementation of newlocale/uselocale.
+  */
+
+#if defined(WIN32)
+    char *locale = strdup(setlocale(LC_ALL, NULL));
+    _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
+    setlocale(LC_ALL, "C");
+#else
+    locale_t nlocale = newlocale(LC_ALL, "C", (locale_t) 0);
+    locale_t locale = uselocale(nlocale);
+#endif
+
   cl_int err = (cl->dlocl->symbols->dt_clBuildProgram)
     (program, 1, &(cl->dev[dev].devid), cl->dev[dev].options, NULL, NULL);
 
-  if(locale)
-  {
-    setlocale(LC_ALL, locale);
-    free(locale);
-  }
+#if defined(WIN32)
+    if(locale)
+    {
+      setlocale(LC_ALL, locale);
+      free(locale);
+    }
+    _configthreadlocale(_DISABLE_PER_THREAD_LOCALE);
+#else
+    uselocale(locale);
+    freelocale(nlocale);
+#endif
 
   if(err != CL_SUCCESS)
     dt_print_nts(DT_DEBUG_OPENCL,
@@ -2871,7 +2882,7 @@ int dt_opencl_enqueue_kernel_1d_args_internal(const int dev,
   return dt_opencl_enqueue_kernel_ndim_with_local(dev, kernel, sizes, NULL, 1);
 }
 
-int dt_opencl_copy_device_to_host(const int devid,
+int dt_opencl_copy_image_to_host(const int devid,
                                   void *host,
                                   cl_mem image,
                                   const int width,
@@ -2883,11 +2894,11 @@ int dt_opencl_copy_device_to_host(const int devid,
 
   const size_t region[2] = { width, height };
   // blocking.
-  return dt_opencl_read_host_from_device_raw(devid, host, image, CLIMG_ORIGIN,
+  return dt_opencl_read_host_from_image_raw(devid, host, image, CLIMG_ORIGIN,
                                              region, (size_t)width * bpp, TRUE);
 }
 
-int dt_opencl_read_host_from_device_raw(const int devid,
+int dt_opencl_read_host_from_image_raw(const int devid,
                                         void *host,
                                         cl_mem image,
                                         const size_t *origin,
@@ -2912,17 +2923,17 @@ int dt_opencl_read_host_from_device_raw(const int devid,
 
   if(err != CL_SUCCESS)
     dt_print(DT_DEBUG_OPENCL,
-             "[dt_opencl_read_host_from_device_raw] could not read image from device '%s' id=%d: %s",
+             "[dt_opencl_read_host_from_image_raw] could not read image from device '%s' id=%d: %s",
              darktable.opencl->dev[devid].fullname, devid, cl_errstr(err));
   else
     dt_print(DT_DEBUG_OPENCL | DT_DEBUG_VERBOSE,
-             "[dt_opencl_read_host_from_device_raw] read image from device '%s' id=%d",
+             "[dt_opencl_read_host_from_image_raw] read image from device '%s' id=%d",
              darktable.opencl->dev[devid].fullname, devid);
 
   return err;
 }
 
-int dt_opencl_write_host_to_device(const int devid,
+int dt_opencl_write_host_to_image(const int devid,
                                    const void *host,
                                    cl_mem image,
                                    const int width,
@@ -2934,11 +2945,11 @@ int dt_opencl_write_host_to_device(const int devid,
 
   const size_t region[2] = { width, height };
   // blocking.
-  return dt_opencl_write_host_to_device_raw(devid, host, image, CLIMG_ORIGIN,
+  return dt_opencl_write_host_to_image_raw(devid, host, image, CLIMG_ORIGIN,
                                             region, (size_t)width * bpp, TRUE);
 }
 
-int dt_opencl_write_host_to_device_raw(const int devid,
+int dt_opencl_write_host_to_image_raw(const int devid,
                                        const void *host,
                                        cl_mem image,
                                        const size_t *origin,
@@ -2960,11 +2971,11 @@ int dt_opencl_write_host_to_device_raw(const int devid,
 
   if(err != CL_SUCCESS)
     dt_print(DT_DEBUG_OPENCL,
-             "[dt_opencl_write_host_to_device_raw] could not write image to device '%s' id=%d: %s",
+             "[dt_opencl_write_host_to_image_raw] could not write image to device '%s' id=%d: %s",
              darktable.opencl->dev[devid].fullname, devid, cl_errstr(err));
   else
     dt_print(DT_DEBUG_OPENCL | DT_DEBUG_VERBOSE,
-             "[dt_opencl_write_host_to_device_raw] wrote image to device '%s' id=%d",
+             "[dt_opencl_write_host_to_image_raw] wrote image to device '%s' id=%d",
              darktable.opencl->dev[devid].fullname, devid);
 
 
@@ -3183,7 +3194,7 @@ void *dt_opencl_copy_host_to_device_constant(const int devid,
 }
 
 
-static void *_opencl_copy_host_to_device_rowpitch(const int devid,
+static void *_opencl_copy_host_to_image_rowpitch(const int devid,
                                              void *host,
                                              const int width,
                                              const int height,
@@ -3233,13 +3244,13 @@ static void *_opencl_copy_host_to_device_rowpitch(const int devid,
   return dev;
 }
 
-void *dt_opencl_copy_host_to_device(const int devid,
+void *dt_opencl_copy_host_to_image(const int devid,
                                     void *host,
                                     const int width,
                                     const int height,
                                     const int bpp)
 {
-  return _opencl_copy_host_to_device_rowpitch(devid, host, width, height, bpp, 0);
+  return _opencl_copy_host_to_image_rowpitch(devid, host, width, height, bpp, 0);
 }
 
 void dt_opencl_release_mem_object(cl_mem mem)
@@ -3516,7 +3527,7 @@ void dt_opencl_dump_pipe_pfm(const char* mod,
   float *data = dt_alloc_aligned((size_t)width * height * element_size);
   if(data)
   {
-    if(dt_opencl_copy_device_to_host(devid, data, img, width, height, element_size) == CL_SUCCESS)
+    if(dt_opencl_copy_image_to_host(devid, data, img, width, height, element_size) == CL_SUCCESS)
       dt_dump_pfm_file(pipe, data, width, height, element_size, mod,
                        "[dt_opencl_dump_pipe_pfm]", input, !input, FALSE);
 

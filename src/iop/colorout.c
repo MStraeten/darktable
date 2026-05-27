@@ -23,6 +23,7 @@
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
 #include "common/opencl.h"
+#include "common/utility.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -188,7 +189,7 @@ int legacy_params(dt_iop_module_t *self,
     else
     {
       n->type = DT_COLORSPACE_FILE;
-      g_strlcpy(n->filename, o->iccprofile, sizeof(n->filename));
+      dt_strlcpy_to_fixed(n->filename, o->iccprofile, sizeof(n->filename));
     }
 
     n->intent = o->intent;
@@ -213,7 +214,7 @@ int legacy_params(dt_iop_module_t *self,
     memset(n, 0, sizeof(dt_iop_colorout_params_v5_t));
 
     n->type = o->type;
-    g_strlcpy(n->filename, o->filename, sizeof(n->filename));
+    dt_strlcpy_to_fixed(n->filename, o->filename, sizeof(n->filename));
     n->intent = o->intent;
 
     *new_params = n;
@@ -262,7 +263,7 @@ static void output_profile_changed(GtkWidget *widget, dt_iop_module_t *self)
     if(pp->out_pos == pos)
     {
       p->type = pp->type;
-      g_strlcpy(p->filename, pp->filename, sizeof(p->filename));
+      dt_strlcpy_to_fixed(p->filename, pp->filename, sizeof(p->filename));
       dt_dev_add_history_item(darktable.develop, self, TRUE);
 
       DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PROFILE_USER_CHANGED, DT_COLORSPACES_PROFILE_TYPE_EXPORT);
@@ -336,11 +337,11 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   pack_3xSSE_to_3x3(d->cmatrix, cmatrix);
   dev_m = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * 9, cmatrix);
   if(dev_m == NULL) goto error;
-  dev_r = dt_opencl_copy_host_to_device(devid, d->lut[0], 256, 256, sizeof(float));
+  dev_r = dt_opencl_copy_host_to_image(devid, d->lut[0], 256, 256, sizeof(float));
   if(dev_r == NULL) goto error;
-  dev_g = dt_opencl_copy_host_to_device(devid, d->lut[1], 256, 256, sizeof(float));
+  dev_g = dt_opencl_copy_host_to_image(devid, d->lut[1], 256, 256, sizeof(float));
   if(dev_g == NULL) goto error;
-  dev_b = dt_opencl_copy_host_to_device(devid, d->lut[2], 256, 256, sizeof(float));
+  dev_b = dt_opencl_copy_host_to_image(devid, d->lut[2], 256, 256, sizeof(float));
   if(dev_b == NULL) goto error;
   dev_coeffs
       = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * 3 * 3, (float *)d->unbounded_coeffs);
@@ -555,6 +556,9 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
 
   d->type = p->type;
 
+  // to be used in pixel-pipe cache
+  dt_ioppr_set_pipe_export_profile_info(self->dev, piece->pipe, p->type, p->filename, p->intent);
+
   const gboolean force_lcms2 = dt_conf_get_bool("plugins/lighttable/export/force_lcms2");
 
   dt_colorspaces_color_profile_type_t out_type = DT_COLORSPACE_SRGB;
@@ -586,7 +590,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
     if(pipe->icc_type != DT_COLORSPACE_NONE)
     {
       p->type = pipe->icc_type;
-      g_strlcpy(p->filename, pipe->icc_filename, sizeof(p->filename));
+      dt_strlcpy_to_fixed(p->filename, pipe->icc_filename, sizeof(p->filename));
     }
     if((unsigned int)pipe->icc_intent < DT_INTENT_LAST) p->intent = pipe->icc_intent;
 
