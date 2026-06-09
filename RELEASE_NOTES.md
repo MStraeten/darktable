@@ -72,6 +72,9 @@ changes (where available).
   and the lightweight decoder produces masks interactively. Each click
   runs iterative refinement passes that tighten the mask, plus an
   optional DenseCRF refinement pass for clean, edge-aware boundaries.
+  The generated mask can optionally be exported as a PNG for use
+  with the *external raster masks* module when finer edge detail is
+  needed than the vectorized mask provides.
 
 - Added neural restore module in the lighttable/darkroom sidebar
   covering three AI-based tasks: raw denoise, denoise, and
@@ -101,6 +104,10 @@ changes (where available).
   be synced with the vectorscope in RYB mode, with harmony and
   rotation angles controllable directly from the vectorscope. Both CPU
   and OpenCL (GPU) implementations are provided.
+
+- Added support for HEIF export. User can choose lossless or lossy
+  compression, all practically supported color depths (8/10/12 bit),
+  all supported color subsampling options.
 
 ## UI/UX Improvements
 
@@ -316,6 +323,10 @@ changes (where available).
   reference.  Support of atomic OpenCL code and OpenCL 3.x is
   autodetected.
 
+- Added two HTJ2K compression options to EXR export. Since they are
+  supported starting with libopenexr 3.4, these options will only be
+  present in darktable if it is linked against a library version 3.4
+  or later.
 
 ## Bug Fixes
 
@@ -426,6 +437,8 @@ changes (where available).
 
 - Fixed collection range selection not working if the collection is in
   descending sort order.
+
+- Fix use-after-free bug in tagging code which caused an instant crash
 
 ## Lua
 
