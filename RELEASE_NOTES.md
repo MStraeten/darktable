@@ -37,9 +37,9 @@ You are strongly advised to take a backup first.
 
 Since darktable 5.6.0:
 
-- ??? commits to darktable+rawspeed
-- ??? pull requests handled
-- ??? issues closed
+- 1546 commits to darktable+rawspeed
+-  704 pull requests handled
+-   63 issues closed
 
 _Please note that the darktable documentation is not currently
 complete for release 5.6 and contributions are greatly
@@ -57,7 +57,117 @@ changes (where available).
 
 ## UI/UX Improvements
 
-- N/A
+- In the crop module, the crop aspect ratio is added to the dimensions
+  in the crop area preview.
+
+- Added the ability to pin any image from the filmstrip in the second
+  darkroom window. Images can be pinned directly from the 2nd window,
+  via drag&drop from the filmstrip and via keyboard shortcuts. Two
+  new actions are the added:
+    - Toggle pinned state for currently developed image
+    - Pin current image in second view
+
+- Allow switching between point/area color picker directly on canvas
+  with a simple Ctrl+Click.
+
+- When moving pictures from a collection we switch to the target
+  collection only if we did not change manually to another collection
+  during the move and the current collection is now empty.
+
+- When copying pictures from a collection we switch to the target
+  collection only if we did not change manually to another collection
+  during the copy.
+
+- In Color Calibration module the calibration box is now initialized
+  on the current bounding box. That is, if a zoom is effective the
+  calibration box will be fully visible and won't require to zoom out.
+
+- Make the slider background darker to gain some contrast making them
+  easier to differentiate from the other labels.
+
+- Introduce a condensed mode for the panel's controls widgets. This
+  mode is off by default and can be select in miscellaneous interface
+  preference.
+
+- Added a 2-up scope showing both the waveform and vectorscope. This
+  allows for a simultaneous understanding of both the lightness and
+  chromaticity of an image.
+
+- Support rendering and caching higher resolution (6K or 8K) thumbnail
+  or full-screen preview images in lighttable view. Previously, for
+  displays larger than a 4K, darktable would render a full-resolution
+  preview then downscale it. These higher resolution previews also
+  allow for less jumpy zooming in of high megapixel files.
+
+- Increase the resolution of the darkroom view's preview-resolution
+  images from 720x450 to 1440x900. This produces better data for
+  various situations, including in scopes and the color picker.
+
+- Use darktable icon in desktop environment when running under Wayland
+  on a KDE-like system. Previously the window manager would use a
+  generic icon.
+
+- Use server-side decorations (SSD) for windows when the user's window
+  manager is capable of this, to make window decorations consistent
+  with other applications. If SSD is not implemented (Gnome/Mutter
+  under Wayland), use client-side decorations (CSD).
+
+- Added a welcome screen to help users understand and set the most
+  relevant configuration options on the first run.
+
+- Added touchpad gestures to darkroom and lighttable culling layouts,
+  including pinch zooming and two-finger panning.
+  Smartphone-like simultaneous pinch zooming and two-finger panning
+  are now possible on Linux and Windows.
+  Zooming gestures are limited to 100%, additionally pressing CTRL
+  enables zooming up to 1600%.
+  Caution: this disables the scroll gesture for zooming on MacOS
+  on trackpad and magic mouse. To restore the former behaviour
+  disable touchpad gestures in preferences dialog.
+
+- Enabled shortcuts for some existing buttons in duplicate manager,
+  snapshots, and AgX modules.
+
+- Enabled shortcuts to cycle through module groups, modules and
+  module instances.
+
+- Added a configuration option to toggle the filmstrip auto-center
+  behavior. Enabled shortcuts to toggle filmstrip auto-centering and
+  to explicitly recenter the filmstrip on the current image.
+
+- The radius calculated for capture sharpening is now using only the
+  central 60% of the image as lenses are mostly sharper here.
+  For xtrans sensors the radius has been slightly increased as
+  images tend to be more blurred.
+
+- The tone equalizer now visualizes an invalid curve (solver maths)
+  also for old edits.
+
+- Add `--library <path>` command-line option to darktable-cli that
+  allows specifying a `library.db` database file to read image processing
+  history stacks from instead of requiring XMP sidecar files, for people
+  who do not use XMP sidecar files.
+
+- Added display name to the available sort options for film rolls.
+
+- When creating a new workspace from the workspace dialog, settings
+  can optionally be copied from an existing workspace as a template.
+  The workspace-specific configuration is duplicated with paths,
+  labels, collection history, and similar keys cleared so the new
+  workspace keeps its own library database instead of reusing the
+  source library. The workspace dialog allows selecting a workspace as
+  the default for startup; if one is chosen as default, the dialog is
+  not shown on the next launch until “allow for multiple workspaces”
+  is enabled again in preferences (storage).
+
+- Use native mouse cursors throughout the UI. Cursors such as the
+  busy spinner, hand, crosshair and resize handles now match the
+  operating system's look, most noticeably on macOS where the busy
+  cursor previously appeared as an old-style wristwatch instead of
+  the familiar spinning wheel.
+
+- Themes can now style expanded modules differently from collapsed
+  ones, via a new `dt_module_expanded` CSS class.
 
 ## Performance Improvements
 
@@ -181,7 +291,16 @@ changes (where available).
 
 ### White Balance Presets
 
-- N/A
+- Canon EOS 90D
+- Nikon Coolpix P1100
+- Nikon D2Hs
+- Nikon Df
+- Nikon Z f
+- Ricoh GR IV
+- Ricoh GR IV HDF
+- Sony ILCE-1M2
+- Sony ILCE-7CR
+- Sony ILCE-9M2
 
 ### Noise Profiles
 
