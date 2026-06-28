@@ -134,6 +134,13 @@ const model_map_t modelMap[] = {
   },
   {
     .exif_make = "Canon",
+    .exif_model = "Canon EOS M6 Mark III",
+    .clean_make = "Canon",
+    .clean_model = "EOS M6 Mark III",
+    .clean_alias = "EOS M6 Mark III"
+  },
+  {
+    .exif_make = "Canon",
     .exif_model = "Canon EOS M200",
     .clean_make = "Canon",
     .clean_model = "EOS M200",
