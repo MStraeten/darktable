@@ -4743,11 +4743,9 @@ static void _target_show(GtkWidget *icon_box, GtkWidget *label, GtkWidget *icon,
 }
 
 // the row opening the selection panel: the selection's icon and name,
-// centered (see _target_show), and on the right the button deleting it. The
-// sections under it act on it
+// centered (see _target_show). The sections under it act on it
 static GtkWidget *_selection_row_new(GtkWidget **icon_box,
-                                     GtkWidget **name_label,
-                                     GtkWidget **delete_btn)
+                                     GtkWidget **name_label)
 {
   *icon_box = dt_gui_hbox();
   gtk_widget_set_valign(*icon_box, GTK_ALIGN_CENTER);
@@ -4757,22 +4755,16 @@ static GtkWidget *_selection_row_new(GtkWidget **icon_box,
   gtk_label_set_ellipsize(GTK_LABEL(*name_label), PANGO_ELLIPSIZE_MIDDLE);
   dt_gui_add_class(*name_label, "dt_masks_selection_name");
 
-  *delete_btn = dtgtk_button_new(dtgtk_cairo_paint_remove, 0, NULL);
-  gtk_widget_set_valign(*delete_btn, GTK_ALIGN_CENTER);
-  dt_gui_add_class(*delete_btn, "dt_masks_selection_delete");
-
-  // the name centered on the whole row whatever sits beside it, as the
-  // section titles under it are (see _section_new)
+  // the name centered on the whole row, as the section titles under it are
+  // (see _section_new)
   GtkWidget *row = dt_gui_hbox();
   gtk_box_set_center_widget(GTK_BOX(row), dt_gui_hbox(*icon_box, *name_label));
-  gtk_box_pack_end(GTK_BOX(row), *delete_btn, FALSE, FALSE, 0);
   dt_gui_add_class(row, "dt_masks_selection_row");
   return row;
 }
 
-// "delete selection" (see _register_masks_action_shortcuts), for the delete
-// button to show its keys and the tooltips of the rows and their menus to
-// name them
+// "delete selection" (see _register_masks_action_shortcuts), for the tooltips
+// of the rows and their menus to name its keys
 static dt_action_t *_masks_delete_action = NULL;
 
 // the keys deleting the selection, as bound now in the darkroom, the one view
@@ -4786,9 +4778,9 @@ static gchar *_delete_selection_keys(void)
 static gchar *_delete_also_tip(void)
 {
   gchar *keys = _delete_selection_keys();
-  gchar *tip = keys ? g_strdup_printf(_("%s, or the delete button by the selection's name,"
+  gchar *tip = keys ? g_strdup_printf(_("%s, or the delete button in its row,"
                                         " does the same"), keys)
-                    : g_strdup(_("the delete button by the selection's name does the same"));
+                    : g_strdup(_("the delete button in its row does the same"));
   g_free(keys);
   return tip;
 }
@@ -4814,39 +4806,6 @@ static dt_mask_id_t _selection_delete_target(dt_iop_module_t *module, gboolean *
     return id;
   }
   return INVALID_MASKID;
-}
-
-// the delete button's sensitivity, and a tooltip saying what it removes, or
-// why it removes nothing. The shortcut's keys follow on their own (see
-// dt_shortcut_tooltip_callback), the button being the action's widget
-static void _selection_delete_sync(dt_iop_module_t *module)
-{
-  dt_iop_gui_blend_data_t *bd = module->blend_data;
-  if(!bd->masks_selection_delete_btn) return;
-  gboolean group;
-  const dt_mask_id_t id = _selection_delete_target(module, &group);
-  const char *tip;
-  if(dt_is_valid_maskid(id) && group)
-    tip = _("delete this group and every element in it");
-  else if(dt_is_valid_maskid(id))
-  {
-    // as the row's actions menu says it (see _build_shape_actions_menu)
-    const dt_masks_form_t *elem = dt_masks_get_from_id(darktable.develop, id);
-    const gboolean linked =
-      dt_masks_model_form_is_linked(elem)
-      || (_form_is_shape(elem) && _model_form_uses_in_mask(module, id) > 1);
-    tip = linked ? _("delete this element here; the other rows and modules"
-                     " it is linked with keep it")
-                 : _("delete this element from the mask");
-  }
-  else if(_pending_form(module))
-    tip = _("the shape being drawn is not in the mask yet: there is nothing to delete");
-  else
-    tip = _("the whole mask cannot be deleted: select the element or group"
-            " to delete.\nto remove everything in the mask, right-click"
-            " its header and choose \"reset mask\"");
-  gtk_widget_set_sensitive(bd->masks_selection_delete_btn, dt_is_valid_maskid(id));
-  gtk_widget_set_tooltip_text(bd->masks_selection_delete_btn, tip);
 }
 
 // the selection panel's row names what the panel holds: the shape being
@@ -4889,7 +4848,6 @@ static void _selection_row_update(dt_iop_module_t *module)
                 " properties and refinements");
   }
   _target_show(bd->masks_selection_icon_box, bd->masks_selection_name_label, icon_w, name);
-  _selection_delete_sync(module);
   // on the row, the icon included
   if(bd->masks_selection_name_label)
     gtk_widget_set_tooltip_text(gtk_widget_get_parent(bd->masks_selection_name_label), tip);
@@ -6293,8 +6251,8 @@ static GtkWidget *_header_stacked_cell(GtkWidget *top, GtkWidget *bottom)
 // pack a row header, shared by element rows, the pending row and group
 // headers: <handle> <name, expanding> then, in one drawer that shares a single
 // background, fixed columns counted from the right: <expander> <visibility>
-// and the kind icon with the warning badge. The badge is half size, at the top
-// of the first free column: over a group's half-size notes toggle
+// <delete> and the kind icon with the warning badge. The badge is half size,
+// at the top of the first free column: over a group's half-size notes toggle
 // (`stack_kind`), in the kind column of an element that has no kind icon, or
 // in a column of its own beside a parametric row's picker or a link. Half
 // size and stacked, the two cost one column, where they took two and kept the
@@ -6305,6 +6263,7 @@ static GtkWidget *_header_stacked_cell(GtkWidget *top, GtkWidget *bottom)
 //   of a linked shape or a raster mask; NULL for none
 // - stack_kind: kind_icon goes half size under the badge (a group's notes)
 // - visibility: see _make_visibility_button; NULL on the pending row
+// - delete_btn: see _make_delete_button; NULL on the pending row
 // - expander: expand/collapse toggle; NULL for a row with nothing to expand
 static void _pack_row_header(GtkWidget *row,
                              GtkWidget *handle,
@@ -6313,6 +6272,7 @@ static void _pack_row_header(GtkWidget *row,
                              GtkWidget *kind_icon,
                              const gboolean stack_kind,
                              GtkWidget *visibility,
+                             GtkWidget *delete_btn,
                              GtkWidget *expander)
 {
   GtkWidget *hbox = dt_gui_hbox();
@@ -6337,15 +6297,15 @@ static void _pack_row_header(GtkWidget *row,
   // the columns, right to left. Each is an icon button sized by the theme,
   // like the icons of the module's sub-panel headers, so the glyphs match
   // theirs; an empty column is a blank button of the same size
-  GtkWidget *cells[4] = { expander, visibility, NULL, NULL };
-  int n_cells = 3;
+  GtkWidget *cells[5] = { expander, visibility, delete_btn, NULL, NULL };
+  int n_cells = 4;
   if(stack_kind || !kind_icon)
-    cells[2] = _header_stacked_cell(badge, kind_icon);
+    cells[3] = _header_stacked_cell(badge, kind_icon);
   else
   {
-    cells[2] = kind_icon;
-    cells[3] = _header_stacked_cell(badge, NULL);
-    n_cells = 4;
+    cells[3] = kind_icon;
+    cells[4] = _header_stacked_cell(badge, NULL);
+    n_cells = 5;
   }
   for(int i = 0; i < n_cells; i++)
     gtk_box_pack_end(GTK_BOX(drawer), cells[i] ? cells[i] : _header_blank_cell(),
@@ -6870,6 +6830,18 @@ static GtkWidget *_make_visibility_button(void)
   GtkWidget *btn = dtgtk_button_new(dtgtk_cairo_paint_eye_toggle, 0, NULL);
   dt_gui_add_class(btn, "dt_masks_icon");
   dt_gui_add_class(btn, "dt_masks_eye");
+  gtk_widget_set_valign(btn, GTK_ALIGN_CENTER);
+  return btn;
+}
+
+// the delete button, left of the visibility button on every element row and
+// group header (see _pack_row_header). The caller sets its tooltip, tags it
+// and connects its press handler (see _delete_form_pressed,
+// _delete_group_pressed)
+static GtkWidget *_make_delete_button(void)
+{
+  GtkWidget *btn = dtgtk_button_new(dtgtk_cairo_paint_basket, 0, NULL);
+  dt_gui_add_class(btn, "dt_masks_icon");
   gtk_widget_set_valign(btn, GTK_ALIGN_CENTER);
   return btn;
 }
@@ -9443,6 +9415,18 @@ static void _delete_single_shape(dt_iop_module_t *module,
   _commit_structure_change(module);
 }
 
+static void _delete_form_pressed(GtkGestureSingle *gesture, const int n_press,
+                                 const double x, const double y,
+                                 dt_iop_module_t *module)
+{
+  if(gtk_gesture_single_get_current_button(gesture) != GDK_BUTTON_PRIMARY) return;
+  dt_gui_claim(gesture);
+  GtkWidget *w = dt_gui_get_widget(gesture);
+  const dt_mask_id_t id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(w), "formid"));
+  dt_masks_point_group_t *pt = g_object_get_data(G_OBJECT(w), "point");
+  _delete_single_shape(module, id, pt);
+}
+
 void dt_iop_gui_blend_delete_element(dt_iop_module_t *module, const dt_mask_id_t id)
 {
   if(module && module->blend_data) _delete_single_shape(module, id, NULL);
@@ -10988,6 +10972,16 @@ static void _visibility_group_pressed(GtkGestureSingle *gesture,
     _toggle_solo_group(module, cid);
 }
 
+static void _delete_group_pressed(GtkGestureSingle *gesture, const int n_press,
+                                  const double x, const double y,
+                                  dt_iop_module_t *module)
+{
+  if(gtk_gesture_single_get_current_button(gesture) != GDK_BUTTON_PRIMARY) return;
+  dt_gui_claim(gesture);
+  GtkWidget *w = dt_gui_get_widget(gesture);
+  _group_delete(module, _header_cid(w));   // _header_cid reads "group-key"
+}
+
 // set a group's flexi operator, on its marker. Maximum sets no bit, so a
 // group that never touches this stays byte-identical
 static void
@@ -12261,7 +12255,7 @@ static GtkWidget *_make_pending_shape_row(dt_iop_module_t *module, dt_masks_form
   // drawer: no element yet to warn about, hide or expand. Its columns stay
   // blank so the name lines up
   _pack_row_header(row, handle, name, NULL,
-                   NULL, FALSE, NULL, NULL);
+                   NULL, FALSE, NULL, NULL, NULL);
 
   GtkWidget *row_vbox = dt_gui_vbox(row);
   dt_gui_add_class(row_vbox, "dt_masks_row");
@@ -14932,6 +14926,16 @@ static GtkWidget *_make_shape_row(dt_iop_module_t *module,
   g_object_set_data(G_OBJECT(visibility), "formid", GINT_TO_POINTER(fid));
   _press_before_widget(dt_gui_connect_click(visibility, _visibility_form_pressed, NULL, module));
 
+  // delete: this reference of the element, or of a nested group with its
+  // elements (see _delete_single_shape)
+  GtkWidget *delete_btn = _make_delete_button();
+  gtk_widget_set_tooltip_text(delete_btn,
+                              is_subgroup ? _("delete this group and every element in it")
+                                          : _("delete this element"));
+  g_object_set_data(G_OBJECT(delete_btn), "formid", GINT_TO_POINTER(fid));
+  g_object_set_data(G_OBJECT(delete_btn), "point", fpt);
+  _press_before_widget(dt_gui_connect_click(delete_btn, _delete_form_pressed, NULL, module));
+
   // low-opacity warning: blank unless this element's opacity is under
   // MASK_LOW_OPACITY_WARN. Its initial state is set by the
   // _refresh_lowop_badges call at the end of dt_masks_gui_build_list, once the
@@ -14963,7 +14967,7 @@ static GtkWidget *_make_shape_row(dt_iop_module_t *module,
                            : (form->type & DT_MASKS_RASTER)   ? _make_raster_source_link(form)
                                                               : linked_slot;
   _pack_row_header(row, handle, evbox, lowop_badge, action_icon, FALSE,
-                   visibility, expand_toggle);
+                   visibility, delete_btn, expand_toggle);
 
   // an event box around the row drives the canvas hover feedback (labels +
   // highlight), which hovering it limits to this shape. Its real window
@@ -15607,6 +15611,26 @@ static void _pack_group(dt_iop_module_t *module,
                                                           : MASK_VISIBILITY_SHOWN);
   _press_before_widget(dt_gui_connect_click(group_visibility, _visibility_group_pressed, NULL,
                                             module));
+
+  // delete: the group goes, with its elements (see _group_delete). The mask's
+  // own group is the mask and stays, so its button is a disabled blank. A
+  // locked mask needs no check here: _mask_lock_sync makes the whole list
+  // insensitive, and a state set at build time would outlive an unlock
+  GtkWidget *group_delete = _make_delete_button();
+  g_object_set_data(G_OBJECT(group_delete), "group-key", GUINT_TO_POINTER(cid));
+  if(is_root)
+  {
+    gtk_widget_set_sensitive(group_delete, FALSE);
+    gtk_widget_set_tooltip_text(group_delete, _("the whole mask cannot be deleted"));
+  }
+  else
+  {
+    gtk_widget_set_tooltip_text(group_delete,
+                                _("delete this group and every element in it"));
+    _press_before_widget(dt_gui_connect_click(group_delete, _delete_group_pressed,
+                                              NULL, module));
+  }
+
   // low-opacity warning for the whole group (blank by default, activated in place by
   // _refresh_lowop_badges, which also sets its initial state at the end of
   // this rebuild)
@@ -15798,7 +15822,7 @@ static void _pack_group(dt_iop_module_t *module,
   }
 
   _pack_row_header(hdr, ghandle, labevt, group_lowop_badge, note_toggle, TRUE,
-                   group_visibility, group_expander);
+                   group_visibility, group_delete, group_expander);
   // dimmed when the group contributes nothing: suppressed by a solo, or the
   // whole group bypassed (in which case the visibility button that brings it
   // back stays at full opacity)
@@ -16974,7 +16998,7 @@ static void _shortcut_invert_selected_element(dt_action_t *action)
 }
 
 // delete what the selection row names (see _selection_delete_target): the
-// selection panel's delete button and the "delete selection" shortcut
+// "delete selection" shortcut
 static void _delete_selection(dt_iop_module_t *module)
 {
   gboolean group;
@@ -16990,11 +17014,6 @@ static void _shortcut_delete_selection(dt_action_t *action)
 {
   dt_iop_gui_blend_data_t *bd = _shortcut_target();
   if(bd && bd->masks_inited) _delete_selection(bd->module);
-}
-
-static void _selection_delete_clicked(GtkButton *button, dt_iop_module_t *module)
-{
-  _delete_selection(module);
 }
 
 // the header toggle has its own widget action under "blend`tools", but
@@ -18353,14 +18372,7 @@ void dt_iop_gui_init_blending(GtkWidget *iopw,
     // #blending-box, whose padding would inset them once more than the
     // refinement beside them
     bd->masks_selection_area = dt_gui_vbox(
-      _selection_row_new(&bd->masks_selection_icon_box, &bd->masks_selection_name_label,
-                         &bd->masks_selection_delete_btn));
-    g_signal_connect(G_OBJECT(bd->masks_selection_delete_btn), "clicked",
-                     G_CALLBACK(_selection_delete_clicked), module);
-    // the button is the shortcut's widget, so its tooltip lists the keys
-    // deleting the selection, as rebound
-    if(_masks_delete_action)
-      dt_action_define(_masks_delete_action, NULL, NULL, bd->masks_selection_delete_btn, NULL);
+      _selection_row_new(&bd->masks_selection_icon_box, &bd->masks_selection_name_label));
     gtk_widget_set_name(bd->masks_selection_area, "masks-selection-area");
     _add_wrapped_box(bd->masks_selection_area, bd->props_panel_box, "masks_drawn");
     // renamed from the #blending-box _add_wrapped_box gives it, whose padding

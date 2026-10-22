@@ -1982,6 +1982,32 @@ void dtgtk_cairo_paint_remove(cairo_t *cr, const gint x, const gint y, const gin
   FINISH
 }
 
+void dtgtk_cairo_paint_basket(cairo_t *cr, const gint x, const gint y, const gint w, const gint h, const gint flags, void *data)
+{
+  PREAMBLE(0.95, 1, 0, 0)
+
+  // the handle
+  cairo_arc(cr, 0.5, 0.35, 0.15, M_PI, 2 * M_PI);
+  cairo_stroke(cr);
+
+  // the basket body: a trapezoid, wider at the rim
+  cairo_move_to(cr, 0.15, 0.35);
+  cairo_line_to(cr, 0.85, 0.35);
+  cairo_line_to(cr, 0.72, 0.9);
+  cairo_line_to(cr, 0.28, 0.9);
+  cairo_close_path(cr);
+  cairo_stroke(cr);
+
+  // the diagonals across the body
+  cairo_move_to(cr, 0.28, 0.9);
+  cairo_line_to(cr, 0.85, 0.35);
+  cairo_move_to(cr, 0.72, 0.9);
+  cairo_line_to(cr, 0.15, 0.35);
+  cairo_stroke(cr);
+
+  FINISH
+}
+
 void dtgtk_cairo_paint_star(cairo_t *cr, const gint x, const gint y, const gint w, const gint h, gint flags, void *data)
 {
   PREAMBLE(1, 1, 0, 0)
