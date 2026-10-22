@@ -466,6 +466,7 @@ static void spv_reflect(const uint32_t *code, size_t words, const char *entry, s
   if(!iface) die("entry point %s not found", entry);
 
   info->nparams = 0;
+  int push_type = -1;
   for(int k = 0; k < niface; k++)
   {
     const uint32_t id = iface[k];
@@ -474,6 +475,7 @@ static void spv_reflect(const uint32_t *code, size_t words, const char *entry, s
     if(var_storage[id] == 9) // PushConstant: the uniform scalars
     {
       const int st = ptr_pointee[var_ptrtype[id]];
+      push_type = st;
       for(int m = 0; m < nmembers; m++)
         if(members[m].type == st && members[m].name[0])
         {
@@ -494,11 +496,14 @@ static void spv_reflect(const uint32_t *code, size_t words, const char *entry, s
       p->offset = -1;
     }
   }
-  // member offsets are only known after the whole module was read
+  // member offsets are only known after the whole module was read. Each entry
+  // point has its own push constant struct, with the same member names in
+  // different places, so only this entry point's struct counts
   for(int k = 0; k < info->nparams; k++)
     if(info->params[k].binding < 0)
       for(int m = 0; m < nmembers; m++)
-        if(!strcmp(members[m].name, info->params[k].name) && members[m].offset >= 0)
+        if(members[m].type == push_type && !strcmp(members[m].name, info->params[k].name)
+           && members[m].offset >= 0)
           info->params[k].offset = members[m].offset;
 
   free(names);
