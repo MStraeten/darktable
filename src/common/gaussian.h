@@ -157,6 +157,21 @@ static inline int dt_gaussian_mean_blur_cl(const int devid,
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+
+/** Like dt_gaussian_blur_cl() with order 0, for a single channel device image
+ *  of the Slang kernels. Returns 0 on success.
+ */
+int dt_gaussian_blur_slang(dt_slang_gpu_image_t *dev_in,
+                           dt_slang_gpu_image_t *dev_out,
+                           const int width,
+                           const int height,
+                           const float sigma,
+                           const float max,
+                           const float min);
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

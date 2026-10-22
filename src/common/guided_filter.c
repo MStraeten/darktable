@@ -719,6 +719,124 @@ int guided_filter_cl(int devid,
 
 #endif
 
+#ifdef HAVE_SLANG_GPU
+static int _slang_box_mean(const int width,
+                           const int height,
+                           const int w,
+                           dt_slang_gpu_image_t *in,
+                           dt_slang_gpu_image_t *out,
+                           dt_slang_gpu_image_t *temp)
+{
+  const int err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_x", height, 1,
+                                           SLARG(width), SLARG(height), SLIMG_DEV(in), SLIMG_DEV(temp), SLARG(w));
+  if(err) return err;
+  return dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_y", width, 1,
+                                  SLARG(width), SLARG(height), SLIMG_DEV(temp), SLIMG_DEV(out), SLARG(w));
+}
+
+static int _slang_update_covariance(const int width,
+                                    const int height,
+                                    dt_slang_gpu_image_t *in,
+                                    dt_slang_gpu_image_t *out,
+                                    dt_slang_gpu_image_t *a,
+                                    dt_slang_gpu_image_t *b,
+                                    const float eps)
+{
+  return dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_update_covariance", width, height,
+                                  SLARG(width), SLARG(height), SLIMG_DEV(in), SLIMG_DEV(out),
+                                  SLIMG_DEV(a), SLIMG_DEV(b), SLARG(eps));
+}
+
+int guided_filter_slang(dt_slang_gpu_image_t *guide,
+                        dt_slang_gpu_image_t *in,
+                        dt_slang_gpu_image_t *out,
+                        const int width,
+                        const int height,
+                        const int w,              // window size
+                        const float sqrt_eps,     // regularization parameter
+                        const float guide_weight, // to balance the amplitudes in the guiding and input image
+                        const float min,
+                        const float max)
+{
+  const float eps = sqrt_eps * sqrt_eps; // this is the regularization parameter of the original papers
+  const int first = 0;
+
+  // temp1, temp2, img_mean, imgg_mean_r/g/b, cov_imgg_img_r/g/b,
+  // var_imgg_rr/rg/rb/gg/gb/bb, a_r, a_g, a_b and b, as in _guided_filter_cl_impl()
+  enum { SL_TEMP1, SL_TEMP2, SL_IMG_MEAN, SL_MEAN_R, SL_MEAN_G, SL_MEAN_B, SL_COV_R, SL_COV_G, SL_COV_B,
+         SL_VAR_RR, SL_VAR_RG, SL_VAR_RB, SL_VAR_GG, SL_VAR_GB, SL_VAR_BB,
+         SL_A_R, SL_A_G, SL_A_B, SL_B, SL_N_IMAGES };
+  dt_slang_gpu_image_t *img[SL_N_IMAGES] = { NULL };
+  int err = 0;
+  for(int k = 0; k < SL_N_IMAGES && !err; k++)
+  {
+    img[k] = dt_slang_gpu_image_new(width, height, 1, NULL);
+    err = !img[k];
+  }
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_split_rgb_image", width, height,
+                                   SLARG(width), SLARG(height), SLARG(first), SLIMG_DEV(guide),
+                                   SLIMG_DEV(img[SL_MEAN_R]), SLIMG_DEV(img[SL_MEAN_G]), SLIMG_DEV(img[SL_MEAN_B]),
+                                   SLARG(guide_weight));
+
+  if(!err) err = _slang_box_mean(width, height, w, in, img[SL_IMG_MEAN], img[SL_TEMP1]);
+  if(!err) err = _slang_box_mean(width, height, w, img[SL_MEAN_R], img[SL_MEAN_R], img[SL_TEMP1]);
+  if(!err) err = _slang_box_mean(width, height, w, img[SL_MEAN_G], img[SL_MEAN_G], img[SL_TEMP1]);
+  if(!err) err = _slang_box_mean(width, height, w, img[SL_MEAN_B], img[SL_MEAN_B], img[SL_TEMP1]);
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_covariances", width, height,
+                                   SLARG(width), SLARG(height), SLARG(first), SLIMG_DEV(guide), SLIMG_DEV(in),
+                                   SLIMG_DEV(img[SL_COV_R]), SLIMG_DEV(img[SL_COV_G]), SLIMG_DEV(img[SL_COV_B]),
+                                   SLARG(guide_weight));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_variances", width, height,
+                                   SLARG(width), SLARG(height), SLARG(first), SLIMG_DEV(guide),
+                                   SLIMG_DEV(img[SL_VAR_RR]), SLIMG_DEV(img[SL_VAR_RG]), SLIMG_DEV(img[SL_VAR_RB]),
+                                   SLIMG_DEV(img[SL_VAR_GG]), SLIMG_DEV(img[SL_VAR_GB]), SLIMG_DEV(img[SL_VAR_BB]),
+                                   SLARG(guide_weight));
+
+  // each covariance and variance, box filtered, minus the product of the means
+  static const int updates[9][4] = {
+    { SL_COV_R, SL_MEAN_R, SL_IMG_MEAN, 0 }, { SL_COV_G, SL_MEAN_G, SL_IMG_MEAN, 0 }, { SL_COV_B, SL_MEAN_B, SL_IMG_MEAN, 0 },
+    { SL_VAR_RR, SL_MEAN_R, SL_MEAN_R, 1 },  { SL_VAR_RG, SL_MEAN_R, SL_MEAN_G, 0 },  { SL_VAR_RB, SL_MEAN_R, SL_MEAN_B, 0 },
+    { SL_VAR_GG, SL_MEAN_G, SL_MEAN_G, 1 },  { SL_VAR_GB, SL_MEAN_G, SL_MEAN_B, 0 },  { SL_VAR_BB, SL_MEAN_B, SL_MEAN_B, 1 } };
+  for(int k = 0; k < 9 && !err; k++)
+  {
+    err = _slang_box_mean(width, height, w, img[updates[k][0]], img[SL_TEMP2], img[SL_TEMP1]);
+    if(!err)
+      err = _slang_update_covariance(width, height, img[SL_TEMP2], img[updates[k][0]], img[updates[k][1]],
+                                     img[updates[k][2]], updates[k][3] ? eps : 0.f);
+  }
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_solve", width, height,
+                                   SLARG(width), SLARG(height), SLIMG_DEV(img[SL_IMG_MEAN]),
+                                   SLIMG_DEV(img[SL_MEAN_R]), SLIMG_DEV(img[SL_MEAN_G]), SLIMG_DEV(img[SL_MEAN_B]),
+                                   SLIMG_DEV(img[SL_COV_R]), SLIMG_DEV(img[SL_COV_G]), SLIMG_DEV(img[SL_COV_B]),
+                                   SLIMG_DEV(img[SL_VAR_RR]), SLIMG_DEV(img[SL_VAR_RG]), SLIMG_DEV(img[SL_VAR_RB]),
+                                   SLIMG_DEV(img[SL_VAR_GG]), SLIMG_DEV(img[SL_VAR_GB]), SLIMG_DEV(img[SL_VAR_BB]),
+                                   SLIMG_DEV(img[SL_A_R]), SLIMG_DEV(img[SL_A_G]), SLIMG_DEV(img[SL_A_B]),
+                                   SLIMG_DEV(img[SL_B]));
+
+  if(!err) err = _slang_box_mean(width, height, w, img[SL_A_R], img[SL_A_R], img[SL_TEMP1]);
+  if(!err) err = _slang_box_mean(width, height, w, img[SL_A_G], img[SL_A_G], img[SL_TEMP1]);
+  if(!err) err = _slang_box_mean(width, height, w, img[SL_A_B], img[SL_A_B], img[SL_TEMP1]);
+  if(!err) err = _slang_box_mean(width, height, w, img[SL_B], img[SL_B], img[SL_TEMP1]);
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_generate_result", width, height,
+                                   SLARG(width), SLARG(height), SLARG(first), SLIMG_DEV(guide),
+                                   SLIMG_DEV(img[SL_A_R]), SLIMG_DEV(img[SL_A_G]), SLIMG_DEV(img[SL_A_B]),
+                                   SLIMG_DEV(img[SL_B]), SLIMG_DEV(out),
+                                   SLARG(guide_weight), SLARG(min), SLARG(max));
+
+  if(err) dt_slang_gpu_wait();
+  for(int k = 0; k < SL_N_IMAGES; k++) dt_slang_gpu_image_free(img[k]);
+  return err;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

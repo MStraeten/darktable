@@ -2223,13 +2223,16 @@ gboolean dt_develop_blend_slang_supported(dt_iop_module_t *self,
                            || self->suppress_mask)))
     return FALSE;
 
-  // feathering and mask blur have no Slang kernels yet
+  // the guided filter of feathering takes an RGB guide
   const gboolean global_refine_bypass = _flexi_global_refine_bypassed(piece, d);
   _develop_mask_post_processing post_operations[3];
   const size_t post_operations_size =
     global_refine_bypass ? 0 : _get_post_operations(d, piece, post_operations);
   for(size_t k = 0; k < post_operations_size; k++)
-    if(post_operations[k] != DEVELOP_MASK_POST_TONE_CURVE) return FALSE;
+    if((post_operations[k] == DEVELOP_MASK_POST_FEATHER_IN
+        || post_operations[k] == DEVELOP_MASK_POST_FEATHER_OUT)
+       && piece->colors != 4)
+      return FALSE;
 
   // the jzczhz mask kernel writes nothing without a profile, in OpenCL too
   dt_iop_order_iccprofile_info_t profile;
@@ -2469,20 +2472,67 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
                 "%s, %s%s", _develop_blend_colorspace_to_str(blend_csp), what,
                 (mask_mode & DEVELOP_MASK_CONDITIONAL) ? ", parametric" : "");
 
-  // the mask tone curve, the only post-processing dt_develop_blend_slang_supported() lets through
+  // post processing the mask, which ends up in dev_mask
   if(!uniform && post_operations_size)
   {
     if(!dev_mask_2) dev_mask_2 = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
     if(!dev_mask_2) goto error;
-    const float e = expf(3.f * d->contrast);
-    const float brightness = d->brightness;
-    if(dt_slang_gpu_run_2d_args("blendop", "blendop_mask_tone_curve", owidth, oheight,
-         SLIMG_DEV(dev_mask), SLIMG_DEV(dev_mask_2), SLARG(owidth), SLARG(oheight),
-         SLARG(e), SLARG(brightness), SLARG(opacity)))
-      goto error;
-    dt_slang_gpu_image_t *swap = dev_mask;
-    dev_mask = dev_mask_2;
-    dev_mask_2 = swap;
+    const int featherw = _required_w(d->feathering_radius, roi_out->scale / piece->iscale,
+                                     MAX(owidth, oheight));
+    const float sqrt_eps = _get_feathering_eps(piece);
+    const float guide_weight = _get_guide_weight(piece);
+
+    for(size_t index = 0; index < post_operations_size; index++)
+    {
+      const _develop_mask_post_processing operation = post_operations[index];
+      if(operation == DEVELOP_MASK_POST_FEATHER_IN)
+      {
+        const gboolean rois_equal = roi_in->width == owidth && roi_in->height == oheight;
+        dt_slang_gpu_image_t *dev_guide = dev_in;
+        if(!rois_equal)
+        {
+          dev_guide = dt_slang_gpu_image_new(owidth, oheight, 4, NULL);
+          const int iwidth = roi_in->width;
+          const int iheight = roi_in->height;
+          if(!dev_guide
+             || dt_slang_gpu_run_2d_args("basic", "interpolation_copy", owidth, oheight,
+                  SLIMG_DEV(dev_in), SLIMG_DEV(dev_guide), SLARG(owidth), SLARG(oheight),
+                  SLARG(iwidth), SLARG(iheight), SLARG(offs[0]), SLARG(offs[1])))
+          {
+            dt_slang_gpu_image_free(dev_guide);
+            goto error;
+          }
+        }
+        const int err = guided_filter_slang(dev_guide, dev_mask, dev_mask_2, owidth, oheight, featherw,
+                                            sqrt_eps, guide_weight, 0.0f, 1.0f);
+        if(!rois_equal) dt_slang_gpu_image_free(dev_guide);
+        if(err) goto error;
+      }
+      else if(operation == DEVELOP_MASK_POST_FEATHER_OUT)
+      {
+        if(guided_filter_slang(dev_module, dev_mask, dev_mask_2, owidth, oheight, featherw,
+                               sqrt_eps, guide_weight, 0.0f, 1.0f))
+          goto error;
+      }
+      else if(operation == DEVELOP_MASK_POST_BLUR)
+      {
+        const float sigma = d->blur_radius * roi_out->scale / piece->iscale;
+        if(dt_gaussian_blur_slang(dev_mask, dev_mask_2, owidth, oheight, sigma, 1.0f, 0.0f))
+          goto error;
+      }
+      else if(operation == DEVELOP_MASK_POST_TONE_CURVE)
+      {
+        const float e = expf(3.f * d->contrast);
+        const float brightness = d->brightness;
+        if(dt_slang_gpu_run_2d_args("blendop", "blendop_mask_tone_curve", owidth, oheight,
+             SLIMG_DEV(dev_mask), SLIMG_DEV(dev_mask_2), SLARG(owidth), SLARG(oheight),
+             SLARG(e), SLARG(brightness), SLARG(opacity)))
+          goto error;
+      }
+      dt_slang_gpu_image_t *swap = dev_mask;
+      dev_mask = dev_mask_2;
+      dev_mask_2 = swap;
+    }
   }
 
   const int blend_mode = d->blend_mode;
