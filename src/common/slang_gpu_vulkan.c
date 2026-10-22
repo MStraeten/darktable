@@ -34,6 +34,7 @@
 // every Vulkan device supports at least 128 bytes of push constants
 #define DT_SLANG_PUSH_SIZE 128
 #define DT_SLANG_POOL_SIZE 4
+#define DT_SLANG_BUFFER_POOL_SIZE 12
 
 typedef struct dt_slang_resource_t
 {
@@ -67,6 +68,7 @@ typedef struct dt_slang_vulkan_t
   VkCommandPool pool;
   GHashTable *kernels; // "program:kernel" -> dt_slang_kernel_t
   GList *images;       // freed device images, for reuse
+  GList *buffers;      // freed device buffers, for reuse
 } dt_slang_vulkan_t;
 
 static dt_slang_vulkan_t _vk = { 0 };
@@ -77,6 +79,7 @@ static GThread *_prepare_thread = NULL;
 // device
 
 static void _image_free(struct dt_slang_gpu_image_t *img);
+static void _buffer_free(struct dt_slang_gpu_buffer_t *buf);
 
 static void _destroy_kernel(gpointer data)
 {
@@ -201,6 +204,7 @@ void dt_slang_gpu_cleanup(void)
   g_mutex_lock(&_vk_lock);
   if(_vk.dev) vkDeviceWaitIdle(_vk.dev);
   g_list_free_full(_vk.images, (GDestroyNotify)_image_free);
+  g_list_free_full(_vk.buffers, (GDestroyNotify)_buffer_free);
   if(_vk.kernels) g_hash_table_destroy(_vk.kernels);
   if(_vk.pool) vkDestroyCommandPool(_vk.dev, _vk.pool, NULL);
   if(_vk.dev) vkDestroyDevice(_vk.dev, NULL);
@@ -523,7 +527,12 @@ static gboolean _memtype(const uint32_t bits, const VkMemoryPropertyFlags want, 
   return FALSE;
 }
 
-static gboolean _alloc_buffer(dt_slang_mem_t *m, const VkDeviceSize size, const VkBufferUsageFlags usage)
+// a mapped buffer, in device local memory if prefer_device and the device
+// has some that the host can map
+static gboolean _alloc_buffer_in(dt_slang_mem_t *m,
+                                 const VkDeviceSize size,
+                                 const VkBufferUsageFlags usage,
+                                 const gboolean prefer_device)
 {
   const VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                    .size = size,
@@ -531,9 +540,10 @@ static gboolean _alloc_buffer(dt_slang_mem_t *m, const VkDeviceSize size, const 
   if(vkCreateBuffer(_vk.dev, &bci, NULL, &m->buffer) != VK_SUCCESS) return FALSE;
   VkMemoryRequirements req;
   vkGetBufferMemoryRequirements(_vk.dev, m->buffer, &req);
+  const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   uint32_t type;
-  if(!_memtype(req.memoryTypeBits,
-               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &type))
+  if(!(prefer_device && _memtype(req.memoryTypeBits, host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type))
+     && !_memtype(req.memoryTypeBits, host, &type))
     return FALSE;
   const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                      .allocationSize = req.size,
@@ -541,6 +551,11 @@ static gboolean _alloc_buffer(dt_slang_mem_t *m, const VkDeviceSize size, const 
   return vkAllocateMemory(_vk.dev, &mai, NULL, &m->buffer_mem) == VK_SUCCESS
          && vkBindBufferMemory(_vk.dev, m->buffer, m->buffer_mem, 0) == VK_SUCCESS
          && vkMapMemory(_vk.dev, m->buffer_mem, 0, size, 0, &m->map) == VK_SUCCESS;
+}
+
+static gboolean _alloc_buffer(dt_slang_mem_t *m, const VkDeviceSize size, const VkBufferUsageFlags usage)
+{
+  return _alloc_buffer_in(m, size, usage, FALSE);
 }
 
 static gboolean _create_image(VkImage *image,
@@ -817,6 +832,77 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host)
   return err;
 }
 
+// device buffers are mapped storage buffers, so the host reads them directly
+// once the queue is idle, which it is between runs
+struct dt_slang_gpu_buffer_t
+{
+  dt_slang_mem_t mem;
+  size_t size;
+};
+
+static void _buffer_free(dt_slang_gpu_buffer_t *buf)
+{
+  _free_mem(&buf->mem);
+  g_free(buf);
+}
+
+dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *host)
+{
+  if(!dt_slang_gpu_enabled() || size == 0) return NULL;
+
+  g_mutex_lock(&_vk_lock);
+  dt_slang_gpu_buffer_t *buf = NULL;
+  for(GList *l = _vk.buffers; l; l = g_list_next(l))
+  {
+    dt_slang_gpu_buffer_t *pooled = l->data;
+    if(pooled->size == size)
+    {
+      _vk.buffers = g_list_delete_link(_vk.buffers, l);
+      buf = pooled;
+      break;
+    }
+  }
+  if(!buf)
+  {
+    buf = g_new0(dt_slang_gpu_buffer_t, 1);
+    buf->size = size;
+    if(!_alloc_buffer_in(&buf->mem, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, TRUE))
+    {
+      dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
+      _buffer_free(buf);
+      buf = NULL;
+    }
+  }
+  if(buf && host) memcpy(buf->mem.map, host, size);
+  g_mutex_unlock(&_vk_lock);
+  return buf;
+}
+
+void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buf)
+{
+  if(!buf) return;
+  g_mutex_lock(&_vk_lock);
+  // a demosaic chain holds eight buffers of the same size
+  _vk.buffers = g_list_prepend(_vk.buffers, buf);
+  GList *last = g_list_nth(_vk.buffers, DT_SLANG_BUFFER_POOL_SIZE);
+  if(last)
+  {
+    last->prev->next = NULL;
+    last->prev = NULL;
+    g_list_free_full(last, (GDestroyNotify)_buffer_free);
+  }
+  g_mutex_unlock(&_vk_lock);
+}
+
+int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buf, void *host, const size_t size)
+{
+  if(!buf || !host || size > buf->size) return 1;
+  g_mutex_lock(&_vk_lock);
+  memcpy(host, buf->mem.map, size);
+  g_mutex_unlock(&_vk_lock);
+  return 0;
+}
+
 // --------------------------------------------------------------------------------------------
 // dispatch
 
@@ -845,9 +931,11 @@ static int _run(const char *program,
       continue;
     }
     if(nres >= k->nres) goto mismatch;
-    if(arg->kind == DT_SLANG_ARG_IMAGE_DEV)
+    if(arg->kind == DT_SLANG_ARG_IMAGE_DEV || arg->kind == DT_SLANG_ARG_BUFFER_DEV)
     {
-      if(k->res[nres].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) goto mismatch;
+      if((k->res[nres].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) != (arg->kind == DT_SLANG_ARG_BUFFER_DEV)
+         || !arg->ptr)
+        goto mismatch;
       res_arg[nres++] = a;
       continue;
     }
@@ -886,6 +974,12 @@ static int _run(const char *program,
       const dt_slang_gpu_image_t *img = arg->ptr;
       image_info[r] = (VkDescriptorImageInfo){ .imageView = img->view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
       writes[r].pImageInfo = &image_info[r];
+    }
+    else if(arg->kind == DT_SLANG_ARG_BUFFER_DEV)
+    {
+      const dt_slang_gpu_buffer_t *buf = arg->ptr;
+      buffer_info[r] = (VkDescriptorBufferInfo){ buf->mem.buffer, 0, buf->size };
+      writes[r].pBufferInfo = &buffer_info[r];
     }
     else if(arg->kind == DT_SLANG_ARG_BUFFER)
     {

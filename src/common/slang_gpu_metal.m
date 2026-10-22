@@ -33,6 +33,7 @@
 
 #define DT_SLANG_MAX_PARAMS 32
 #define DT_SLANG_POOL_SIZE 4
+#define DT_SLANG_BUFFER_POOL_SIZE 12
 
 @interface DtSlangKernel : NSObject
 {
@@ -64,6 +65,7 @@ typedef struct dt_slang_metal_t
   __strong NSMutableDictionary<NSString *, DtSlangKernel *> *kernels; // "program:kernel"
   __strong id<MTLCommandBuffer> pending; // committed without waiting
   __strong NSMutableArray *images;        // freed device images, most recent first
+  __strong NSMutableArray *buffers;       // freed device buffers, most recent first
   NSUInteger max_image_dim;
 } dt_slang_metal_t;
 
@@ -94,6 +96,7 @@ static gboolean _init_device(void)
   _mtl.libraries = [NSMutableDictionary dictionary];
   _mtl.kernels = [NSMutableDictionary dictionary];
   _mtl.images = [NSMutableArray array];
+  _mtl.buffers = [NSMutableArray array];
   dt_print(DT_DEBUG_OPENCL, "[slang_gpu] using Metal device %s%s", _mtl.dev.name.UTF8String,
            _mtl.dev.hasUnifiedMemory ? " (unified memory)" : "");
   return TRUE;
@@ -125,6 +128,7 @@ void dt_slang_gpu_cleanup(void)
   if(_mtl.pending) [_mtl.pending waitUntilCompleted];
   _mtl.pending = nil;
   _mtl.images = nil;
+  _mtl.buffers = nil;
   _mtl.kernels = nil;
   _mtl.libraries = nil;
   _mtl.queue = nil;
@@ -413,6 +417,18 @@ static DtSlangImage *_image_wrap(const void *host, const int width, const int he
   return img;
 }
 
+// a device buffer, in shared storage like the images
+@interface DtSlangBuffer : NSObject
+{
+@public
+  id<MTLBuffer> buffer;
+  size_t size;
+}
+@end
+
+@implementation DtSlangBuffer
+@end
+
 // waits for the last command buffer that ran without waiting
 static void _finish(void)
 {
@@ -456,9 +472,9 @@ static int _run(const char *program,
       memcpy(vals + k->val_offset[nvals], arg->ptr, arg->size);
       nvals++;
     }
-    else if(arg->kind == DT_SLANG_ARG_BUFFER)
+    else if(arg->kind == DT_SLANG_ARG_BUFFER || arg->kind == DT_SLANG_ARG_BUFFER_DEV)
     {
-      if(nbuf >= k->nbuf) goto mismatch;
+      if(nbuf >= k->nbuf || !arg->ptr) goto mismatch;
       buf_arg[nbuf++] = a;
     }
     else
@@ -492,9 +508,11 @@ static int _run(const char *program,
   for(int b = 0; b < nbuf; b++)
   {
     const dt_slang_arg_t *arg = &args[buf_arg[b]];
-    id<MTLBuffer> buf = [_mtl.dev newBufferWithBytes:arg->ptr
-                                              length:arg->size
-                                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf = arg->kind == DT_SLANG_ARG_BUFFER_DEV
+      ? ((__bridge DtSlangBuffer *)arg->ptr)->buffer
+      : [_mtl.dev newBufferWithBytes:arg->ptr
+                              length:arg->size
+                             options:MTLResourceStorageModeShared];
     if(!buf) goto failed;
     [enc setBuffer:buf offset:0 atIndex:k->buf_index[b]];
   }
@@ -712,5 +730,83 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *image, const void *host)
   _copy_rows(img->buffer.contents, img->pitch, host, row, row, img->height);
   dt_print(DT_DEBUG_PERF, "[slang_gpu] writing %dx%d to the device took %.3f secs",
            img->width, img->height, dt_get_debug_wtime() - start);
+  return 0;
+}
+
+// --------------------------------------------------------------------------------------------
+// device buffers
+
+dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *host)
+{
+  if(!dt_slang_gpu_enabled() || size == 0) return NULL;
+
+  g_mutex_lock(&_mtl_lock);
+  DtSlangBuffer *buf = nil;
+  @autoreleasepool
+  {
+    for(NSUInteger i = 0; i < _mtl.buffers.count; i++)
+    {
+      DtSlangBuffer *pooled = _mtl.buffers[i];
+      if(pooled->size == size)
+      {
+        buf = pooled;
+        [_mtl.buffers removeObjectAtIndex:i];
+        break;
+      }
+    }
+    if(buf && host)
+    {
+      // the buffer may still be in use by a pending kernel
+      _finish();
+      memcpy(buf->buffer.contents, host, size);
+    }
+    else if(!buf && size <= _mtl.dev.maxBufferLength)
+    {
+      id<MTLBuffer> mb = host
+        ? [_mtl.dev newBufferWithBytes:host length:size options:MTLResourceStorageModeShared]
+        : [_mtl.dev newBufferWithLength:size options:MTLResourceStorageModeShared];
+      if(mb)
+      {
+        buf = [DtSlangBuffer new];
+        buf->buffer = mb;
+        buf->size = size;
+      }
+    }
+  }
+  g_mutex_unlock(&_mtl_lock);
+  if(!buf) dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
+  return buf ? (__bridge_retained dt_slang_gpu_buffer_t *)buf : NULL;
+}
+
+void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buffer)
+{
+  if(!buffer) return;
+  DtSlangBuffer *buf = CFBridgingRelease(buffer);
+  g_mutex_lock(&_mtl_lock);
+  // a demosaic chain holds eight buffers of the same size. A pending command
+  // buffer keeps its own reference to the MTLBuffer.
+  if(_mtl.buffers)
+  {
+    [_mtl.buffers insertObject:buf atIndex:0];
+    while(_mtl.buffers.count > DT_SLANG_BUFFER_POOL_SIZE) [_mtl.buffers removeLastObject];
+  }
+  g_mutex_unlock(&_mtl_lock);
+}
+
+int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buffer, void *host, const size_t size)
+{
+  DtSlangBuffer *buf = (__bridge DtSlangBuffer *)buffer;
+  if(!buf || !host || size > buf->size) return 1;
+  g_mutex_lock(&_mtl_lock);
+  id<MTLCommandBuffer> last = _mtl.pending;
+  _finish();
+  g_mutex_unlock(&_mtl_lock);
+  if(last && last.status != MTLCommandBufferStatusCompleted)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this buffer failed: %s",
+             last.error.localizedDescription.UTF8String);
+    return 1;
+  }
+  memcpy(host, buf->buffer.contents, size);
   return 0;
 }

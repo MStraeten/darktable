@@ -34,14 +34,16 @@ typedef enum dt_slang_arg_kind_t
   DT_SLANG_ARG_BUFFER,
   DT_SLANG_ARG_VALUE,
   DT_SLANG_ARG_IMAGE_DEV,
+  DT_SLANG_ARG_BUFFER_DEV,
 } dt_slang_arg_kind_t;
 
 typedef struct dt_slang_gpu_image_t dt_slang_gpu_image_t;
+typedef struct dt_slang_gpu_buffer_t dt_slang_gpu_buffer_t;
 
 typedef struct dt_slang_arg_t
 {
   dt_slang_arg_kind_t kind;
-  const void *ptr; // host data, written to for DT_SLANG_ARG_IMAGE_OUT, or the dt_slang_gpu_image_t
+  const void *ptr; // host data, written to for DT_SLANG_ARG_IMAGE_OUT, or the device image or buffer
   size_t size;     // bytes, for buffers and values
   int width, height, channels;
 } dt_slang_arg_t;
@@ -54,6 +56,8 @@ typedef struct dt_slang_arg_t
 #define SLARG(v) ((dt_slang_arg_t){ DT_SLANG_ARG_VALUE, &(v), sizeof(v), 0, 0, 0 })
 // a device image, as the kernel's input or output
 #define SLIMG_DEV(img) ((dt_slang_arg_t){ DT_SLANG_ARG_IMAGE_DEV, (img), 0, 0, 0, 0 })
+// a device buffer, which kernels can read and write
+#define SLBUF_DEV(buf) ((dt_slang_arg_t){ DT_SLANG_ARG_BUFFER_DEV, (buf), 0, 0, 0, 0 })
 
 #ifdef HAVE_SLANG_GPU
 
@@ -96,6 +100,15 @@ int dt_slang_gpu_image_height(const dt_slang_gpu_image_t *img);
 // a read waits for the kernels writing the image to finish.
 int dt_slang_gpu_image_read(dt_slang_gpu_image_t *img, void *host);
 int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host);
+
+// a buffer of size bytes on the device, for the intermediate results of a
+// chain of kernels. It is filled from host if that is not NULL, and zeroed
+// otherwise. Returns NULL on failure.
+dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *host);
+void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buf);
+// copies the first size bytes to host, after the kernels writing the buffer
+// have finished. Returns 0 on success.
+int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buf, void *host, const size_t size);
 
 #define dt_slang_gpu_run_2d_args(program, kernel, width, height, ...)                    \
   dt_slang_gpu_run_2d((program), (kernel), (width), (height),                           \
