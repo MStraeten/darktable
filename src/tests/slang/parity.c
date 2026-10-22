@@ -327,6 +327,36 @@ static int make_tests(test_t *t)
        LUT("lutr", lut_curve, 256, 256), LUT("lutg", lut_curve, 256, 256), LUT("lutb", lut_curve, 256, 256),
        BUFFER("a", unbounded, sizeof(unbounded)), INT("hdr_transfer", 1));
 
+  // 4x4 matrices as the host passes them, of which the kernels read 3 rows
+  static const float cm_rgb_to_xyz[12] = { 0.4361f, 0.3851f, 0.1431f, 0.0f, 0.2225f, 0.7169f, 0.0606f, 0.0f,
+                                           0.0139f, 0.0971f, 0.7141f, 0.0f };
+  static const float cm_xyz_to_rgb[12] = { 3.1339f, -1.6169f, -0.4906f, 0.0f, -0.9788f, 1.9161f, 0.0335f, 0.0f,
+                                           0.0719f, -0.2290f, 1.4052f, 0.0f };
+  static const float cm_mix[12] = { 1.05f, -0.03f, -0.02f, 0.0f, -0.04f, 1.06f, -0.02f, 0.0f,
+                                    0.01f, -0.06f, 1.05f, 0.0f };
+  static const char *cm_kernels[5] = { "channelmixerrgb_CAT16", "channelmixerrgb_bradford_linear",
+                                       "channelmixerrgb_bradford_full", "channelmixerrgb_XYZ",
+                                       "channelmixerrgb_RGB" };
+  static char cm_labels[5][3][96];
+  for(int k = 0; k < 5; k++)
+    for(int mode = 0; mode < 3; mode++)
+    {
+      // version 3 with gamut compression and clipping; version 1 unclipped;
+      // version 2 to monochrome
+      static const char *cm_suffix[3] = { "v3 clip", "v1", "v2 grey" };
+      snprintf(cm_labels[k][mode], sizeof(cm_labels[k][mode]), "%s %s", cm_kernels[k], cm_suffix[mode]);
+      // unclipped, out of gamut inputs come out between about -1e3 and 1e6,
+      // where Metal lands up to 2.5e-4 (relative) from OpenCL
+      TEST_TOL(cm_labels[k][mode], "channelmixer", cm_kernels[k], mode == 1 ? 1e-3 : 0.0,
+           IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+           BUFFER("RGB_to_XYZ", cm_rgb_to_xyz, sizeof(cm_rgb_to_xyz)),
+           BUFFER("XYZ_to_RGB", cm_xyz_to_rgb, sizeof(cm_xyz_to_rgb)), BUFFER("MIX", cm_mix, sizeof(cm_mix)),
+           FLOAT4("illuminant", 0.97f, 1.01f, 0.78f, 0.0f), FLOAT4("saturation", 0.1f, -0.05f, 0.08f, 0.0f),
+           FLOAT4("lightness", 0.02f, 0.05f, -0.03f, 0.0f), FLOAT4("grey", 0.3f, 0.6f, 0.1f, 0.0f),
+           FLOAT("p", 1.02f), FLOAT("gamut", mode == 0 ? 0.5f : 0.0f), INT("clip", mode == 0),
+           INT("apply_grey", mode == 2), INT("version", mode == 0 ? 2 : mode == 1 ? 0 : 1));
+    }
+
 #undef TEST
 #undef TEST_TOL
   return n;
