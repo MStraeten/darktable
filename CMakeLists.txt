@@ -335,6 +335,16 @@ elseif(USE_OPENCL)
   message(STATUS "Test-compilation of OpenCL programs is disabled.")
 endif()
 
+if(USE_SLANG)
+  find_program(SLANGC_EXECUTABLE slangc)
+  if(SLANGC_EXECUTABLE)
+    message(STATUS "Found slangc - ${SLANGC_EXECUTABLE}")
+  else()
+    message(WARNING "slangc not found, the Slang kernels will not be compiled")
+    set(USE_SLANG OFF)
+  endif()
+endif()
+
 # we need an XSLT interpreter to generate preferences_gen.h and darktablerc
 find_program(Xsltproc_BIN xsltproc)
 if(${Xsltproc_BIN} STREQUAL "Xsltproc_BIN-NOTFOUND")
