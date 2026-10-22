@@ -23,6 +23,7 @@
 #include "common/imagebuf.h"
 #include "common/matrices.h"
 #include "common/image_cache.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
@@ -1883,6 +1884,50 @@ float *dt_ioppr_build_iccprofile_params_slang(const dt_iop_order_iccprofile_info
         lut[x] = profile_info->lut_out[c][y];
   }
   return lut;
+}
+
+gboolean dt_ioppr_transform_image_colorspace_slang(dt_iop_module_t *self,
+                                                   dt_slang_gpu_image_t *dev_img_in,
+                                                   dt_slang_gpu_image_t *dev_img_out,
+                                                   const int width,
+                                                   const int height,
+                                                   const dt_iop_colorspace_type_t cst_from,
+                                                   const dt_iop_colorspace_type_t cst_to,
+                                                   const dt_iop_order_iccprofile_info_t *const profile_info)
+{
+  const char *kernel = NULL;
+  if(cst_from == IOP_CS_RGB && cst_to == IOP_CS_LAB)
+    kernel = "colorspaces_transform_rgb_matrix_to_lab";
+  else if(cst_from == IOP_CS_LAB && cst_to == IOP_CS_RGB)
+    kernel = "colorspaces_transform_lab_to_rgb_matrix";
+
+  // the CPU path handles everything else, lcms2 profiles included
+  if(!kernel
+     || !profile_info
+     || profile_info->type == DT_COLORSPACE_NONE
+     || !dt_is_valid_colormatrix(profile_info->matrix_in[0][0])
+     || !dt_is_valid_colormatrix(profile_info->matrix_out[0][0]))
+    return FALSE;
+
+  dt_times_t start_time = { 0 };
+  dt_get_perf_times(&start_time);
+
+  dt_colorspaces_iccprofile_info_slang_t info;
+  int lut_w = 0, lut_h = 0;
+  float *lut = dt_ioppr_build_iccprofile_params_slang(profile_info, &info, &lut_w, &lut_h);
+  if(!lut) return FALSE;
+
+  const int err = dt_slang_gpu_run_2d_args("colorspaces", kernel, width, height,
+                                           SLIMG_DEV(dev_img_in), SLIMG_DEV(dev_img_out),
+                                           SLARG(width), SLARG(height), SLBUF(&info, sizeof(info)),
+                                           SLIMG_IN(lut, lut_w, lut_h, 1));
+  free(lut);
+  if(!err)
+    dt_print(DT_DEBUG_PERF,
+             "[dt_ioppr_transform_image_colorspace_slang] %s-->%s took %.3f secs [%s%s]",
+             dt_iop_colorspace_to_name(cst_from), dt_iop_colorspace_to_name(cst_to),
+             dt_get_lap_time(&start_time.clock), self->op, dt_iop_get_instance_id(self));
+  return !err;
 }
 #endif
 

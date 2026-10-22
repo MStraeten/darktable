@@ -2113,17 +2113,40 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   }
 
   // the cache keeps a focused module's input, and histograms are collected
-  // on the host, as is a colorspace conversion of the input. It goes to a
-  // separate buffer, which leaves the input cacheline valid for the next run.
+  // on the host
   const dt_iop_colorspace_type_t cst_to = module->input_colorspace(module, pipe, piece);
   const gboolean convert = input_format->cst != cst_to;
   const gboolean histogram = (dev->gui_attached || !(piece->request_histogram & DT_REQUEST_ONLY_IN_GUI))
                              && (piece->request_histogram & DT_REQUEST_ON);
-  if(resident && (important_input || histogram || convert) && !_slang_sync_host(pipe)) return -1;
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    input_format->cst != IOP_CS_RAW ? dt_ioppr_get_pipe_work_profile_info(pipe) : NULL;
+  if(resident && (important_input || histogram) && !_slang_sync_host(pipe)) return -1;
 
-  float *converted = NULL;
-  if(convert)
+  // a colorspace conversion of the input runs on the device if it can, and
+  // the histogram is taken from the converted input
+  dt_slang_gpu_image_t *dev_in = NULL;
+  if(convert && !histogram)
   {
+    dt_slang_gpu_image_t *src = resident
+      ? pipe->slang_image
+      : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, 4, input);
+    dev_in = src ? dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, NULL) : NULL;
+    if(dev_in && !dt_ioppr_transform_image_colorspace_slang(module, src, dev_in, roi_in->width, roi_in->height,
+                                                            input_format->cst, cst_to, work_profile))
+    {
+      dt_slang_gpu_image_free(dev_in);
+      dev_in = NULL;
+    }
+    if(!resident) dt_slang_gpu_image_free(src);
+  }
+  const gboolean converted_on_device = dev_in != NULL;
+
+  // otherwise it runs on the host, into a separate buffer, which leaves the
+  // input cacheline valid for the next run
+  float *converted = NULL;
+  if(convert && !converted_on_device)
+  {
+    if(resident && !_slang_sync_host(pipe)) return -1;
     converted = dt_iop_image_alloc(roi_in->width, roi_in->height, 4);
     if(!converted)
     {
@@ -2132,26 +2155,27 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     }
     dt_iop_colorspace_type_t cst_tmp = input_format->cst;
     dt_ioppr_transform_image_colorspace(module, input, converted, roi_in->width, roi_in->height,
-                                        input_format->cst, cst_to, &cst_tmp,
-                                        input_format->cst != IOP_CS_RAW
-                                          ? dt_ioppr_get_pipe_work_profile_info(pipe) : NULL);
+                                        input_format->cst, cst_to, &cst_tmp, work_profile);
     _slang_release(pipe);
   }
   const float *host_in = converted ? converted : input;
-  _collect_histogram_on_CPU(pipe, dev, host_in, roi_in, module, piece, pixelpipe_flow);
+  if(!converted_on_device)
+    _collect_histogram_on_CPU(pipe, dev, host_in, roi_in, module, piece, pixelpipe_flow);
 
   // a wrapped input may share host_in's memory until it is freed below, so
   // converted is only freed after that
   const gboolean on_device = resident && !convert;
-  dt_slang_gpu_image_t *dev_in = on_device
-    ? pipe->slang_image
-    : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, 4, host_in);
+  if(!converted_on_device)
+    dev_in = on_device
+      ? pipe->slang_image
+      : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, 4, host_in);
   dt_slang_gpu_image_t *dev_out = dev_in
     ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, 4, NULL)
     : NULL;
 
   const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
-  dt_print_pipe(DT_DEBUG_PIPE, on_device ? "process slang" : "process slang, upload",
+  dt_print_pipe(DT_DEBUG_PIPE,
+                on_device || (resident && converted_on_device) ? "process slang" : "process slang, upload",
                 pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "%s%s%s",
                 dt_iop_colorspace_to_name(cst_to),
                 cst_to != cst_out ? " -> " : "",
@@ -2164,15 +2188,15 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     dt_slang_gpu_image_free(dev_out);
     if(!on_device) dt_slang_gpu_image_free(dev_in);
     dt_free_align(converted);
-    if(on_device && !_slang_sync_host(pipe)) return -1;
+    if(resident && !_slang_sync_host(pipe)) return -1;
     _slang_release(pipe);
     return 0;
   }
 
-  if(on_device)
-    _slang_release(pipe);
-  else
-    dt_slang_gpu_image_free(dev_in);
+  // a resident input converted on the device is released only now, as the
+  // CPU fallback above needs it on the host
+  if(!on_device) dt_slang_gpu_image_free(dev_in);
+  _slang_release(pipe);
   dt_free_align(converted);
 
   pipe->slang_image = dev_out;

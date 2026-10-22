@@ -345,6 +345,20 @@ float *dt_ioppr_build_iccprofile_params_slang
    dt_colorspaces_iccprofile_info_slang_t *info,
    int *lut_width,
    int *lut_height);
+
+struct dt_slang_gpu_image_t;
+/** converts between RGB and Lab on the device, like
+ *  dt_ioppr_transform_image_colorspace_cl() does with a matrix profile.
+ *  Returns FALSE, having done nothing, for any other conversion. */
+gboolean dt_ioppr_transform_image_colorspace_slang
+  (struct dt_iop_module_t *self,
+   struct dt_slang_gpu_image_t *dev_img_in,
+   struct dt_slang_gpu_image_t *dev_img_out,
+   const int width,
+   const int height,
+   const dt_iop_colorspace_type_t cst_from,
+   const dt_iop_colorspace_type_t cst_to,
+   const dt_iop_order_iccprofile_info_t *const profile_info);
 #endif
 
 /** the following must have the matrix_in and matrix_out generated */
