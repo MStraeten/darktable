@@ -2078,6 +2078,27 @@ static void _slang_release(dt_dev_pixelpipe_t *pipe)
    Images are float, with 4 channels or 1 for raw data.
    Returns 1 if the module ran, 0 if it has to run on the CPU (its input is
    then on the host), and -1 if the pipe has to stop. */
+// blending runs on the device when the module's input and output are
+// already in the blend colorspace, which the CPU path would convert them to
+static gboolean _slang_blend_possible(dt_iop_module_t *module,
+                                      dt_dev_pixelpipe_iop_t *piece,
+                                      const dt_iop_roi_t *roi_in,
+                                      const dt_iop_roi_t *roi_out,
+                                      const int ch_in,
+                                      const int ch_out)
+{
+  if(!_transform_for_blend(module, piece)) return TRUE;
+
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
+  const dt_iop_colorspace_type_t blend_cst = dt_develop_blend_colorspace(piece, cst_out);
+  if(module->input_colorspace(module, pipe, piece) != blend_cst || cst_out != blend_cst)
+    return FALSE;
+
+  return !_piece_wants_blending(piece)
+         || (ch_in == ch_out && dt_develop_blend_slang_supported(module, piece, roi_in, roi_out));
+}
+
 // a 1-channel float image of uint16 raw data
 static dt_slang_gpu_image_t *_slang_upload_u16(const int width,
                                                const int height,
@@ -2131,8 +2152,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     && out_format->datatype == TYPE_FLOAT
     && (ch_out == 1 || ch_out == 4)
     && dt_iop_buffer_dsc_to_bpp(out_format) == ch_out * sizeof(float)
-    && !_transform_for_blend(module, piece)
-    && !_piece_wants_blending(piece)
+    && _slang_blend_possible(module, piece, roi_in, roi_out, ch_in, ch_out)
     && !_request_color_pick(pipe, dev, module)
     && !(darktable.dump_pfm_pipe && _is_debug_pipe(pipe));
 
@@ -2231,7 +2251,17 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   // modules return FALSE for settings they have no kernels for, like
   // demosaic in a thumbnail's downscaling pipe, which is expected. Kernels
   // that fail are reported by the dispatcher.
-  if(!dev_out || !module->process_slang(module, piece, dev_in, dev_out, roi_in, roi_out))
+  // a blended module writes its own output to a separate image, which the
+  // blend then mixes with the input into dev_out
+  const gboolean blending = _piece_wants_blending(piece);
+  dt_slang_gpu_image_t *dev_module = dev_out && blending
+    ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL)
+    : dev_out;
+  gboolean ok = dev_module && module->process_slang(module, piece, dev_in, dev_module, roi_in, roi_out);
+  if(ok && blending)
+    ok = dt_develop_blend_process_slang(module, piece, dev_in, dev_module, dev_out, roi_in, roi_out);
+  if(blending) dt_slang_gpu_image_free(dev_module);
+  if(!ok)
   {
     dt_print_pipe(DT_DEBUG_PIPE, "slang fallback",
                   pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "running on the CPU");
@@ -2260,6 +2290,11 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
 
   *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
   *pixelpipe_flow &= ~(PIXELPIPE_FLOW_PROCESSED_ON_CPU | PIXELPIPE_FLOW_PROCESSED_WITH_TILING);
+  if(blending)
+  {
+    *pixelpipe_flow |= PIXELPIPE_FLOW_BLENDED_ON_GPU;
+    *pixelpipe_flow &= ~PIXELPIPE_FLOW_BLENDED_ON_CPU;
+  }
 
   if(_module_pipe_stop(pipe, module, *output) != DT_DEV_PIXELPIPE_STOP_NO)
     return -1;

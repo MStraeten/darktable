@@ -992,6 +992,28 @@ void dt_develop_blendif_rgb_jzczhz_blend(dt_dev_pixelpipe_iop_t *piece,
                                          const dt_dev_pixelpipe_display_mask_t request_mask_display);
 
 
+#ifdef HAVE_SLANG_GPU
+struct dt_slang_gpu_image_t;
+
+/** whether dt_develop_blend_process_slang() can blend this piece. Mask and
+ * channel display, feathering, mask blur, and drawn groups that read the
+ * module's images stay on the CPU */
+gboolean dt_develop_blend_slang_supported(dt_iop_module_t *self,
+                                          dt_dev_pixelpipe_iop_t *piece,
+                                          const dt_iop_roi_t *roi_in,
+                                          const dt_iop_roi_t *roi_out);
+
+/** blends the module's input dev_in and its output dev_module into dev_out
+ * on the Slang GPU path, as dt_develop_blend_process_cl() does */
+gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
+                                        dt_dev_pixelpipe_iop_t *piece,
+                                        struct dt_slang_gpu_image_t *dev_in,
+                                        struct dt_slang_gpu_image_t *dev_module,
+                                        struct dt_slang_gpu_image_t *dev_out,
+                                        const dt_iop_roi_t *roi_in,
+                                        const dt_iop_roi_t *roi_out);
+#endif
+
 /** May the blend render mask_id's group as this module's blend mask?
 
     FALSE only for an IOP_FLAGS_NO_MASKS module (retouch, spots) with a
