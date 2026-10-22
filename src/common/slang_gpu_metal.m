@@ -456,7 +456,7 @@ static int _run(const char *program,
   // match the arguments to the kernel's parameters, see _reflect()
   int tex_arg[DT_SLANG_MAX_PARAMS], buf_arg[DT_SLANG_MAX_PARAMS];
   int ntex = 0, nbuf = 0, nvals = 0;
-  gboolean host_images = FALSE;
+  gboolean host_out = FALSE;
   uint8_t vals[256] = { 0 };
   if(k->vals_size > sizeof(vals)) goto mismatch;
   for(int a = 0; a < nargs; a++)
@@ -486,15 +486,15 @@ static int _run(const char *program,
           dt_print(DT_DEBUG_OPENCL, "[slang_gpu] %dx%d image too large for %s", arg->width, arg->height, entry);
           return 1;
         }
-        host_images = TRUE;
+        host_out |= arg->kind == DT_SLANG_ARG_IMAGE_OUT;
       }
       tex_arg[ntex++] = a;
     }
   }
   if(ntex != k->ntex || nbuf != k->nbuf || nvals != k->nvals) goto mismatch;
 
-  // host buffers can be freed or reused once we return
-  if(host_images) _finish();
+  // host outputs are read back below, so this call waits anyway
+  if(host_out) _finish();
 
   cb = [_mtl.queue commandBuffer];
   enc = [cb computeCommandEncoder];
@@ -519,7 +519,10 @@ static int _run(const char *program,
       images[t] = (__bridge DtSlangImage *)arg->ptr;
     else
     {
-      images[t] = _image_wrap(arg->ptr, arg->width, arg->height, arg->channels);
+      // a host input is copied unless we wait: the caller may free or change
+      // it once we return, and the command buffer keeps the copy alive. This
+      // keeps lookup tables such as colorin's from stalling the queue.
+      images[t] = host_out ? _image_wrap(arg->ptr, arg->width, arg->height, arg->channels) : nil;
       if(!images[t])
         images[t] = _image_new(arg->width, arg->height, arg->channels,
                                arg->kind == DT_SLANG_ARG_IMAGE_IN ? arg->ptr : NULL);
@@ -540,9 +543,9 @@ static int _run(const char *program,
   [enc endEncoding];
   [cb commit];
 
-  // with only device images nothing needs to wait: the queue runs command
+  // without host outputs nothing needs to wait: the queue runs command
   // buffers in order, and a read waits in _finish()
-  if(!host_images)
+  if(!host_out)
   {
     _mtl.pending = cb;
     return 0;
