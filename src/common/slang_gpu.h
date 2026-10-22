@@ -72,12 +72,23 @@ int dt_slang_gpu_run_2d(const char *program,
 
 void dt_slang_gpu_cleanup(void);
 
+// sets up the device and loads every kernel in a background thread, so that
+// the first module doesn't wait for that. Does nothing unless slang_gpu is set.
+void dt_slang_gpu_prepare(void);
+
 // a float image with 1 or 4 channels on the device, filled from host if that
 // is not NULL. Returns NULL on failure.
 dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
                                              const int height,
                                              const int channels,
                                              const void *host);
+// like dt_slang_gpu_image_new(), but the image may use host's memory instead
+// of a copy: host must stay valid and unchanged until the image is freed, and
+// dt_slang_gpu_image_free() waits for the kernels still using it
+dt_slang_gpu_image_t *dt_slang_gpu_image_wrap(const int width,
+                                              const int height,
+                                              const int channels,
+                                              const void *host);
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img);
 int dt_slang_gpu_image_width(const dt_slang_gpu_image_t *img);
 int dt_slang_gpu_image_height(const dt_slang_gpu_image_t *img);
@@ -95,5 +106,6 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host);
 
 static inline gboolean dt_slang_gpu_enabled(void) { return FALSE; }
 static inline void dt_slang_gpu_cleanup(void) {}
+static inline void dt_slang_gpu_prepare(void) {}
 
 #endif

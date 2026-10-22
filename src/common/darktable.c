@@ -2416,6 +2416,9 @@ int dt_init(int argc,
   else
     dt_opencl_init(darktable.opencl, options, print_statistics);
 
+  // runs in the background, and only with slang_gpu set
+  dt_slang_gpu_prepare();
+
   // must come before mipmap_cache, because that one will need to access image dimensions stored in here:
   dt_image_cache_init();
 

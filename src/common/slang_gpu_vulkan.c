@@ -71,6 +71,7 @@ typedef struct dt_slang_vulkan_t
 
 static dt_slang_vulkan_t _vk = { 0 };
 static GMutex _vk_lock;
+static GThread *_prepare_thread = NULL;
 
 // --------------------------------------------------------------------------------------------
 // device
@@ -195,6 +196,8 @@ gboolean dt_slang_gpu_enabled(void)
 
 void dt_slang_gpu_cleanup(void)
 {
+  if(_prepare_thread) g_thread_join(_prepare_thread);
+  _prepare_thread = NULL;
   g_mutex_lock(&_vk_lock);
   if(_vk.dev) vkDeviceWaitIdle(_vk.dev);
   g_list_free_full(_vk.images, (GDestroyNotify)_image_free);
@@ -431,6 +434,69 @@ error:
   g_free(key);
   g_free(code);
   return NULL;
+}
+
+// creates the pipelines of every entry point in every .spv in kernels/slang,
+// which takes longer than running them the first time
+static void _preload_kernels(void)
+{
+  char datadir[PATH_MAX] = { 0 };
+  dt_loc_get_datadir(datadir, sizeof(datadir));
+  gchar *dirname = g_build_filename(datadir, "kernels", "slang", NULL);
+  GDir *dir = g_dir_open(dirname, 0, NULL);
+  const gchar *file;
+  while(dir && (file = g_dir_read_name(dir)))
+  {
+    if(!g_str_has_suffix(file, ".spv")) continue;
+    gchar *path = g_build_filename(dirname, file, NULL);
+    gchar *code = NULL;
+    gsize len = 0;
+    if(g_file_get_contents(path, &code, &len, NULL) && len % 4 == 0 && len >= 20)
+    {
+      gchar *program = g_strndup(file, strlen(file) - strlen(".spv"));
+      const uint32_t *w = (const uint32_t *)code;
+      const size_t words = len / 4;
+      for(size_t i = 5; i < words;)
+      {
+        const uint32_t op = w[i] & 0xffff, n = w[i] >> 16;
+        if(n == 0 || i + n > words) break;
+        if(op == 15 && n > 3) // OpEntryPoint
+        {
+          gchar *entry = g_strndup((const char *)(w + i + 3), sizeof(uint32_t) * (n - 3));
+          _get_kernel(program, entry);
+          g_free(entry);
+        }
+        i += n;
+      }
+      g_free(program);
+    }
+    g_free(code);
+    g_free(path);
+  }
+  if(dir) g_dir_close(dir);
+  g_free(dirname);
+}
+
+static gpointer _prepare(gpointer data)
+{
+  const double start = dt_get_debug_wtime();
+  g_mutex_lock(&_vk_lock);
+  if(!_vk.initialized)
+  {
+    _vk.initialized = TRUE;
+    _vk.usable = _init_device();
+  }
+  if(_vk.usable) _preload_kernels();
+  g_mutex_unlock(&_vk_lock);
+  dt_print(DT_DEBUG_PERF, "[slang_gpu] preparing the Vulkan device and kernels took %.3f secs",
+           dt_get_debug_wtime() - start);
+  return NULL;
+}
+
+void dt_slang_gpu_prepare(void)
+{
+  if(!dt_conf_get_bool("slang_gpu") || _prepare_thread) return;
+  _prepare_thread = g_thread_new("slang_gpu", _prepare, NULL);
 }
 
 // --------------------------------------------------------------------------------------------
@@ -692,6 +758,15 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
   }
   g_mutex_unlock(&_vk_lock);
   return img;
+}
+
+// a device image always holds a copy here
+dt_slang_gpu_image_t *dt_slang_gpu_image_wrap(const int width,
+                                              const int height,
+                                              const int channels,
+                                              const void *host)
+{
+  return host ? dt_slang_gpu_image_new(width, height, channels, host) : NULL;
 }
 
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img)

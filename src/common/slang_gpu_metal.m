@@ -69,6 +69,7 @@ typedef struct dt_slang_metal_t
 
 static dt_slang_metal_t _mtl = { 0 };
 static GMutex _mtl_lock;
+static GThread *_prepare_thread = NULL;
 
 // --------------------------------------------------------------------------------------------
 // device
@@ -118,6 +119,8 @@ gboolean dt_slang_gpu_enabled(void)
 
 void dt_slang_gpu_cleanup(void)
 {
+  if(_prepare_thread) g_thread_join(_prepare_thread);
+  _prepare_thread = NULL;
   g_mutex_lock(&_mtl_lock);
   if(_mtl.pending) [_mtl.pending waitUntilCompleted];
   _mtl.pending = nil;
@@ -260,6 +263,57 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
   return k;
 }
 
+// loads every .metallib in kernels/slang and builds the pipelines of all their
+// kernels, which takes longer than running them the first time
+static void _preload_kernels(void)
+{
+  char datadir[PATH_MAX] = { 0 };
+  dt_loc_get_datadir(datadir, sizeof(datadir));
+  gchar *dirname = g_build_filename(datadir, "kernels", "slang", NULL);
+  GDir *dir = g_dir_open(dirname, 0, NULL);
+  const gchar *file;
+  while(dir && (file = g_dir_read_name(dir)))
+  {
+    if(!g_str_has_suffix(file, ".metallib")) continue;
+    gchar *program = g_strndup(file, strlen(file) - strlen(".metallib"));
+    NSString *path = [NSString stringWithFormat:@"%s/%s", dirname, file];
+    id<MTLLibrary> lib = [_mtl.dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:NULL];
+    if(lib)
+    {
+      _mtl.libraries[@(program)] = lib;
+      for(NSString *fn in lib.functionNames) _get_kernel(program, fn.UTF8String);
+    }
+    g_free(program);
+  }
+  if(dir) g_dir_close(dir);
+  g_free(dirname);
+}
+
+static gpointer _prepare(gpointer data)
+{
+  const double start = dt_get_debug_wtime();
+  g_mutex_lock(&_mtl_lock);
+  @autoreleasepool
+  {
+    if(!_mtl.initialized)
+    {
+      _mtl.initialized = TRUE;
+      _mtl.usable = _init_device();
+    }
+    if(_mtl.usable) _preload_kernels();
+  }
+  g_mutex_unlock(&_mtl_lock);
+  dt_print(DT_DEBUG_PERF, "[slang_gpu] preparing the Metal device and kernels took %.3f secs",
+           dt_get_debug_wtime() - start);
+  return NULL;
+}
+
+void dt_slang_gpu_prepare(void)
+{
+  if(!dt_conf_get_bool("slang_gpu") || _prepare_thread) return;
+  _prepare_thread = g_thread_new("slang_gpu", _prepare, NULL);
+}
+
 // --------------------------------------------------------------------------------------------
 // memory
 
@@ -340,21 +394,21 @@ static DtSlangImage *_image_new(const int width, const int height, const int cha
   return img;
 }
 
-static DtSlangImage *_image_wrap(const dt_slang_arg_t *arg)
+static DtSlangImage *_image_wrap(const void *host, const int width, const int height, const int channels)
 {
-  const size_t row = sizeof(float) * arg->channels * arg->width;
+  const size_t row = sizeof(float) * channels * width;
   const size_t page = sysconf(_SC_PAGESIZE);
-  const size_t length = (row * arg->height + page - 1) / page * page;
+  const size_t length = (row * height + page - 1) / page * page;
   // malloc_size() is 0 for a pointer into the middle of a block
-  if((uintptr_t)arg->ptr % page || row != _linear_pitch(arg->width, arg->channels)
-     || malloc_size(arg->ptr) < length || length > _mtl.dev.maxBufferLength)
+  if((uintptr_t)host % page || row != _linear_pitch(width, channels)
+     || malloc_size(host) < length || length > _mtl.dev.maxBufferLength)
     return nil;
-  id<MTLBuffer> buffer = [_mtl.dev newBufferWithBytesNoCopy:(void *)arg->ptr
+  id<MTLBuffer> buffer = [_mtl.dev newBufferWithBytesNoCopy:(void *)host
                                                      length:length
                                                     options:MTLResourceStorageModeShared
                                                 deallocator:nil];
   if(!buffer) return nil;
-  DtSlangImage *img = _image_on(buffer, arg->width, arg->height, arg->channels, row);
+  DtSlangImage *img = _image_on(buffer, width, height, channels, row);
   if(img) img->wrapped = TRUE;
   return img;
 }
@@ -451,7 +505,7 @@ static int _run(const char *program,
       images[t] = (__bridge DtSlangImage *)arg->ptr;
     else
     {
-      images[t] = _image_wrap(arg);
+      images[t] = _image_wrap(arg->ptr, arg->width, arg->height, arg->channels);
       if(!images[t])
         images[t] = _image_new(arg->width, arg->height, arg->channels,
                                arg->kind == DT_SLANG_ARG_IMAGE_IN ? arg->ptr : NULL);
@@ -572,11 +626,37 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
   return img ? (__bridge_retained dt_slang_gpu_image_t *)img : NULL;
 }
 
+dt_slang_gpu_image_t *dt_slang_gpu_image_wrap(const int width,
+                                              const int height,
+                                              const int channels,
+                                              const void *host)
+{
+  if(!host || !dt_slang_gpu_enabled() || !_image_fits(width, height, channels)) return NULL;
+
+  g_mutex_lock(&_mtl_lock);
+  DtSlangImage *img;
+  @autoreleasepool
+  {
+    img = _image_wrap(host, width, height, channels);
+  }
+  g_mutex_unlock(&_mtl_lock);
+  return img ? (__bridge_retained dt_slang_gpu_image_t *)img
+             : dt_slang_gpu_image_new(width, height, channels, host);
+}
+
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *image)
 {
   if(!image) return;
   DtSlangImage *img = CFBridgingRelease(image);
   g_mutex_lock(&_mtl_lock);
+  // the caller may reuse the memory of a wrapped image as soon as we return,
+  // and it belongs to the caller, so it never goes to the pool
+  if(img->wrapped)
+  {
+    _finish();
+    g_mutex_unlock(&_mtl_lock);
+    return;
+  }
   // enough for a pipe's input and output, and those of a second pipe. A
   // pending command buffer keeps its own reference to the texture.
   if(_mtl.images)

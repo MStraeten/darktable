@@ -2139,11 +2139,12 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   const float *host_in = converted ? converted : input;
   _collect_histogram_on_CPU(pipe, dev, host_in, roi_in, module, piece, pixelpipe_flow);
 
+  // a wrapped input may share host_in's memory until it is freed below, so
+  // converted is only freed after that
   const gboolean on_device = resident && !convert;
   dt_slang_gpu_image_t *dev_in = on_device
     ? pipe->slang_image
-    : dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, host_in);
-  dt_free_align(converted);
+    : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, 4, host_in);
   dt_slang_gpu_image_t *dev_out = dev_in
     ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, 4, NULL)
     : NULL;
@@ -2161,6 +2162,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                   pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "falling back to CPU");
     dt_slang_gpu_image_free(dev_out);
     if(!on_device) dt_slang_gpu_image_free(dev_in);
+    dt_free_align(converted);
     if(on_device && !_slang_sync_host(pipe)) return -1;
     _slang_release(pipe);
     return 0;
@@ -2170,6 +2172,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     _slang_release(pipe);
   else
     dt_slang_gpu_image_free(dev_in);
+  dt_free_align(converted);
 
   pipe->slang_image = dev_out;
   pipe->slang_host = *output;
