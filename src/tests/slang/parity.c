@@ -36,7 +36,7 @@
 
 #define W 517
 #define H 263
-#define MAX_ARGS 24
+#define MAX_ARGS 48
 
 // -------------------------------------------------------------------------------------------------
 // test cases
@@ -575,6 +575,41 @@ static int make_tests(test_t *t)
               INT("dx", W - OW / 2), INT("dy", 7));
   }
 
+  // color balance rgb, with both saturation formulas and its mask display
+  {
+    static const float cb_matrix_in[12] = { 0.31f, 0.58f, 0.11f, 0.0f, 0.18f, 0.71f, 0.11f, 0.0f,
+                                            0.04f, 0.16f, 0.80f, 0.0f };
+    static const float cb_matrix_out[12] = { 1.71f, -0.36f, -0.25f, 0.0f, -0.67f, 1.62f, 0.04f, 0.0f,
+                                             0.02f, -0.04f, 0.91f, 0.0f };
+    static const float cb_hue_rotation[4] = { 0.9848f, -0.1736f, 0.1736f, 0.9848f };
+    static float cb_gamut_lut[512];
+    for(int k = 0; k < 512; k++) cb_gamut_lut[k] = 0.6f + 0.3f * sinf(k * 0.0491f) + 0.05f * cosf(k * 0.31f);
+    static const char *cb_labels[3] = { "colorbalancergb dtucs", "colorbalancergb jzazbz", "colorbalancergb mask" };
+    // pow() on Vulkan is exp2(log2()), and the JzAzBz exponent of 134 scales up
+    // its error: PoCL and lavapipe land about 1e-3 apart there
+    static const double cb_tol[3] = { 5e-4, 5e-3, 0.0 };
+    for(int mode = 0; mode < 3; mode++)
+      TEST_TOL(cb_labels[mode], "extended", "colorbalancergb", cb_tol[mode],
+           IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+           BUFFER("profile_info", &profile_linear, sizeof(profile_info_t)),
+           BUFFER("matrix_in", cb_matrix_in, sizeof(cb_matrix_in)),
+           BUFFER("matrix_out", cb_matrix_out, sizeof(cb_matrix_out)),
+           BUFFER("gamut_lut", cb_gamut_lut, sizeof(cb_gamut_lut)),
+           FLOAT("shadows_weight", 2.2f), FLOAT("highlights_weight", 1.8f), FLOAT("midtones_weight", 1.4f),
+           FLOAT("mask_grey_fulcrum", 0.1845f), FLOAT("hue_angle", 0.17f), FLOAT("chroma_global", 0.1f),
+           FLOAT4("chroma", 0.05f, -0.1f, 0.15f, 0.0f), FLOAT("vibrance", 0.2f),
+           FLOAT4("global_offset", 0.002f, -0.001f, 0.003f, 0.0f),
+           FLOAT4("shadows", 1.05f, 0.97f, 1.02f, 0.0f), FLOAT4("highlights", 0.96f, 1.03f, 1.01f, 0.0f),
+           FLOAT4("midtones", 1.03f, 0.98f, 1.05f, 0.0f), FLOAT("white_fulcrum", 1.2f),
+           FLOAT("midtones_Y", 0.95f), FLOAT("grey_fulcrum", 0.1845f), FLOAT("contrast", 1.15f),
+           FLOAT("brilliance_global", 0.05f), FLOAT4("brilliance", 0.02f, -0.03f, 0.04f, 0.0f),
+           FLOAT("saturation_global", 0.12f), FLOAT4("saturation", -0.05f, 0.08f, 0.1f, 0.0f),
+           INT("mask_display", mode == 2), INT("mask_type", 1), INT("checker_1", 8), INT("checker_2", 16),
+           FLOAT4("checker_color_1", 0.2f, 0.2f, 0.2f, 1.0f), FLOAT4("checker_color_2", 0.8f, 0.8f, 0.8f, 1.0f),
+           FLOAT("L_white", 1.07f), INT("saturation_formula", mode == 1 ? 0 : 1),
+           BUFFER("hue_rotation_matrix", cb_hue_rotation, sizeof(cb_hue_rotation)));
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
@@ -1046,7 +1081,7 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
   vk_buffer_t buf[MAX_ARGS] = { 0 };
   vk_buffer_t stage[MAX_ARGS] = { 0 };
   int nbind = 0, have_img[MAX_ARGS] = { 0 }, have_buf[MAX_ARGS] = { 0 };
-  uint8_t push[128] = { 0 };
+  uint8_t push[256] = { 0 };
   int push_size = 0;
 
   for(int a = 0; a < t->nargs; a++)

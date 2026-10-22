@@ -223,3 +223,20 @@ public struct ImageOut
 
   public void write(int2 p, float4 v) { tex[p] = v; }
 }
+
+// expm1 and log1p are OpenCL builtins Slang lacks. These are Kahan's
+// formulations, which cancel the rounding of 1 + x and keep the precision
+// near zero that the callers need
+public float dt_log1p(float x)
+{
+  const float u = 1.0f + x;
+  return u == 1.0f ? x : log(u) * x / (u - 1.0f);
+}
+
+public float dt_expm1(float x)
+{
+  const float u = exp(x);
+  if(u == 1.0f) return x;
+  const float um1 = u - 1.0f;
+  return um1 == -1.0f ? -1.0f : um1 * x / log(u);
+}
