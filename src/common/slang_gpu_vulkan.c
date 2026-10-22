@@ -31,8 +31,8 @@
 #include <string.h>
 
 #define DT_SLANG_MAX_PARAMS 32
-// every Vulkan device supports at least 128 bytes of push constants
-#define DT_SLANG_PUSH_SIZE 128
+// Vulkan guarantees 128 bytes of push constants, most devices have 256
+#define DT_SLANG_PUSH_SIZE 256
 #define DT_SLANG_POOL_SIZE 4
 #define DT_SLANG_BUFFER_POOL_SIZE 12
 
@@ -63,6 +63,7 @@ typedef struct dt_slang_vulkan_t
   VkPhysicalDevice pdev;
   VkPhysicalDeviceMemoryProperties memprops;
   uint32_t max_image_dim;
+  uint32_t push_size; // up to DT_SLANG_PUSH_SIZE
   VkDevice dev;
   VkQueue queue;
   VkCommandPool pool;
@@ -131,6 +132,7 @@ static gboolean _init_device(void)
   VkPhysicalDeviceProperties props;
   vkGetPhysicalDeviceProperties(_vk.pdev, &props);
   _vk.max_image_dim = props.limits.maxImageDimension2D;
+  _vk.push_size = MIN(DT_SLANG_PUSH_SIZE, props.limits.maxPushConstantsSize);
   vkGetPhysicalDeviceMemoryProperties(_vk.pdev, &_vk.memprops);
 
   VkPhysicalDeviceFeatures features;
@@ -335,9 +337,11 @@ static gboolean _reflect(const uint32_t *code,
       }
       i += n;
     }
+    // a kernel with more values than this device's push constants falls
+    // back to the CPU
     for(int m = 0; m < k->nvals; m++)
     {
-      if(member_offset[m] == UINT32_MAX) goto error;
+      if(member_offset[m] == UINT32_MAX || member_offset[m] + sizeof(float) > _vk.push_size) goto error;
       k->val_offset[m] = member_offset[m];
     }
   }
@@ -400,7 +404,7 @@ static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry)
   const VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                                   .bindingCount = k->nres,
                                                   .pBindings = lb };
-  const VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, DT_SLANG_PUSH_SIZE };
+  const VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, _vk.push_size };
   const VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                           .codeSize = len,
                                           .pCode = (const uint32_t *)code };
@@ -938,7 +942,7 @@ static int _run(const char *program,
     const dt_slang_arg_t *arg = &args[a];
     if(arg->kind == DT_SLANG_ARG_VALUE)
     {
-      if(nvals >= k->nvals || k->val_offset[nvals] + arg->size > DT_SLANG_PUSH_SIZE) goto mismatch;
+      if(nvals >= k->nvals || k->val_offset[nvals] + arg->size > _vk.push_size) goto mismatch;
       memcpy(push + k->val_offset[nvals], arg->ptr, arg->size);
       nvals++;
       continue;
@@ -1047,7 +1051,7 @@ static int _run(const char *program,
   }
   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline);
   vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->layout, 0, 1, &set, 0, NULL);
-  vkCmdPushConstants(cb, k->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, DT_SLANG_PUSH_SIZE, push);
+  vkCmdPushConstants(cb, k->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, _vk.push_size, push);
   vkCmdDispatch(cb, (width + k->local_size[0] - 1) / k->local_size[0],
                 (height + k->local_size[1] - 1) / k->local_size[1], 1);
   for(int r = 0; r < nres; r++)
