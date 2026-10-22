@@ -245,6 +245,26 @@ static int make_tests(test_t *t)
   TEST("colorspaces gamma", "colorspaces", "colorspaces_transform_gamma",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), FLOAT("gamma", 0.45f));
 
+  // 4x4 matrices as the host passes them, of which the kernel reads 3 rows
+  static const float to_base[16] = { 0.95f, 0.03f, 0.02f, 0.0f, 0.04f, 0.92f, 0.04f, 0.0f, 0.01f, 0.05f, 0.94f, 0.0f };
+  static const float to_rendering[16] = { 1.1f, -0.06f, -0.04f, 0.0f, -0.05f, 1.08f, -0.03f, 0.0f, -0.02f, -0.07f, 1.09f, 0.0f };
+  static const float to_pipe[16] = { 0.91f, 0.05f, 0.04f, 0.0f, 0.06f, 0.9f, 0.04f, 0.0f, 0.02f, 0.04f, 0.94f, 0.0f };
+  // the hue preservation divides by the sum of the two smaller channels,
+  // which goes through zero for out of gamut colors: there it multiplies the
+  // float noise of pow() by a few hundred. Against a double precision
+  // reference, PoCL and lavapipe land about 1e-4 away, Apple's OpenCL 2e-3
+  // and Metal 6e-3
+  TEST_TOL("sigmoid per channel", "sigmoid", "sigmoid_loglogistic_per_channel", 1e-2,
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+       FLOAT("white_target", 1.0f), FLOAT("paper_exp", 0.18f), FLOAT("film_fog", 0.0f),
+       FLOAT("contrast_power", 1.5f), FLOAT("skew_power", 1.2f), FLOAT("hue_preservation", 0.7f),
+       BUFFER("pipe_to_base", to_base, sizeof(to_base)), BUFFER("base_to_rendering", to_rendering, sizeof(to_rendering)),
+       BUFFER("rendering_to_pipe", to_pipe, sizeof(to_pipe)));
+  TEST("sigmoid rgb ratio", "sigmoid", "sigmoid_loglogistic_rgb_ratio",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+       FLOAT("white_target", 1.0f), FLOAT("black_target", 0.0002f), FLOAT("paper_exp", 0.18f),
+       FLOAT("film_fog", 0.0f), FLOAT("contrast_power", 1.5f), FLOAT("skew_power", 1.2f));
+
 #undef TEST
 #undef TEST_TOL
   return n;
