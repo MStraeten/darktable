@@ -222,14 +222,15 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
   DtSlangKernel *k = _mtl.kernels[key];
   if(k) return k;
 
-  NSString *prog = @(program);
-  id<MTLLibrary> lib = (id<MTLLibrary>)_mtl.libraries[prog];
+  // one library per entry point, see data/kernels/slang/CMakeLists.txt
+  NSString *name = [NSString stringWithFormat:@"%s.%s", program, entry];
+  id<MTLLibrary> lib = (id<MTLLibrary>)_mtl.libraries[name];
   NSError *error = nil;
   if(!lib)
   {
     char datadir[PATH_MAX] = { 0 };
     dt_loc_get_datadir(datadir, sizeof(datadir));
-    NSString *path = [NSString stringWithFormat:@"%s/kernels/slang/%s.metallib", datadir, program];
+    NSString *path = [NSString stringWithFormat:@"%s/kernels/slang/%@.metallib", datadir, name];
     lib = [_mtl.dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
     if(!lib)
     {
@@ -237,13 +238,13 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
                error.localizedDescription.UTF8String);
       return nil;
     }
-    _mtl.libraries[prog] = lib;
+    _mtl.libraries[name] = lib;
   }
 
   id<MTLFunction> fn = [lib newFunctionWithName:@(entry)];
   if(!fn)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] no kernel %s in %s.metallib", entry, program);
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] no kernel %s in %s.metallib", entry, name.UTF8String);
     return nil;
   }
   MTLComputePipelineReflection *refl = nil;
@@ -260,15 +261,16 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
   }
   if(!_reflect(refl, k))
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't find the parameters of %s in %s.metallib", entry, program);
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't find the parameters of %s in %s.metallib", entry,
+             name.UTF8String);
     return nil;
   }
   _mtl.kernels[key] = k;
   return k;
 }
 
-// loads every .metallib in kernels/slang and builds the pipelines of all their
-// kernels, which takes longer than running them the first time
+// loads every <program>.<entry>.metallib in kernels/slang and builds its
+// pipeline, which takes longer than running the kernel the first time
 static void _preload_kernels(void)
 {
   char datadir[PATH_MAX] = { 0 };
@@ -279,15 +281,9 @@ static void _preload_kernels(void)
   while(dir && (file = g_dir_read_name(dir)))
   {
     if(!g_str_has_suffix(file, ".metallib")) continue;
-    gchar *program = g_strndup(file, strlen(file) - strlen(".metallib"));
-    NSString *path = [NSString stringWithFormat:@"%s/%s", dirname, file];
-    id<MTLLibrary> lib = [_mtl.dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:NULL];
-    if(lib)
-    {
-      _mtl.libraries[@(program)] = lib;
-      for(NSString *fn in lib.functionNames) _get_kernel(program, fn.UTF8String);
-    }
-    g_free(program);
+    gchar **parts = g_strsplit(file, ".", 3);
+    if(g_strv_length(parts) == 3) _get_kernel(parts[0], parts[1]);
+    g_strfreev(parts);
   }
   if(dir) g_dir_close(dir);
   g_free(dirname);
