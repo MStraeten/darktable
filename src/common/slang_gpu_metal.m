@@ -26,10 +26,13 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <malloc/malloc.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #define DT_SLANG_MAX_PARAMS 32
+#define DT_SLANG_POOL_SIZE 4
 
 @interface DtSlangKernel : NSObject
 {
@@ -59,6 +62,8 @@ typedef struct dt_slang_metal_t
   __strong id<MTLCommandQueue> queue;
   __strong NSMutableDictionary<NSString *, NSObject *> *libraries; // program -> MTLLibrary
   __strong NSMutableDictionary<NSString *, DtSlangKernel *> *kernels; // "program:kernel"
+  __strong id<MTLCommandBuffer> pending; // committed without waiting
+  __strong NSMutableArray *images;        // freed device images, most recent first
   NSUInteger max_image_dim;
 } dt_slang_metal_t;
 
@@ -87,6 +92,7 @@ static gboolean _init_device(void)
                          ? 16384 : 8192;
   _mtl.libraries = [NSMutableDictionary dictionary];
   _mtl.kernels = [NSMutableDictionary dictionary];
+  _mtl.images = [NSMutableArray array];
   dt_print(DT_DEBUG_OPENCL, "[slang_gpu] using Metal device %s%s", _mtl.dev.name.UTF8String,
            _mtl.dev.hasUnifiedMemory ? " (unified memory)" : "");
   return TRUE;
@@ -113,6 +119,9 @@ gboolean dt_slang_gpu_enabled(void)
 void dt_slang_gpu_cleanup(void)
 {
   g_mutex_lock(&_mtl_lock);
+  if(_mtl.pending) [_mtl.pending waitUntilCompleted];
+  _mtl.pending = nil;
+  _mtl.images = nil;
   _mtl.kernels = nil;
   _mtl.libraries = nil;
   _mtl.queue = nil;
@@ -252,32 +261,116 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
 }
 
 // --------------------------------------------------------------------------------------------
-// dispatch
+// memory
 
-static id<MTLTexture> _texture(const dt_slang_arg_t *arg)
+// Every image is a linear texture on an MTLBuffer in shared storage, which
+// the CPU reads and writes directly on unified memory. Host buffers that are
+// whole VM pages, as the large blocks from posix_memalign() are on macOS, are
+// wrapped without a copy; anything else is copied into a buffer of our own.
+@interface DtSlangImage : NSObject
+{
+@public
+  id<MTLBuffer> buffer;
+  id<MTLTexture> texture;
+  int width, height, channels;
+  size_t pitch;
+  gboolean wrapped; // buffer is the caller's memory
+}
+@end
+
+@implementation DtSlangImage
+@end
+
+static size_t _linear_pitch(const int width, const int channels)
+{
+  const MTLPixelFormat format = channels == 1 ? MTLPixelFormatR32Float : MTLPixelFormatRGBA32Float;
+  const size_t align = [_mtl.dev minimumLinearTextureAlignmentForPixelFormat:format];
+  const size_t row = sizeof(float) * channels * width;
+  return (row + align - 1) / align * align;
+}
+
+static gboolean _image_fits(const int width, const int height, const int channels)
+{
+  return width > 0 && height > 0 && width <= _mtl.max_image_dim && height <= _mtl.max_image_dim
+         && (channels == 1 || channels == 4);
+}
+
+static DtSlangImage *_image_on(id<MTLBuffer> buffer, const int width, const int height, const int channels,
+                               const size_t pitch)
 {
   MTLTextureDescriptor *d = [MTLTextureDescriptor
-    texture2DDescriptorWithPixelFormat:arg->channels == 1 ? MTLPixelFormatR32Float : MTLPixelFormatRGBA32Float
-                                 width:arg->width
-                                height:arg->height
+    texture2DDescriptorWithPixelFormat:channels == 1 ? MTLPixelFormatR32Float : MTLPixelFormatRGBA32Float
+                                 width:width
+                                height:height
                              mipmapped:NO];
-  // with unified memory the CPU reads and writes the texture directly;
-  // otherwise a managed texture keeps a copy on each side. macOS 27 deprecates
-  // managed storage because Apple silicon has no use for it, Intel Macs still do.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-  d.storageMode = _mtl.dev.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
-#pragma clang diagnostic pop
-  d.usage = arg->kind == DT_SLANG_ARG_IMAGE_OUT ? MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite
-                                                : MTLTextureUsageShaderRead;
-  id<MTLTexture> t = [_mtl.dev newTextureWithDescriptor:d];
-  if(t && arg->kind == DT_SLANG_ARG_IMAGE_IN)
-    [t replaceRegion:MTLRegionMake2D(0, 0, arg->width, arg->height)
-         mipmapLevel:0
-           withBytes:arg->ptr
-         bytesPerRow:sizeof(float) * arg->channels * arg->width];
-  return t;
+  d.storageMode = MTLStorageModeShared;
+  d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  id<MTLTexture> t = [buffer newTextureWithDescriptor:d offset:0 bytesPerRow:pitch];
+  if(!t) return nil;
+  DtSlangImage *img = [DtSlangImage new];
+  img->buffer = buffer;
+  img->texture = t;
+  img->width = width;
+  img->height = height;
+  img->channels = channels;
+  img->pitch = pitch;
+  return img;
 }
+
+static void _copy_rows(void *dst, const size_t dst_pitch, const void *src, const size_t src_pitch,
+                       const size_t row, const int height)
+{
+  if(dst_pitch == row && src_pitch == row)
+    memcpy(dst, src, row * height);
+  else
+    for(int y = 0; y < height; y++)
+      memcpy((char *)dst + y * dst_pitch, (const char *)src + y * src_pitch, row);
+}
+
+static DtSlangImage *_image_new(const int width, const int height, const int channels, const void *host)
+{
+  const size_t pitch = _linear_pitch(width, channels);
+  if(pitch * height > _mtl.dev.maxBufferLength) return nil;
+  id<MTLBuffer> buffer = [_mtl.dev newBufferWithLength:pitch * height options:MTLResourceStorageModeShared];
+  if(!buffer) return nil;
+  DtSlangImage *img = _image_on(buffer, width, height, channels, pitch);
+  if(img && host)
+    _copy_rows(buffer.contents, pitch, host, sizeof(float) * channels * width, sizeof(float) * channels * width,
+               height);
+  return img;
+}
+
+static DtSlangImage *_image_wrap(const dt_slang_arg_t *arg)
+{
+  const size_t row = sizeof(float) * arg->channels * arg->width;
+  const size_t page = sysconf(_SC_PAGESIZE);
+  const size_t length = (row * arg->height + page - 1) / page * page;
+  // malloc_size() is 0 for a pointer into the middle of a block
+  if((uintptr_t)arg->ptr % page || row != _linear_pitch(arg->width, arg->channels)
+     || malloc_size(arg->ptr) < length || length > _mtl.dev.maxBufferLength)
+    return nil;
+  id<MTLBuffer> buffer = [_mtl.dev newBufferWithBytesNoCopy:(void *)arg->ptr
+                                                     length:length
+                                                    options:MTLResourceStorageModeShared
+                                                deallocator:nil];
+  if(!buffer) return nil;
+  DtSlangImage *img = _image_on(buffer, arg->width, arg->height, arg->channels, row);
+  if(img) img->wrapped = TRUE;
+  return img;
+}
+
+// waits for the last command buffer that ran without waiting
+static void _finish(void)
+{
+  if(_mtl.pending)
+  {
+    [_mtl.pending waitUntilCompleted];
+    _mtl.pending = nil;
+  }
+}
+
+// --------------------------------------------------------------------------------------------
+// dispatch
 
 static int _run(const char *program,
                 const char *entry,
@@ -290,13 +383,14 @@ static int _run(const char *program,
   if(!k) return 1;
 
   // ARC objects are declared before the first goto, which must not skip their initialization
-  id<MTLTexture> textures[DT_SLANG_MAX_PARAMS];
+  DtSlangImage *images[DT_SLANG_MAX_PARAMS];
   id<MTLCommandBuffer> cb = nil;
   id<MTLComputeCommandEncoder> enc = nil;
 
   // match the arguments to the kernel's parameters, see _reflect()
   int tex_arg[DT_SLANG_MAX_PARAMS], buf_arg[DT_SLANG_MAX_PARAMS];
   int ntex = 0, nbuf = 0, nvals = 0;
+  gboolean host_images = FALSE;
   uint8_t vals[256] = { 0 };
   if(k->vals_size > sizeof(vals)) goto mismatch;
   for(int a = 0; a < nargs; a++)
@@ -315,17 +409,26 @@ static int _run(const char *program,
     }
     else
     {
-      if(ntex >= k->ntex || k->tex_write[ntex] != (arg->kind == DT_SLANG_ARG_IMAGE_OUT)) goto mismatch;
-      if(arg->width > _mtl.max_image_dim || arg->height > _mtl.max_image_dim
-         || (arg->channels != 1 && arg->channels != 4))
+      // a device image can be read or written
+      if(ntex >= k->ntex || !arg->ptr
+         || (arg->kind != DT_SLANG_ARG_IMAGE_DEV && k->tex_write[ntex] != (arg->kind == DT_SLANG_ARG_IMAGE_OUT)))
+        goto mismatch;
+      if(arg->kind != DT_SLANG_ARG_IMAGE_DEV)
       {
-        dt_print(DT_DEBUG_OPENCL, "[slang_gpu] %dx%d image too large for %s", arg->width, arg->height, entry);
-        return 1;
+        if(!_image_fits(arg->width, arg->height, arg->channels))
+        {
+          dt_print(DT_DEBUG_OPENCL, "[slang_gpu] %dx%d image too large for %s", arg->width, arg->height, entry);
+          return 1;
+        }
+        host_images = TRUE;
       }
       tex_arg[ntex++] = a;
     }
   }
   if(ntex != k->ntex || nbuf != k->nbuf || nvals != k->nvals) goto mismatch;
+
+  // host buffers can be freed or reused once we return
+  if(host_images) _finish();
 
   cb = [_mtl.queue commandBuffer];
   enc = [cb computeCommandEncoder];
@@ -343,9 +446,18 @@ static int _run(const char *program,
   }
   for(int t = 0; t < ntex; t++)
   {
-    textures[t] = _texture(&args[tex_arg[t]]);
-    if(!textures[t]) goto failed;
-    [enc setTexture:textures[t] atIndex:k->tex_index[t]];
+    const dt_slang_arg_t *arg = &args[tex_arg[t]];
+    if(arg->kind == DT_SLANG_ARG_IMAGE_DEV)
+      images[t] = (__bridge DtSlangImage *)arg->ptr;
+    else
+    {
+      images[t] = _image_wrap(arg);
+      if(!images[t])
+        images[t] = _image_new(arg->width, arg->height, arg->channels,
+                               arg->kind == DT_SLANG_ARG_IMAGE_IN ? arg->ptr : NULL);
+    }
+    if(!images[t]) goto failed;
+    [enc setTexture:images[t]->texture atIndex:k->tex_index[t]];
   }
 
   // the kernels are written for 16x16 work groups, see [numthreads] in the .slang files
@@ -358,18 +470,16 @@ static int _run(const char *program,
   [enc dispatchThreadgroups:MTLSizeMake((width + tw - 1) / tw, (height + th - 1) / th, 1)
       threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
   [enc endEncoding];
-
-  if(!_mtl.dev.hasUnifiedMemory)
-  {
-    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    for(int t = 0; t < ntex; t++)
-      if(args[tex_arg[t]].kind == DT_SLANG_ARG_IMAGE_OUT) [blit synchronizeResource:textures[t]];
-#pragma clang diagnostic pop
-    [blit endEncoding];
-  }
   [cb commit];
+
+  // with only device images nothing needs to wait: the queue runs command
+  // buffers in order, and a read waits in _finish()
+  if(!host_images)
+  {
+    _mtl.pending = cb;
+    return 0;
+  }
+
   [cb waitUntilCompleted];
   if(cb.status != MTLCommandBufferStatusCompleted)
   {
@@ -377,15 +487,12 @@ static int _run(const char *program,
              cb.error.localizedDescription.UTF8String);
     return 1;
   }
-
   for(int t = 0; t < ntex; t++)
   {
     const dt_slang_arg_t *arg = &args[tex_arg[t]];
-    if(arg->kind != DT_SLANG_ARG_IMAGE_OUT) continue;
-    [textures[t] getBytes:(void *)arg->ptr
-              bytesPerRow:sizeof(float) * arg->channels * arg->width
-               fromRegion:MTLRegionMake2D(0, 0, arg->width, arg->height)
-              mipmapLevel:0];
+    if(arg->kind != DT_SLANG_ARG_IMAGE_OUT || images[t]->wrapped) continue;
+    const size_t row = sizeof(float) * arg->channels * arg->width;
+    _copy_rows((void *)arg->ptr, row, images[t]->buffer.contents, images[t]->pitch, row, arg->height);
   }
   return 0;
 
@@ -419,7 +526,111 @@ int dt_slang_gpu_run_2d(const char *program,
   }
   g_mutex_unlock(&_mtl_lock);
   if(!err)
-    dt_print(DT_DEBUG_PERF, "[slang_gpu] %s %dx%d took %.3f secs (Metal, with copies)",
+    dt_print(DT_DEBUG_PERF, "[slang_gpu] %s %dx%d took %.3f secs (Metal)",
              kernel, width, height, dt_get_debug_wtime() - start);
   return err;
+}
+
+// --------------------------------------------------------------------------------------------
+// device images
+
+dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
+                                             const int height,
+                                             const int channels,
+                                             const void *host)
+{
+  if(!dt_slang_gpu_enabled() || !_image_fits(width, height, channels)) return NULL;
+
+  g_mutex_lock(&_mtl_lock);
+  DtSlangImage *img = nil;
+  @autoreleasepool
+  {
+    // a fresh 160 MB buffer costs more than the kernels that use it, mostly
+    // for the pages the GPU touches the first time
+    for(NSUInteger i = 0; i < _mtl.images.count; i++)
+    {
+      DtSlangImage *pooled = _mtl.images[i];
+      if(pooled->width == width && pooled->height == height && pooled->channels == channels)
+      {
+        img = pooled;
+        [_mtl.images removeObjectAtIndex:i];
+        break;
+      }
+    }
+    if(img && host)
+    {
+      // the image may still be in use by a pending kernel
+      _finish();
+      const size_t row = sizeof(float) * channels * width;
+      _copy_rows(img->buffer.contents, img->pitch, host, row, row, height);
+    }
+    else if(!img)
+      img = _image_new(width, height, channels, host);
+  }
+  g_mutex_unlock(&_mtl_lock);
+  if(!img) dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a %dx%d device image", width, height);
+  return img ? (__bridge_retained dt_slang_gpu_image_t *)img : NULL;
+}
+
+void dt_slang_gpu_image_free(dt_slang_gpu_image_t *image)
+{
+  if(!image) return;
+  DtSlangImage *img = CFBridgingRelease(image);
+  g_mutex_lock(&_mtl_lock);
+  // enough for a pipe's input and output, and those of a second pipe. A
+  // pending command buffer keeps its own reference to the texture.
+  if(_mtl.images)
+  {
+    [_mtl.images insertObject:img atIndex:0];
+    while(_mtl.images.count > DT_SLANG_POOL_SIZE) [_mtl.images removeLastObject];
+  }
+  g_mutex_unlock(&_mtl_lock);
+}
+
+int dt_slang_gpu_image_width(const dt_slang_gpu_image_t *image)
+{
+  return ((__bridge DtSlangImage *)image)->width;
+}
+
+int dt_slang_gpu_image_height(const dt_slang_gpu_image_t *image)
+{
+  return ((__bridge DtSlangImage *)image)->height;
+}
+
+int dt_slang_gpu_image_read(dt_slang_gpu_image_t *image, void *host)
+{
+  DtSlangImage *img = (__bridge DtSlangImage *)image;
+  if(!img || !host) return 1;
+  const double start = dt_get_debug_wtime();
+  g_mutex_lock(&_mtl_lock);
+  id<MTLCommandBuffer> last = _mtl.pending;
+  _finish();
+  g_mutex_unlock(&_mtl_lock);
+  if(last && last.status != MTLCommandBufferStatusCompleted)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this image failed: %s",
+             last.error.localizedDescription.UTF8String);
+    return 1;
+  }
+  const size_t row = sizeof(float) * img->channels * img->width;
+  _copy_rows(host, row, img->buffer.contents, img->pitch, row, img->height);
+  dt_print(DT_DEBUG_PERF, "[slang_gpu] reading %dx%d from the device took %.3f secs",
+           img->width, img->height, dt_get_debug_wtime() - start);
+  return 0;
+}
+
+int dt_slang_gpu_image_write(dt_slang_gpu_image_t *image, const void *host)
+{
+  DtSlangImage *img = (__bridge DtSlangImage *)image;
+  if(!img || !host) return 1;
+  const double start = dt_get_debug_wtime();
+  // a pending kernel may still read the image
+  g_mutex_lock(&_mtl_lock);
+  _finish();
+  g_mutex_unlock(&_mtl_lock);
+  const size_t row = sizeof(float) * img->channels * img->width;
+  _copy_rows(img->buffer.contents, img->pitch, host, row, row, img->height);
+  dt_print(DT_DEBUG_PERF, "[slang_gpu] writing %dx%d to the device took %.3f secs",
+           img->width, img->height, dt_get_debug_wtime() - start);
+  return 0;
 }

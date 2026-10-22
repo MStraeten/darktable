@@ -33,6 +33,7 @@
 #define DT_SLANG_MAX_PARAMS 32
 // every Vulkan device supports at least 128 bytes of push constants
 #define DT_SLANG_PUSH_SIZE 128
+#define DT_SLANG_POOL_SIZE 4
 
 typedef struct dt_slang_resource_t
 {
@@ -65,6 +66,7 @@ typedef struct dt_slang_vulkan_t
   VkQueue queue;
   VkCommandPool pool;
   GHashTable *kernels; // "program:kernel" -> dt_slang_kernel_t
+  GList *images;       // freed device images, for reuse
 } dt_slang_vulkan_t;
 
 static dt_slang_vulkan_t _vk = { 0 };
@@ -72,6 +74,8 @@ static GMutex _vk_lock;
 
 // --------------------------------------------------------------------------------------------
 // device
+
+static void _image_free(struct dt_slang_gpu_image_t *img);
 
 static void _destroy_kernel(gpointer data)
 {
@@ -193,6 +197,7 @@ void dt_slang_gpu_cleanup(void)
 {
   g_mutex_lock(&_vk_lock);
   if(_vk.dev) vkDeviceWaitIdle(_vk.dev);
+  g_list_free_full(_vk.images, (GDestroyNotify)_image_free);
   if(_vk.kernels) g_hash_table_destroy(_vk.kernels);
   if(_vk.pool) vkDestroyCommandPool(_vk.dev, _vk.pool, NULL);
   if(_vk.dev) vkDestroyDevice(_vk.dev, NULL);
@@ -472,26 +477,30 @@ static gboolean _alloc_buffer(dt_slang_mem_t *m, const VkDeviceSize size, const 
          && vkMapMemory(_vk.dev, m->buffer_mem, 0, size, 0, &m->map) == VK_SUCCESS;
 }
 
-static gboolean _alloc_image(dt_slang_mem_t *m, const dt_slang_arg_t *arg)
+static gboolean _create_image(VkImage *image,
+                              VkDeviceMemory *mem,
+                              VkImageView *view,
+                              const int width,
+                              const int height,
+                              const int channels,
+                              const VkImageUsageFlags usage)
 {
-  const VkFormat format = arg->channels == 1 ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
-  const gboolean out = arg->kind == DT_SLANG_ARG_IMAGE_OUT;
+  const VkFormat format = channels == 1 ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
   const VkImageCreateInfo ici = {
     .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
     .imageType = VK_IMAGE_TYPE_2D,
     .format = format,
-    .extent = { arg->width, arg->height, 1 },
+    .extent = { width, height, 1 },
     .mipLevels = 1,
     .arrayLayers = 1,
     .samples = VK_SAMPLE_COUNT_1_BIT,
     .tiling = VK_IMAGE_TILING_OPTIMAL,
-    .usage = out ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                 : VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    .usage = usage,
     .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
   };
-  if(vkCreateImage(_vk.dev, &ici, NULL, &m->image) != VK_SUCCESS) return FALSE;
+  if(vkCreateImage(_vk.dev, &ici, NULL, image) != VK_SUCCESS) return FALSE;
   VkMemoryRequirements req;
-  vkGetImageMemoryRequirements(_vk.dev, m->image, &req);
+  vkGetImageMemoryRequirements(_vk.dev, *image, &req);
   uint32_t type;
   if(!_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)
      && !_memtype(req.memoryTypeBits, 0, &type))
@@ -499,15 +508,24 @@ static gboolean _alloc_image(dt_slang_mem_t *m, const dt_slang_arg_t *arg)
   const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                      .allocationSize = req.size,
                                      .memoryTypeIndex = type };
-  if(vkAllocateMemory(_vk.dev, &mai, NULL, &m->image_mem) != VK_SUCCESS
-     || vkBindImageMemory(_vk.dev, m->image, m->image_mem, 0) != VK_SUCCESS)
+  if(vkAllocateMemory(_vk.dev, &mai, NULL, mem) != VK_SUCCESS
+     || vkBindImageMemory(_vk.dev, *image, *mem, 0) != VK_SUCCESS)
     return FALSE;
   const VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                                      .image = m->image,
+                                      .image = *image,
                                       .viewType = VK_IMAGE_VIEW_TYPE_2D,
                                       .format = format,
                                       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-  if(vkCreateImageView(_vk.dev, &vci, NULL, &m->view) != VK_SUCCESS) return FALSE;
+  return vkCreateImageView(_vk.dev, &vci, NULL, view) == VK_SUCCESS;
+}
+
+static gboolean _alloc_image(dt_slang_mem_t *m, const dt_slang_arg_t *arg)
+{
+  const gboolean out = arg->kind == DT_SLANG_ARG_IMAGE_OUT;
+  if(!_create_image(&m->image, &m->image_mem, &m->view, arg->width, arg->height, arg->channels,
+                    out ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                        : VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+    return FALSE;
 
   const size_t bytes = sizeof(float) * arg->channels * arg->width * arg->height;
   if(!_alloc_buffer(m, bytes, out ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
@@ -540,6 +558,190 @@ static void _barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkIm
                        0, 0, NULL, 0, NULL, 1, &b);
 }
 
+static VkCommandBuffer _begin_commands(void)
+{
+  const VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                             .commandPool = _vk.pool,
+                                             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                             .commandBufferCount = 1 };
+  VkCommandBuffer cb = VK_NULL_HANDLE;
+  if(vkAllocateCommandBuffers(_vk.dev, &cbai, &cb) != VK_SUCCESS) return VK_NULL_HANDLE;
+  const VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+  vkBeginCommandBuffer(cb, &begin);
+  // device images carry data from one submission to the next
+  const VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                               .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                               .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                       0, 1, &mb, 0, NULL, 0, NULL);
+  return cb;
+}
+
+// ends, submits and frees cb, and waits for it
+static gboolean _submit_commands(VkCommandBuffer cb)
+{
+  const VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                .commandBufferCount = 1,
+                                .pCommandBuffers = &cb };
+  const gboolean ok = vkEndCommandBuffer(cb) == VK_SUCCESS
+                      && vkQueueSubmit(_vk.queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS
+                      && vkQueueWaitIdle(_vk.queue) == VK_SUCCESS;
+  vkFreeCommandBuffers(_vk.dev, _vk.pool, 1, &cb);
+  return ok;
+}
+
+// device images stay in the GENERAL layout, which allows sampling, storage
+// writes and transfers alike, so kernels can take them as input or output
+struct dt_slang_gpu_image_t
+{
+  VkImage image;
+  VkDeviceMemory mem;
+  VkImageView view;
+  int width, height, channels;
+};
+
+static void _image_free(dt_slang_gpu_image_t *img)
+{
+  if(img->view) vkDestroyImageView(_vk.dev, img->view, NULL);
+  if(img->image) vkDestroyImage(_vk.dev, img->image, NULL);
+  if(img->mem) vkFreeMemory(_vk.dev, img->mem, NULL);
+  g_free(img);
+}
+
+// copies between host memory and a device image through a staging buffer
+static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean to_device)
+{
+  const size_t bytes = sizeof(float) * img->channels * img->width * img->height;
+  dt_slang_mem_t staging = { 0 };
+  int err = 1;
+  if(!_alloc_buffer(&staging, bytes, to_device ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                                : VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+    goto done;
+  if(to_device) memcpy(staging.map, host, bytes);
+
+  VkCommandBuffer cb = _begin_commands();
+  if(!cb) goto done;
+  const VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                   .imageExtent = { img->width, img->height, 1 } };
+  if(to_device)
+    vkCmdCopyBufferToImage(cb, staging.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+  else
+    vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &copy);
+  if(!_submit_commands(cb)) goto done;
+
+  if(!to_device) memcpy(host, staging.map, bytes);
+  err = 0;
+
+done:
+  _free_mem(&staging);
+  return err;
+}
+
+dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
+                                             const int height,
+                                             const int channels,
+                                             const void *host)
+{
+  if(!dt_slang_gpu_enabled()) return NULL;
+  if(width <= 0 || height <= 0 || (channels != 1 && channels != 4)) return NULL;
+
+  g_mutex_lock(&_vk_lock);
+  // allocating and clearing a full image costs more than the kernels running
+  // on it, and the pipe asks for the same sizes on every run
+  for(GList *l = _vk.images; l; l = g_list_next(l))
+  {
+    dt_slang_gpu_image_t *img = l->data;
+    if(img->width == width && img->height == height && img->channels == channels)
+    {
+      _vk.images = g_list_delete_link(_vk.images, l);
+      if(host && _image_transfer(img, (void *)host, TRUE))
+      {
+        _image_free(img);
+        img = NULL;
+      }
+      g_mutex_unlock(&_vk_lock);
+      return img;
+    }
+  }
+
+  dt_slang_gpu_image_t *img = g_new0(dt_slang_gpu_image_t, 1);
+  img->width = width;
+  img->height = height;
+  img->channels = channels;
+  gboolean ok = (uint32_t)width <= _vk.max_image_dim && (uint32_t)height <= _vk.max_image_dim
+    && _create_image(&img->image, &img->mem, &img->view, width, height, channels,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT
+                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+  if(ok)
+  {
+    VkCommandBuffer cb = _begin_commands();
+    ok = cb != VK_NULL_HANDLE;
+    if(ok)
+    {
+      _barrier(cb, img->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+      ok = _submit_commands(cb);
+    }
+  }
+  if(ok && host) ok = _image_transfer(img, (void *)host, TRUE) == 0;
+  if(!ok)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a %dx%d device image", width, height);
+    _image_free(img);
+    img = NULL;
+  }
+  g_mutex_unlock(&_vk_lock);
+  return img;
+}
+
+void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img)
+{
+  if(!img) return;
+  g_mutex_lock(&_vk_lock);
+  // enough for a pipe's input and output, and those of a second pipe
+  _vk.images = g_list_prepend(_vk.images, img);
+  GList *last = g_list_nth(_vk.images, DT_SLANG_POOL_SIZE);
+  if(last)
+  {
+    last->prev->next = NULL;
+    last->prev = NULL;
+    g_list_free_full(last, (GDestroyNotify)_image_free);
+  }
+  g_mutex_unlock(&_vk_lock);
+}
+
+int dt_slang_gpu_image_width(const dt_slang_gpu_image_t *img)
+{
+  return img->width;
+}
+
+int dt_slang_gpu_image_height(const dt_slang_gpu_image_t *img)
+{
+  return img->height;
+}
+
+int dt_slang_gpu_image_read(dt_slang_gpu_image_t *img, void *host)
+{
+  const double start = dt_get_debug_wtime();
+  g_mutex_lock(&_vk_lock);
+  const int err = _image_transfer(img, host, FALSE);
+  g_mutex_unlock(&_vk_lock);
+  dt_print(DT_DEBUG_PERF, "[slang_gpu] reading %dx%d from the device took %.3f secs",
+           img->width, img->height, dt_get_debug_wtime() - start);
+  return err;
+}
+
+int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host)
+{
+  const double start = dt_get_debug_wtime();
+  g_mutex_lock(&_vk_lock);
+  const int err = _image_transfer(img, (void *)host, TRUE);
+  g_mutex_unlock(&_vk_lock);
+  dt_print(DT_DEBUG_PERF, "[slang_gpu] writing %dx%d to the device took %.3f secs",
+           img->width, img->height, dt_get_debug_wtime() - start);
+  return err;
+}
+
 // --------------------------------------------------------------------------------------------
 // dispatch
 
@@ -568,6 +770,12 @@ static int _run(const char *program,
       continue;
     }
     if(nres >= k->nres) goto mismatch;
+    if(arg->kind == DT_SLANG_ARG_IMAGE_DEV)
+    {
+      if(k->res[nres].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) goto mismatch;
+      res_arg[nres++] = a;
+      continue;
+    }
     const VkDescriptorType want = arg->kind == DT_SLANG_ARG_IMAGE_IN ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
                                 : arg->kind == DT_SLANG_ARG_IMAGE_OUT ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                                 : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -598,7 +806,13 @@ static int _run(const char *program,
                                         .dstBinding = k->res[r].binding,
                                         .descriptorCount = 1,
                                         .descriptorType = k->res[r].type };
-    if(arg->kind == DT_SLANG_ARG_BUFFER)
+    if(arg->kind == DT_SLANG_ARG_IMAGE_DEV)
+    {
+      const dt_slang_gpu_image_t *img = arg->ptr;
+      image_info[r] = (VkDescriptorImageInfo){ .imageView = img->view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+      writes[r].pImageInfo = &image_info[r];
+    }
+    else if(arg->kind == DT_SLANG_ARG_BUFFER)
     {
       if(!_alloc_buffer(&mem[r], arg->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) goto done;
       memcpy(mem[r].map, arg->ptr, arg->size);
@@ -633,14 +847,8 @@ static int _run(const char *program,
   for(int r = 0; r < nres; r++) writes[r].dstSet = set;
   vkUpdateDescriptorSets(_vk.dev, nres, writes, 0, NULL);
 
-  const VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                                             .commandPool = _vk.pool,
-                                             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                             .commandBufferCount = 1 };
-  if(vkAllocateCommandBuffers(_vk.dev, &cbai, &cb) != VK_SUCCESS) goto done;
-  const VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-  vkBeginCommandBuffer(cb, &begin);
+  cb = _begin_commands();
+  if(!cb) goto done;
   for(int r = 0; r < nres; r++)
   {
     const dt_slang_arg_t *arg = &args[res_arg[r]];
@@ -669,14 +877,9 @@ static int _run(const char *program,
     _barrier(cb, mem[r].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     vkCmdCopyImageToBuffer(cb, mem[r].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mem[r].buffer, 1, &copy);
   }
-  if(vkEndCommandBuffer(cb) != VK_SUCCESS) goto done;
-
-  const VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                                .commandBufferCount = 1,
-                                .pCommandBuffers = &cb };
-  if(vkQueueSubmit(_vk.queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS
-     || vkQueueWaitIdle(_vk.queue) != VK_SUCCESS)
-    goto done;
+  const gboolean submitted = _submit_commands(cb);
+  cb = VK_NULL_HANDLE;
+  if(!submitted) goto done;
 
   for(int r = 0; r < nres; r++)
   {
@@ -714,7 +917,7 @@ int dt_slang_gpu_run_2d(const char *program,
   const int err = _run(program, kernel, width, height, nargs, args);
   g_mutex_unlock(&_vk_lock);
   if(!err)
-    dt_print(DT_DEBUG_PERF, "[slang_gpu] %s %dx%d took %.3f secs (Vulkan, with copies)",
+    dt_print(DT_DEBUG_PERF, "[slang_gpu] %s %dx%d took %.3f secs (Vulkan)",
              kernel, width, height, dt_get_debug_wtime() - start);
   return err;
 }

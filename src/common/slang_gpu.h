@@ -19,9 +19,10 @@
 #pragma once
 
 // Runs the Slang-compiled kernels from data/kernels/slang on a GPU, through
-// Vulkan or Metal. This is a proof of concept for #22732: a module calls it
-// from its CPU process() with host buffers, which are copied to the device and
-// back for every call. Nothing stays resident between modules yet.
+// Vulkan or Metal. This is a proof of concept for #22732. Host buffers passed
+// with SLIMG_IN/SLIMG_OUT/SLBUF are copied to the device and back for every
+// call; a dt_slang_gpu_image_t stays on the device, which is how the pixelpipe
+// hands images from one module's process_slang() to the next.
 
 #include <glib.h>
 #include <stddef.h>
@@ -32,12 +33,15 @@ typedef enum dt_slang_arg_kind_t
   DT_SLANG_ARG_IMAGE_OUT,
   DT_SLANG_ARG_BUFFER,
   DT_SLANG_ARG_VALUE,
+  DT_SLANG_ARG_IMAGE_DEV,
 } dt_slang_arg_kind_t;
+
+typedef struct dt_slang_gpu_image_t dt_slang_gpu_image_t;
 
 typedef struct dt_slang_arg_t
 {
   dt_slang_arg_kind_t kind;
-  const void *ptr; // host data; written to for DT_SLANG_ARG_IMAGE_OUT
+  const void *ptr; // host data, written to for DT_SLANG_ARG_IMAGE_OUT, or the dt_slang_gpu_image_t
   size_t size;     // bytes, for buffers and values
   int width, height, channels;
 } dt_slang_arg_t;
@@ -48,6 +52,8 @@ typedef struct dt_slang_arg_t
 #define SLIMG_OUT(p, w, h, c) ((dt_slang_arg_t){ DT_SLANG_ARG_IMAGE_OUT, (p), 0, (w), (h), (c) })
 #define SLBUF(p, s) ((dt_slang_arg_t){ DT_SLANG_ARG_BUFFER, (p), (s), 0, 0, 0 })
 #define SLARG(v) ((dt_slang_arg_t){ DT_SLANG_ARG_VALUE, &(v), sizeof(v), 0, 0, 0 })
+// a device image, as the kernel's input or output
+#define SLIMG_DEV(img) ((dt_slang_arg_t){ DT_SLANG_ARG_IMAGE_DEV, (img), 0, 0, 0, 0 })
 
 #ifdef HAVE_SLANG_GPU
 
@@ -65,6 +71,20 @@ int dt_slang_gpu_run_2d(const char *program,
                         const dt_slang_arg_t *args);
 
 void dt_slang_gpu_cleanup(void);
+
+// a float image with 1 or 4 channels on the device, filled from host if that
+// is not NULL. Returns NULL on failure.
+dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
+                                             const int height,
+                                             const int channels,
+                                             const void *host);
+void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img);
+int dt_slang_gpu_image_width(const dt_slang_gpu_image_t *img);
+int dt_slang_gpu_image_height(const dt_slang_gpu_image_t *img);
+// copy between host memory and the whole image. Both return 0 on success, and
+// a read waits for the kernels writing the image to finish.
+int dt_slang_gpu_image_read(dt_slang_gpu_image_t *img, void *host);
+int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host);
 
 #define dt_slang_gpu_run_2d_args(program, kernel, width, height, ...)                    \
   dt_slang_gpu_run_2d((program), (kernel), (width), (height),                           \
