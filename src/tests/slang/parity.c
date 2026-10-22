@@ -938,6 +938,83 @@ static int make_tests(test_t *t)
 #undef LL_OUT
   }
 
+  // the recursive gaussian of the mask blur, with the coefficients
+  // dt_gaussian_init() computes for sigma 6 and order 0
+  {
+    const float alpha = 1.695f / 6.0f;
+    const float ema = expf(-alpha), ema2 = expf(-2.0f * alpha);
+    const float b1 = -2.0f * ema, b2 = ema2;
+    const float k = (1.0f - ema) * (1.0f - ema) / (1.0f + (2.0f * alpha * ema) - ema2);
+    const float a0 = k, a1 = k * (alpha - 1.0f) * ema, a2 = k * (alpha + 1.0f) * ema, a3 = -k * ema2;
+    const float coefp = (a0 + a1) / (1.0f + b1 + b2), coefn = (a2 + a3) / (1.0f + b1 + b2);
+    TEST_GRID("gaussian_column_1c", "gaussian", "gaussian_column_1c", 1e-6, W, 1,
+              BUFFER("in", image_raw, plane), BUFFER_OUT("out", NULL, plane), INT("width", W), INT("height", H),
+              FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
+              FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT("Labmax", 1.0f), FLOAT("Labmin", 0.0f));
+    TEST("gaussian_transpose_1c", "gaussian", "gaussian_transpose_1c",
+         BUFFER("in", image_raw, plane), BUFFER_OUT("out", NULL, plane), INT("width", W), INT("height", H),
+         INT("blocksize", 16), LOCAL("buffer", sizeof(float) * 16 * 17));
+  }
+
+  // the guided filter of mask feathering: an RGB guide, read from row 2 on as
+  // when the OpenCL code tiles, and a mask
+  {
+    enum { GH = H - 2 };
+    static float gf_var[6][W * GH], gf_cov[3][W * GH];
+    for(int k = 0; k < W * GH; k++)
+    {
+      // positive definite covariance matrices, and a few singular ones
+      const int singular = k % 97 == 0;
+      for(int c = 0; c < 3; c++)
+      {
+        gf_var[c == 0 ? 0 : c == 1 ? 3 : 5][k] = singular ? 0.0f : 0.05f + rcd_dir[k + c * 7];
+        gf_cov[c][k] = 0.3f * rcd_lpf[k + c * 11] - 0.6f;
+      }
+      gf_var[1][k] = singular ? 0.0f : 0.02f * rcd_dir[k + 3];
+      gf_var[2][k] = singular ? 0.0f : -0.02f * rcd_dir[k + 5];
+      gf_var[4][k] = singular ? 0.0f : 0.01f * rcd_dir[k + 9];
+    }
+#define GF_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = GH, .channels = 1, .pixels = px }
+#define GF_OUT(n) { .kind = ARG_IMAGE_OUT, .name = n, .w = W, .h = GH, .channels = 1 }
+    TEST_GRID("guided_filter_split_rgb_image", "guided_filter", "guided_filter_split_rgb_image", 0.0, W, GH,
+              INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in),
+              GF_OUT("out_r"), GF_OUT("out_g"), GF_OUT("out_b"), FLOAT("guide_weight", 10.0f));
+    // a narrow window, and one wider than half the image
+    TEST_GRID("guided_filter_box_mean_x w7", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH, 1,
+              INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 7));
+    TEST_GRID("guided_filter_box_mean_x w300", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH, 1,
+              INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 300));
+    TEST_GRID("guided_filter_box_mean_y w7", "guided_filter", "guided_filter_box_mean_y", 1e-6, W, 1,
+              INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 7));
+    TEST_GRID("guided_filter_box_mean_y w150", "guided_filter", "guided_filter_box_mean_y", 1e-6, W, 1,
+              INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 150));
+    TEST_GRID("guided_filter_covariances", "guided_filter", "guided_filter_covariances", 0.0, W, GH,
+              INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in), GF_IN("img", rcd_dir),
+              GF_OUT("cov_imgg_img_r"), GF_OUT("cov_imgg_img_g"), GF_OUT("cov_imgg_img_b"),
+              FLOAT("guide_weight", 10.0f));
+    TEST_GRID("guided_filter_variances", "guided_filter", "guided_filter_variances", 0.0, W, GH,
+              INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in),
+              GF_OUT("var_imgg_rr"), GF_OUT("var_imgg_rg"), GF_OUT("var_imgg_rb"), GF_OUT("var_imgg_gg"),
+              GF_OUT("var_imgg_gb"), GF_OUT("var_imgg_bb"), FLOAT("guide_weight", 10.0f));
+    TEST_GRID("guided_filter_update_covariance", "guided_filter", "guided_filter_update_covariance", 0.0, W, GH,
+              INT("width", W), INT("height", GH), GF_IN("in", rcd_lpf), GF_OUT("out"), GF_IN("a", rcd_dir),
+              GF_IN("b", rcd_cfa), FLOAT("eps", 0.25f));
+    TEST_GRID("guided_filter_solve", "guided_filter", "guided_filter_solve", 1e-5, W, GH,
+              INT("width", W), INT("height", GH), GF_IN("img_mean", rcd_cfa),
+              GF_IN("imgg_mean_r", rcd_rgb[0]), GF_IN("imgg_mean_g", rcd_rgb[1]), GF_IN("imgg_mean_b", rcd_rgb[2]),
+              GF_IN("cov_imgg_img_r", gf_cov[0]), GF_IN("cov_imgg_img_g", gf_cov[1]),
+              GF_IN("cov_imgg_img_b", gf_cov[2]),
+              GF_IN("var_imgg_rr", gf_var[0]), GF_IN("var_imgg_rg", gf_var[1]), GF_IN("var_imgg_rb", gf_var[2]),
+              GF_IN("var_imgg_gg", gf_var[3]), GF_IN("var_imgg_gb", gf_var[4]), GF_IN("var_imgg_bb", gf_var[5]),
+              GF_OUT("a_r"), GF_OUT("a_g"), GF_OUT("a_b"), GF_OUT("b"));
+    TEST_GRID("guided_filter_generate_result", "guided_filter", "guided_filter_generate_result", 1e-6, W, GH,
+              INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in),
+              GF_IN("a_r", gf_cov[0]), GF_IN("a_g", gf_cov[1]), GF_IN("a_b", gf_cov[2]), GF_IN("b", rcd_lpf),
+              GF_OUT("res"), FLOAT("guide_weight", 10.0f), FLOAT("minval", 0.0f), FLOAT("maxval", 1.0f));
+#undef GF_IN
+#undef GF_OUT
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID

@@ -93,12 +93,45 @@ public vector<float, N> dt_cbrt<let N : int>(vector<float, N> x)
 
 public float dt_fast_hypot(float x, float y) { return dt_hypot(x, y); }
 
+// a + b and a - b that the driver may not rearrange. slangc ignores precise
+// on the SPIR-V target, and without the NoContraction decoration lavapipe
+// simplifies the compensation term of Kahan_sum, (t2 - m) - t1, to 0
+float _exact_add(float a, float b)
+{
+  __target_switch
+  {
+  case spirv:
+    return spirv_asm {
+      %r:$$float = OpFAdd $a $b;
+      OpDecorate %r NoContraction;
+      result:$$float = OpCopyObject %r;
+    };
+  default:
+    return a + b;
+  }
+}
+
+float _exact_sub(float a, float b)
+{
+  __target_switch
+  {
+  case spirv:
+    return spirv_asm {
+      %r:$$float = OpFSub $a $b;
+      OpDecorate %r NoContraction;
+      result:$$float = OpCopyObject %r;
+    };
+  default:
+    return a - b;
+  }
+}
+
 // Kahan summation algorithm
 public void Kahan_sum(inout float m, inout float c, float add)
 {
-  const float t1 = add - c;
-  const float t2 = m + t1;
-  c = (t2 - m) - t1;
+  const float t1 = _exact_sub(add, c);
+  const float t2 = _exact_add(m, t1);
+  c = _exact_sub(_exact_sub(t2, m), t1);
   m = t2;
 }
 
