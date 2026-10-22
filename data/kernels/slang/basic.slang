@@ -615,3 +615,35 @@ void interpolation_copy(uint3 gid : SV_DispatchThreadID,
     pix = dev_in.Areadpixel(icol, irow);
   dev_out.write(int2(ocol, orow), pix);
 }
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void flip(uint3 gid : SV_DispatchThreadID,
+          uniform ImageIn in, uniform ImageOut out,
+          uniform int width, uniform int height, uniform int owidth, uniform int oheight,
+          uniform int orientation)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  // ORIENTATION_FLIP_X = 2
+  int ox = (orientation & 2) != 0 ? width - x - 1 : x;
+
+  // ORIENTATION_FLIP_Y = 1
+  int oy = (orientation & 1) != 0 ? height - y - 1 : y;
+
+  // ORIENTATION_SWAP_XY = 4
+  if((orientation & 4) != 0)
+  {
+    const int tmp = ox;
+    ox = oy;
+    oy = tmp;
+  }
+
+  if(ox >= 0 && oy >= 0 && ox < owidth && oy < oheight)
+  {
+    const float4 pixel = in.readpixel(x, y);
+    out.write(int2(ox, oy), pixel);
+  }
+}

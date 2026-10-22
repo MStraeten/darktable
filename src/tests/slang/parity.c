@@ -577,6 +577,22 @@ static int make_tests(test_t *t)
               INT("dx", W - OW / 2), INT("dy", 7));
   }
 
+  // flip: mirrored, and rotated by 90 degrees with a swapped output
+  {
+    static const int fl_orientation[4] = { 1, 2, 5, 6 };
+    static char fl_labels[4][32];
+    for(int k = 0; k < 4; k++)
+    {
+      const int o = fl_orientation[k], swap = o & 4;
+      snprintf(fl_labels[k], sizeof(fl_labels[k]), "flip %d", o);
+      TEST(fl_labels[k], "basic", "flip",
+           IMG_IN("in", image_in),
+           { .kind = ARG_IMAGE_OUT, .name = "out", .w = swap ? H : W, .h = swap ? W : H, .channels = 4 },
+           INT("width", W), INT("height", H), INT("owidth", swap ? H : W), INT("oheight", swap ? W : H),
+           INT("orientation", o));
+    }
+  }
+
   // color balance rgb, with both saturation formulas and its mask display
   {
     static const float cb_matrix_in[12] = { 0.31f, 0.58f, 0.11f, 0.0f, 0.18f, 0.71f, 0.11f, 0.0f,
