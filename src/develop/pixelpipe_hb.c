@@ -2075,6 +2075,7 @@ static void _slang_release(dt_dev_pixelpipe_t *pipe)
    that only the CPU path does. The input stays on the device when the previous
    module ran here too, and the output is left on the device for the next one;
    it is only copied to the host cacheline when something there needs it.
+   Images are float, with 4 channels or 1 for raw data.
    Returns 1 if the module ran, 0 if it has to run on the CPU (its input is
    then on the host), and -1 if the pipe has to stop. */
 static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
@@ -2092,14 +2093,19 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                                        const gboolean important_out)
 {
   const gboolean resident = pipe->slang_image && pipe->slang_host == input;
+  const int ch_in = input_format->channels;
+  const int ch_out = out_format->channels;
   const gboolean possible =
     module->process_slang
     && piece->process_cl_ready
     && dt_slang_gpu_enabled()
     && *output != input
     && input_format->datatype == TYPE_FLOAT
-    && dt_iop_buffer_dsc_to_bpp(input_format) == 4 * sizeof(float)
-    && dt_iop_buffer_dsc_to_bpp(out_format) == 4 * sizeof(float)
+    && out_format->datatype == TYPE_FLOAT
+    && (ch_in == 1 || ch_in == 4)
+    && (ch_out == 1 || ch_out == 4)
+    && dt_iop_buffer_dsc_to_bpp(input_format) == ch_in * sizeof(float)
+    && dt_iop_buffer_dsc_to_bpp(out_format) == ch_out * sizeof(float)
     && !_transform_for_blend(module, piece)
     && !_piece_wants_blending(piece)
     && !_request_color_pick(pipe, dev, module)
@@ -2111,6 +2117,9 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     _slang_release(pipe);
     return 0;
   }
+
+  // the Bayer and X-Trans patterns as seen from this module's roi
+  dt_dev_prepare_piece_cfa(piece, roi_in);
 
   // the cache keeps a focused module's input, and histograms are collected
   // on the host
@@ -2129,8 +2138,8 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   {
     dt_slang_gpu_image_t *src = resident
       ? pipe->slang_image
-      : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, 4, input);
-    dev_in = src ? dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, NULL) : NULL;
+      : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, ch_in, input);
+    dev_in = src ? dt_slang_gpu_image_new(roi_in->width, roi_in->height, ch_in, NULL) : NULL;
     if(dev_in && !dt_ioppr_transform_image_colorspace_slang(module, src, dev_in, roi_in->width, roi_in->height,
                                                             input_format->cst, cst_to, work_profile))
     {
@@ -2147,7 +2156,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   if(convert && !converted_on_device)
   {
     if(resident && !_slang_sync_host(pipe)) return -1;
-    converted = dt_iop_image_alloc(roi_in->width, roi_in->height, 4);
+    converted = dt_iop_image_alloc(roi_in->width, roi_in->height, ch_in);
     if(!converted)
     {
       _slang_release(pipe);
@@ -2168,9 +2177,9 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   if(!converted_on_device)
     dev_in = on_device
       ? pipe->slang_image
-      : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, 4, host_in);
+      : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, ch_in, host_in);
   dt_slang_gpu_image_t *dev_out = dev_in
-    ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, 4, NULL)
+    ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL)
     : NULL;
 
   const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
