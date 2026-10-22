@@ -22,6 +22,7 @@
 #include "common/dng_opcode.h"
 #include "common/interpolation.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/image_cache.h"
 #include "common/math.h"
 #include "common/imagebuf.h"
@@ -1530,6 +1531,60 @@ finish:
   return err;
 }
 
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// RCD and PPG on full scale Bayer data, without the options that need more
+// kernels: dual demosaic, capture sharpening, green equilibration, color
+// smoothing, the masks and details and the scaled darkroom views
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_image_t *img = &self->dev->image_storage;
+  dt_dev_pixelpipe_t *const pipe = piece->pipe;
+  const dt_iop_demosaic_data_t *d = piece->data;
+  const uint32_t filters = piece->filters;
+  const int method = d->demosaicing_method;
+  const int iwidth = roi_in->width;
+  const int iheight = roi_in->height;
+  const gboolean run_fast = dt_pipe_is_fast(pipe) || dt_pipe_is_preview(pipe);
+  const gboolean direct = roi_out->width == iwidth && roi_out->height == iheight
+                          && feqf(roi_in->scale, roi_out->scale, 1e-8f);
+
+  const gboolean is_bayer = filters != 0 && filters != 9u && !(img->flags & DT_IMAGE_4BAYER)
+                            && !dt_image_is_mono_sraw(img);
+  const gboolean supported =
+    is_bayer
+    && (method == DT_IOP_DEMOSAIC_RCD || (method == DT_IOP_DEMOSAIC_PPG && d->median_thrs <= 0.0f))
+    && _demosaic_full(pipe, img)
+    && direct
+    && iwidth >= 16 && iheight >= 16
+    && dt_pipe_no_mask_display(pipe)
+    && !pipe->want_detail_mask
+    && (run_fast || !d->cs_enabled)
+    && (run_fast || d->green_eq == DT_IOP_GREEN_EQ_NO)
+    && (run_fast || d->color_smoothing == DT_DEMOSAIC_SMOOTH_OFF);
+  if(!supported) return FALSE;
+
+  dt_iop_demosaic_gui_data_t *g = self->gui_data;
+  if(g && self->dev->gui_attached && dt_pipe_is_full(pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    const gboolean show_mask = g->dual_mask || g->cs_mask || g->cs_boost_mask;
+    dt_iop_gui_leave_critical_section(self);
+    if(show_mask) return FALSE;
+  }
+
+  dt_dev_clear_scharr_mask(pipe);
+
+  return method == DT_IOP_DEMOSAIC_RCD
+    ? process_rcd_slang(piece, dev_in, dev_out, iwidth, iheight, filters)
+    : process_ppg_slang(dev_in, dev_out, iwidth, iheight, filters);
+}
 #endif
 #undef MIN_TILE_ROWS
 

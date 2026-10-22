@@ -589,6 +589,34 @@ static int demosaic_box3_cl(dt_iop_module_t *self,
 }
 
 #endif
+
+#ifdef HAVE_SLANG_GPU
+// PPG as in process_default_cl(), without the median prefilter. Returns TRUE
+// on success.
+static gboolean process_ppg_slang(dt_slang_gpu_image_t *dev_in,
+                                  dt_slang_gpu_image_t *dev_out,
+                                  const int width,
+                                  const int height,
+                                  const uint32_t filters)
+{
+  // a border wider than any image: the PPG kernels cover all of it
+  const int border = 100000;
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  const gboolean ok =
+    dev_tmp
+    && !dt_slang_gpu_run_2d_args("demosaic_ppg", "border_interpolate", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height), SLARG(filters))
+    && !dt_slang_gpu_run_2d_args("demosaic_ppg", "ppg_demosaic_green", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height),
+                                 SLARG(filters), SLARG(border))
+    && !dt_slang_gpu_run_2d_args("demosaic_ppg", "ppg_demosaic_redblue", width, height,
+                                 SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLARG(filters), SLARG(border));
+  dt_slang_gpu_image_free(dev_tmp);
+  return ok;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
