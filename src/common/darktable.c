@@ -57,6 +57,7 @@
 #include "common/mipmap_cache.h"
 #include "common/noiseprofiles.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/points.h"
 #include "common/resource_limits.h"
 #include "common/undo.h"
@@ -2854,6 +2855,7 @@ void dt_cleanup()
   g_list_free_full(darktable.iop_order_rules, free);
   darktable.iop_order_rules = NULL;
   dt_opencl_cleanup(darktable.opencl);
+  dt_slang_gpu_cleanup();
   free(darktable.opencl);
   darktable.opencl = NULL;
 #ifdef HAVE_GPHOTO2

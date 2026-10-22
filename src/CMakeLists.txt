@@ -856,6 +856,18 @@ if(USE_OPENCL)
   add_definitions("-DHAVE_OPENCL")
 endif(USE_OPENCL)
 
+# runs the Slang kernels from data/kernels/slang through Vulkan
+if(USE_SLANG AND NOT APPLE)
+  find_package(Vulkan)
+  if(Vulkan_FOUND)
+    add_definitions("-DHAVE_SLANG_GPU")
+    list(APPEND SOURCES "common/slang_gpu_vulkan.c")
+    list(APPEND LIBS Vulkan::Vulkan)
+  else()
+    message(STATUS "Vulkan not found, the Slang kernels will not run")
+  endif()
+endif()
+
 
 # Check for __builtin_cpu_supports here due to a bug in clang/llvm. LLVM uses
 # libgcc to provide the symbols, so if clang wasn't compiled with libgcc, the

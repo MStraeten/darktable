@@ -21,6 +21,11 @@ list(REMOVE_ITEM DT_SLANG_KERNELS ${DT_SLANG_MODULE_FILES})
 # scalars, so Slang moves the texture to its own binding, which is what we want
 set(DT_SLANG_FLAGS -I ${CMAKE_CURRENT_SOURCE_DIR} -fvk-use-entrypoint-name -warnings-disable 31106,31107)
 
+# keep unused parameters, so that src/common/slang_gpu can bind arguments by
+# position, as OpenCL does. Only for SPIR-V: slangc 2026.12 crashes on
+# colorspaces.slang with -target metal -preserve-params.
+set(DT_SLANG_SPIRV_FLAGS -preserve-params)
+
 # slangc hands .metallib builds to Apple's metal compiler, which ships with
 # Xcode but not with the Command Line Tools
 set(DT_SLANG_METALLIB OFF)
@@ -43,7 +48,7 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
   set(SPV "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.spv")
   add_custom_command(
     OUTPUT  ${SPV}
-    COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -target spirv ${DT_SLANG_FLAGS} -o ${SPV}
+    COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -target spirv ${DT_SLANG_FLAGS} ${DT_SLANG_SPIRV_FLAGS} -o ${SPV}
     DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES}
     COMMENT "Compiling Slang kernel ${KERNAME} to SPIR-V"
   )
