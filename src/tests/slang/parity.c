@@ -762,6 +762,46 @@ static int make_tests(test_t *t)
          IMG_IN("detail", image_in), IMG_IN("LF", image_lab), IMG_OUT("HF"), INT("width", W), INT("height", H));
   }
 
+  // local laplacian on 1-channel pyramids: the fine level is the test image
+  // size, the coarse one half of it, and the padding 16 pixels
+  {
+    const int CW = (W - 1) / 2 + 1, CH = (H - 1) / 2 + 1, SUPP = 16;
+    static float *ll_fine[6], *ll_coarse[6], *ll_out1;
+    for(int k = 0; k < 6; k++)
+    {
+      ll_fine[k] = malloc(sizeof(float) * W * H);
+      ll_coarse[k] = malloc(sizeof(float) * CW * CH);
+      for(size_t i = 0; i < (size_t)W * H; i++) ll_fine[k][i] = rcd_cfa[i] * (0.8f + 0.05f * k) + 0.02f * frand();
+      for(size_t i = 0; i < (size_t)CW * CH; i++) ll_coarse[k][i] = rcd_cfa[i] * (0.8f + 0.05f * k);
+    }
+    ll_out1 = malloc(sizeof(float) * CW * CH);
+    for(size_t i = 0; i < (size_t)CW * CH; i++) ll_out1[i] = frand();
+#define LL_IN(n, px, ww, hh) { .kind = ARG_IMAGE_IN, .name = n, .w = ww, .h = hh, .channels = 1, .pixels = px }
+#define LL_OUT(n, ww, hh) { .kind = ARG_IMAGE_OUT, .name = n, .w = ww, .h = hh, .channels = 1 }
+    TEST_GRID("pad_input", "locallaplacian", "pad_input", 0.0, W + 2 * SUPP, H + 2 * SUPP,
+              IMG_IN("input", image_lab), LL_OUT("padded", W + 2 * SUPP, H + 2 * SUPP), INT("wd", W), INT("ht", H),
+              INT("max_supp", SUPP), INT("wd2", W + 2 * SUPP), INT("ht2", H + 2 * SUPP));
+    TEST_GRID("gauss_reduce", "locallaplacian", "gauss_reduce", 0.0, CW, CH,
+              RAW_IN("input", rcd_cfa), LL_OUT("coarse", CW, CH), INT("wd", CW), INT("ht", CH));
+    TEST("laplacian_assemble", "locallaplacian", "laplacian_assemble",
+         RAW_IN("input", rcd_dir), LL_IN("output1", ll_out1, CW, CH), RAW_OUT("output0"),
+         RAW_IN("buf_g0_l0", ll_fine[0]), LL_IN("buf_g0_l1", ll_coarse[0], CW, CH),
+         RAW_IN("buf_g1_l0", ll_fine[1]), LL_IN("buf_g1_l1", ll_coarse[1], CW, CH),
+         RAW_IN("buf_g2_l0", ll_fine[2]), LL_IN("buf_g2_l1", ll_coarse[2], CW, CH),
+         RAW_IN("buf_g3_l0", ll_fine[3]), LL_IN("buf_g3_l1", ll_coarse[3], CW, CH),
+         RAW_IN("buf_g4_l0", ll_fine[4]), LL_IN("buf_g4_l1", ll_coarse[4], CW, CH),
+         RAW_IN("buf_g5_l0", ll_fine[5]), LL_IN("buf_g5_l1", ll_coarse[5], CW, CH), INT("pw", W), INT("ph", H));
+    TEST("process_curve", "locallaplacian", "process_curve",
+         RAW_IN("input", rcd_dir), RAW_OUT("output"), FLOAT("g", 0.41f), FLOAT("sigma", 0.5f),
+         FLOAT("shadows", 0.7f), FLOAT("highlights", 0.4f), FLOAT("clarity", 0.25f), INT("wd", W), INT("ht", H));
+    TEST_GRID("write_back", "locallaplacian", "write_back", 0.0, W - 2 * SUPP, H - 2 * SUPP,
+              IMG_IN("input", image_lab), RAW_IN("processed", rcd_dir),
+              { .kind = ARG_IMAGE_OUT, .name = "output", .w = W - 2 * SUPP, .h = H - 2 * SUPP, .channels = 4 },
+              INT("max_supp", SUPP), INT("wd", W - 2 * SUPP), INT("ht", H - 2 * SUPP));
+#undef LL_IN
+#undef LL_OUT
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
