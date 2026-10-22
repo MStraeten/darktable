@@ -2094,6 +2094,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   const gboolean resident = pipe->slang_image && pipe->slang_host == input;
   const gboolean possible =
     module->process_slang
+    && piece->process_cl_ready
     && dt_slang_gpu_enabled()
     && *output != input
     && input_format->datatype == TYPE_FLOAT
