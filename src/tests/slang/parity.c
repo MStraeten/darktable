@@ -48,6 +48,7 @@ typedef enum arg_kind_t
   ARG_INT,
   ARG_FLOAT,
   ARG_FLOAT4,
+  ARG_INT2,
   ARG_BUFFER,
   ARG_BUFFER_OUT, // read and written by the kernel, and compared
   ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
@@ -62,6 +63,7 @@ typedef struct arg_t
   int i;
   float f;
   float v[4];
+  int iv[2];
   const void *data; // buffers, and the initial contents of ARG_BUFFER_OUT (zeros if NULL)
   size_t size;
   int bytes;        // ARG_BUFFER_OUT holds bytes, compared exactly
@@ -197,6 +199,7 @@ static void make_inputs(void)
 #define INT(n, val) { .kind = ARG_INT, .name = n, .i = val }
 #define FLOAT(n, val) { .kind = ARG_FLOAT, .name = n, .f = val }
 #define FLOAT4(n, a, b, c, d) { .kind = ARG_FLOAT4, .name = n, .v = { a, b, c, d } }
+#define INT2(n, a, b) { .kind = ARG_INT2, .name = n, .iv = { a, b } }
 #define BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz }
 
 static const float levels[9] = { 0.05f, 0.45f, 0.9f, 0.0f, 0.5f, 1.0f, 0.1f, 0.4f, 0.95f };
@@ -618,6 +621,98 @@ static int make_tests(test_t *t)
               BUFFER("rdiv", rp_rdiv4, sizeof(rp_rdiv4)), INT("rx", 5), INT("ry", 1));
   }
 
+  // blending: a module's input and output with an offset between them, as
+  // when a module crops, through each blend mode of each blend colorspace,
+  // and the parametric masks
+  {
+    enum { OW = W - 8, OH = H - 6 };
+    static float bl_rgb_b[4 * OW * OH], bl_lab_b[4 * OW * OH], bl_raw_b[OW * OH], bl_form[OW * OH];
+    static float bl_params[6 * 16];
+    for(int k = 0; k < OW * OH; k++)
+    {
+      for(int c = 0; c < 4; c++)
+      {
+        bl_rgb_b[4 * k + c] = image_in[(4 * k + c + 52) % (4 * W * H)] * 0.9f + 0.05f;
+        bl_lab_b[4 * k + c] = image_lab[(4 * k + c + 52) % (4 * W * H)] * (c == 0 ? 0.8f : 1.1f);
+      }
+      bl_raw_b[k] = image_raw[(k + 31) % (W * H)] * 0.95f;
+      bl_form[k] = 0.5f + 0.5f * sinf(k * 0.003f);
+    }
+    for(int ch = 0; ch < 16; ch++)
+    {
+      // a trapezoid per channel, wide enough that most pixels sit on a slope
+      const float p0 = -0.1f + 0.02f * ch, p1 = p0 + 0.25f, p2 = p1 + 0.2f, p3 = p2 + 0.3f;
+      const float pr[6] = { p0, p1, p2, p3, 1.0f / (p1 - p0), 1.0f / (p3 - p2) };
+      memcpy(bl_params + 6 * ch, pr, sizeof(pr));
+    }
+#define BL_IMG(n, px, ch) { .kind = ARG_IMAGE_IN, .name = n, .w = OW, .h = OH, .channels = ch, .pixels = px }
+#define BL_OUT(n, ch) { .kind = ARG_IMAGE_OUT, .name = n, .w = OW, .h = OH, .channels = ch }
+
+    // Lab: L in, L out and h in, the last inverted; RGB: gray in, red out
+    // and H in, red out inverted
+    static const struct { const char *kernel; int blendif; int rgb_in; int profile; } bl_masks[] = {
+      { "blendop_mask_Lab", 0x211 | (0x200 << 16), 0, 0 },
+      { "blendop_mask_RAW", 0, 0, 0 },
+      { "blendop_mask_rgb_hsl", 0x121 | (0x20 << 16), 1, 0 },
+      { "blendop_mask_rgb_hsl", 0x121 | (0x20 << 16), 1, 1 },
+      { "blendop_mask_rgb_jzczhz", 0x121 | (0x100 << 16), 1, 1 },
+    };
+    static char bl_mask_labels[2 * 5][64];
+    for(int m = 0; m < 5; m++)
+      for(int comb = 0; comb < 2; comb++)
+      {
+        // DEVELOP_COMBINE_NORM_EXCL, then DEVELOP_COMBINE_INV_INCL
+        const unsigned int combine = comb ? 3 : 0;
+        char *lbl = bl_mask_labels[2 * m + comb];
+        snprintf(lbl, 64, "%s%s %s", bl_masks[m].kernel + 8, bl_masks[m].profile ? " profile" : "",
+                 comb ? "inv incl" : "norm excl");
+        TEST_GRID(lbl, "blendop", bl_masks[m].kernel, 0.0, OW, OH,
+                  IMG_IN("in_a", bl_masks[m].rgb_in ? image_in : image_lab),
+                  BL_IMG("in_b", bl_masks[m].rgb_in ? bl_rgb_b : bl_lab_b, 4), BL_IMG("mask_in", bl_form, 1),
+                  BL_OUT("mask", 1), INT("width", OW), INT("height", OH), FLOAT("gopacity", 0.8f),
+                  INT("blendif", bl_masks[m].blendif), BUFFER("blendif_parameters", bl_params, sizeof(bl_params)),
+                  INT("mask_mode", 5), INT("mask_combine", combine), INT2("offs", 3, 2),
+                  BUFFER("profile_info", bl_masks[m].profile ? &profile_nonlinear : &profile_linear,
+                         sizeof(profile_info_t)),
+                  LUT("profile_lut", lut_profile, 256, 256 * 6), INT("use_work_profile", bl_masks[m].profile));
+      }
+
+    TEST_GRID("mask_tone_curve", "blendop", "blendop_mask_tone_curve", 0.0, OW, OH,
+              BL_IMG("mask_in", bl_form, 1), BL_OUT("mask_out", 1), INT("width", OW), INT("height", OH),
+              FLOAT("e", expf(3.0f * 0.4f)), FLOAT("brightness", -0.3f), FLOAT("gopacity", 0.9f));
+
+    static const int bl_modes[] = { 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                                    0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+                                    0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x25, 0x26, 0x27, 0x28,
+                                    0x29, (int)(0x80000000u | 0x18), (int)(0x80000000u | 0x0B) };
+    enum { NMODES = sizeof(bl_modes) / sizeof(bl_modes[0]) };
+    static const struct { const char *kernel; int ch; int kind; } bl_kernels[] = {
+      { "blendop_Lab", 4, 0 }, { "blendop_RAW", 1, 1 }, { "blendop_RAW4", 4, 2 },
+      { "blendop_rgb_hsl", 4, 2 }, { "blendop_rgb_jzczhz", 4, 2 },
+    };
+    static char bl_labels[5 * NMODES][64];
+    for(int b = 0; b < 5; b++)
+      for(int m = 0; m < NMODES; m++)
+      {
+        const int kind = bl_kernels[b].kind;
+        char *lbl = bl_labels[b * NMODES + m];
+        snprintf(lbl, 64, "%s 0x%x", bl_kernels[b].kernel + 8, (unsigned)bl_modes[m]);
+        // the Lab hue, color and color adjustment modes go through LCh and
+        // back, and Vulkan only bounds the absolute error of sin and cos, by
+        // 2^-11
+        const int lch = kind == 0 && (bl_modes[m] == 0x12 || bl_modes[m] == 0x13 || bl_modes[m] == 0x16);
+        TEST_GRID(lbl, "blendop", bl_kernels[b].kernel, lch ? 1e-3 : 0.0, OW, OH,
+                  { .kind = ARG_IMAGE_IN, .name = "in_a", .w = W, .h = H, .channels = bl_kernels[b].ch,
+                    .pixels = kind == 0 ? image_lab : kind == 1 ? image_raw : image_in },
+                  BL_IMG("in_b", kind == 0 ? bl_lab_b : kind == 1 ? bl_raw_b : bl_rgb_b, bl_kernels[b].ch),
+                  BL_IMG("mask", bl_form, 1), BL_OUT("out", bl_kernels[b].ch), INT("width", OW), INT("height", OH),
+                  INT("blend_mode", bl_modes[m]), FLOAT("blend_parameter", 1.5f), INT2("offs", 3, 2),
+                  INT("mask_display", 0));
+      }
+#undef BL_IMG
+#undef BL_OUT
+  }
+
   // color balance rgb, with both saturation formulas and its mask display
   {
     static const float cb_matrix_in[12] = { 0.31f, 0.58f, 0.11f, 0.0f, 0.18f, 0.71f, 0.11f, 0.0f,
@@ -991,6 +1086,9 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
         break;
       case ARG_FLOAT4:
         CK(clSetKernelArg(k, a, 4 * sizeof(float), arg->v));
+        break;
+      case ARG_INT2:
+        CK(clSetKernelArg(k, a, 2 * sizeof(int), arg->iv));
         break;
     }
   }
@@ -1371,10 +1469,12 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
       case ARG_INT:
       case ARG_FLOAT:
       case ARG_FLOAT4:
+      case ARG_INT2:
       {
-        const size_t sz = arg->kind == ARG_FLOAT4 ? 16 : 4;
+        const size_t sz = arg->kind == ARG_FLOAT4 ? 16 : arg->kind == ARG_INT2 ? 8 : 4;
         const void *src = arg->kind == ARG_INT ? (const void *)&arg->i
-                        : arg->kind == ARG_FLOAT ? (const void *)&arg->f : (const void *)arg->v;
+                        : arg->kind == ARG_FLOAT ? (const void *)&arg->f
+                        : arg->kind == ARG_INT2 ? (const void *)arg->iv : (const void *)arg->v;
         if(p->offset < 0 || p->offset + sz > sizeof(push)) die("%s: bad offset for %s", t->kernel, arg->name);
         memcpy(push + p->offset, src, sz);
         if(p->offset + (int)sz > push_size) push_size = p->offset + sz;
@@ -1490,7 +1590,7 @@ int main(int argc, char **argv)
   if(sizeof(profile_info_t) != 160) die("profile_info_t is %zu bytes, the kernels expect 160", sizeof(profile_info_t));
 
   make_inputs();
-  static test_t tests[160];
+  static test_t tests[512];
   const int ntests = make_tests(tests);
 
   cl_env_t cl;
