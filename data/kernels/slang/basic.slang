@@ -647,3 +647,112 @@ void flip(uint3 gid : SV_DispatchThreadID,
     out.write(int2(ox, oy), pixel);
   }
 }
+
+int BL(int row, int col)
+{
+  return ((row & 1) << 1) + (col & 1);
+}
+
+// fma(a, b, c) for the rawprepare division, whose result must match the CPU
+// bit for bit: highlight reconstruction tells clipped pixels by comparing
+// with 1.0. Vulkan allows fma to round twice, as a multiply and an add, and
+// lavapipe does, so there the product is made exact with Dekker's algorithm.
+// Metal's fma is fused.
+float fma_exact(float a, float b, float c)
+{
+  __target_switch
+  {
+  case metal:
+    return fma(a, b, c);
+  default:
+    precise const float p = a * b;
+    precise const float ca = 4097.0f * a;
+    precise const float ah = ca - (ca - a);
+    precise const float al = a - ah;
+    precise const float cb = 4097.0f * b;
+    precise const float bh = cb - (cb - b);
+    precise const float bl = b - bh;
+    precise const float e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    precise const float s = p + c;
+    precise const float bs = s - p;
+    precise const float es = (p - (s - bs)) + (c - bs);
+    precise const float r = s + (es + e);
+    return r;
+  }
+}
+
+// rawprepare_1f reads a uint16 image, which the Slang path never makes: the
+// pipe converts uint16 input to float with u16_to_float, so this kernel
+// serves both
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void rawprepare_1f_unnormalized(uint3 gid : SV_DispatchThreadID,
+                                uniform ImageIn in, uniform ImageOut out,
+                                uniform int width, uniform int height,
+                                uniform int cx, uniform int cy,
+                                uniform StructuredBuffer<float> sub, uniform StructuredBuffer<float> div,
+                                uniform StructuredBuffer<float> rdiv,
+                                uniform int rx, uniform int ry)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float pix = in.read(int2(x + cx, y + cy)).x;
+  const int id = BL(ry + cy + y, rx + cx + x);
+  const float n = pix - sub[id];
+  const float q = n * rdiv[id];
+  const float rem = fma_exact(-q, div[id], n);
+  const float oval = fma_exact(rem, rdiv[id], q);
+
+  out.write(int2(x, y), float4(oval));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void rawprepare_4f(uint3 gid : SV_DispatchThreadID,
+                   uniform ImageIn in, uniform ImageOut out,
+                   uniform int width, uniform int height,
+                   uniform int cx, uniform int cy,
+                   uniform StructuredBuffer<float> sub, uniform StructuredBuffer<float> div,
+                   uniform StructuredBuffer<float> rdiv,
+                   uniform int rx, uniform int ry)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  // rx and ry are unused, as in OpenCL, but Metal drops parameters nothing reads
+  if(width < 0) out.write(int2(0), float4(float(rx + ry)));
+  if(x >= width || y >= height) return;
+
+  const float4 sub4 = float4(sub[0], sub[1], sub[2], sub[3]);
+  const float4 div4 = float4(div[0], div[1], div[2], div[3]);
+  const float4 rdiv4 = float4(rdiv[0], rdiv[1], rdiv[2], rdiv[3]);
+  const float4 pix = in.readpixel(x + cx, y + cy);
+  const float4 n = pix - sub4;
+  const float4 q = n * rdiv4;
+  float4 oval = float4(0.0f);
+  for(int c = 0; c < 3; c++)
+  {
+    const float rem = fma_exact(-q[c], div4[c], n[c]);
+    oval[c] = fma_exact(rem, rdiv4[c], q[c]);
+  }
+  out.write(int2(x, y), oval);
+}
+
+// uint16 raw data, two values to a uint, to a 1-channel float image. There is
+// no OpenCL counterpart: OpenCL reads the uint16 image directly.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void u16_to_float(uint3 gid : SV_DispatchThreadID,
+                  uniform StructuredBuffer<uint> in, uniform ImageOut out,
+                  uniform int width, uniform int height)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const uint k = uint(y) * uint(width) + uint(x);
+  const uint pair = in[k >> 1];
+  const uint v = (k & 1) != 0 ? pair >> 16 : pair & 0xffff;
+  out.write(int2(x, y), float4(float(v)));
+}

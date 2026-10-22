@@ -593,6 +593,31 @@ static int make_tests(test_t *t)
     }
   }
 
+  // rawprepare on integer raw values, cropped, with per-site black and white levels
+  {
+    static float rp_raw[W * H];
+    for(int k = 0; k < W * H; k++) rp_raw[k] = floorf(fmaxf(0.0f, image_raw[k]) * 15000.0f) + 512.0f;
+    static const float rp_sub[4] = { 512.0f, 510.0f, 514.0f, 509.0f };
+    static const float rp_div[4] = { 15872.0f, 15870.0f, 15000.0f, 15869.0f };
+    static float rp_rdiv[4];
+    for(int k = 0; k < 4; k++) rp_rdiv[k] = 1.0f / rp_div[k];
+    static const float rp_sub4[4] = { 0.02f, 0.01f, 0.03f, 0.0f };
+    static const float rp_div4[4] = { 0.9f, 0.95f, 0.85f, 1.0f };
+    static float rp_rdiv4[4];
+    for(int k = 0; k < 4; k++) rp_rdiv4[k] = 1.0f / rp_div4[k];
+    const int rw = W - 8, rh = H - 6;
+    TEST_GRID("rawprepare 1f", "basic", "rawprepare_1f_unnormalized", 0.0, rw, rh,
+              RAW_IN("in", rp_raw), { .kind = ARG_IMAGE_OUT, .name = "out", .w = rw, .h = rh, .channels = 1 },
+              INT("width", rw), INT("height", rh), INT("cx", 3), INT("cy", 2),
+              BUFFER("sub", rp_sub, sizeof(rp_sub)), BUFFER("div", rp_div, sizeof(rp_div)),
+              BUFFER("rdiv", rp_rdiv, sizeof(rp_rdiv)), INT("rx", 5), INT("ry", 1));
+    TEST_GRID("rawprepare 4f", "basic", "rawprepare_4f", 0.0, rw, rh,
+              IMG_IN("in", image_in), { .kind = ARG_IMAGE_OUT, .name = "out", .w = rw, .h = rh, .channels = 4 },
+              INT("width", rw), INT("height", rh), INT("cx", 3), INT("cy", 2),
+              BUFFER("sub", rp_sub4, sizeof(rp_sub4)), BUFFER("div", rp_div4, sizeof(rp_div4)),
+              BUFFER("rdiv", rp_rdiv4, sizeof(rp_rdiv4)), INT("rx", 5), INT("ry", 1));
+  }
+
   // color balance rgb, with both saturation formulas and its mask display
   {
     static const float cb_matrix_in[12] = { 0.31f, 0.58f, 0.11f, 0.0f, 0.18f, 0.71f, 0.11f, 0.0f,
