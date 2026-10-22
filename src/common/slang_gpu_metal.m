@@ -783,11 +783,15 @@ dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *ho
         break;
       }
     }
-    if(buf && host)
+    if(buf)
     {
-      // the buffer may still be in use by a pending kernel
+      // the buffer may still be in use by a pending kernel. A new one starts
+      // zeroed, a pooled one has to be cleared.
       _finish();
-      memcpy(buf->buffer.contents, host, size);
+      if(host)
+        memcpy(buf->buffer.contents, host, size);
+      else
+        memset(buf->buffer.contents, 0, size);
     }
     else if(!buf && size <= _mtl.dev.maxBufferLength)
     {

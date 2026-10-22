@@ -890,7 +890,11 @@ dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *ho
       buf = NULL;
     }
   }
-  if(buf && host) memcpy(buf->mem.map, host, size);
+  // neither a pooled buffer nor fresh device memory is zeroed
+  if(buf && host)
+    memcpy(buf->mem.map, host, size);
+  else if(buf)
+    memset(buf->mem.map, 0, size);
   g_mutex_unlock(&_vk_lock);
   return buf;
 }
