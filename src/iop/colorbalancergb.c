@@ -24,6 +24,7 @@
 #include "common/darktable_ucs_22_helpers.h"
 #include "common/gamut_mapping.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
@@ -1076,6 +1077,65 @@ error:
   dt_opencl_release_mem_object(hue_rotation_matrix_cl);
   return err;
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorbalancergb_data_t *const d = piece->data;
+  const dt_iop_colorbalancergb_gui_data_t *g = self->gui_data;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile
+      = dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  if(piece->colors != 4 || work_profile == NULL) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // the same premultiplied matrices as process_cl()
+  dt_colormatrix_t input_matrix;
+  dt_colormatrix_t output_matrix;
+  dt_colormatrix_mul(output_matrix, XYZ_D50_to_D65_CAT16, work_profile->matrix_in);
+  dt_colormatrix_mul(input_matrix, XYZ_D65_to_LMS_2006_D65, output_matrix);
+  dt_colormatrix_mul(output_matrix, work_profile->matrix_out, XYZ_D65_to_D50_CAT16);
+
+  gboolean mask_display = FALSE;
+  dt_iop_colorbalancergb_mask_data_t mask_type = MASK_NONE;
+  if(self->dev->gui_attached && g && dt_pipe_is_full(piece->pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    mask_display = g->mask_display;
+    mask_type = g->mask_type;
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  const int checker_1 = mask_display ? DT_PIXEL_APPLY_DPI(d->checker_size) : 0;
+  const int checker_2 = 2 * checker_1;
+  const float L_white = Y_to_dt_UCS_L_star(d->white_fulcrum);
+  const float hue_rotation_matrix[4]
+    = { cosf(d->hue_angle), -sinf(d->hue_angle), sinf(d->hue_angle), cosf(d->hue_angle) };
+
+  // the kernel takes the profile like the OpenCL one does, but never reads it
+  const dt_colorspaces_iccprofile_info_slang_t profile_info = { 0 };
+
+  return !dt_slang_gpu_run_2d_args("extended", "colorbalancergb", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLBUF(&profile_info, sizeof(profile_info)),
+    SLBUF(input_matrix, 12 * sizeof(float)), SLBUF(output_matrix, 12 * sizeof(float)),
+    SLBUF(d->gamut_LUT, LUT_ELEM * sizeof(float)),
+    SLARG(d->shadows_weight), SLARG(d->highlights_weight), SLARG(d->midtones_weight),
+    SLARG(d->mask_grey_fulcrum), SLARG(d->hue_angle), SLARG(d->chroma_global), SLARG(d->chroma), SLARG(d->vibrance),
+    SLARG(d->global), SLARG(d->shadows), SLARG(d->highlights), SLARG(d->midtones), SLARG(d->white_fulcrum),
+    SLARG(d->midtones_Y), SLARG(d->grey_fulcrum), SLARG(d->contrast), SLARG(d->brilliance_global),
+    SLARG(d->brilliance), SLARG(d->saturation_global), SLARG(d->saturation), SLARG(mask_display), SLARG(mask_type),
+    SLARG(checker_1), SLARG(checker_2), SLARG(d->checker_color_1), SLARG(d->checker_color_2), SLARG(L_white),
+    SLARG(d->saturation_formula), SLBUF(hue_rotation_matrix, sizeof(hue_rotation_matrix)));
+}
+#endif
 
 void init_global(dt_iop_module_so_t *self)
 {
