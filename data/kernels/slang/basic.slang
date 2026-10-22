@@ -284,3 +284,279 @@ void colorout(uint3 gid : SV_DispatchThreadID,
   pixel.z = lerp_lookup_unbounded0(lutb, rgb[2], a, 2);
   out.write(int2(x, y), pixel);
 }
+
+// the raw stage: white balance and highlight reconstruction
+
+// like _keep(), for the xtrans pattern of kernels that run on Bayer data
+void _keep_xtrans(StructuredBuffer<uint> xtrans, int never, ImageOut out)
+{
+  if(never < 0) out.write(int2(0), float4(float(xtrans[0])));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void whitebalance_1f(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform StructuredBuffer<float> coeffs, uniform uint filters,
+                     uniform StructuredBuffer<uint> xtrans)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  _keep_xtrans(xtrans, width, out);
+  if(x >= width || y >= height) return;
+  const float pixel = in.readsingle(x, y);
+  out.write(int2(x, y), float4(pixel * coeffs[FC(y, x, filters)]));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void whitebalance_1f_xtrans(uint3 gid : SV_DispatchThreadID,
+                            uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                            uniform StructuredBuffer<float> coeffs, uniform uint filters,
+                            uniform StructuredBuffer<uint> xtrans)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  const float pixel = in.readsingle(x, y);
+  out.write(int2(x, y), float4(pixel * coeffs[FCxtrans(y, x, xtrans)]));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void whitebalance_4f(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform StructuredBuffer<float> coeffs, uniform uint filters,
+                     uniform StructuredBuffer<uint> xtrans)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  _keep_xtrans(xtrans, width, out);
+  if(x >= width || y >= height) return;
+  const float4 pixel = in.Areadpixel(x, y);
+  out.write(int2(x, y), float4(pixel.x * coeffs[0], pixel.y * coeffs[1], pixel.z * coeffs[2], pixel.w));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_1f_clip(uint3 gid : SV_DispatchThreadID,
+                        uniform ImageIn in, uniform ImageOut out,
+                        uniform int iwidth, uniform int iheight,
+                        uniform int owidth, uniform int oheight,
+                        uniform float4 clip, uniform int dx, uniform int dy,
+                        uniform int filters, uniform StructuredBuffer<uint> xtrans)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= owidth || y >= oheight) return;
+
+  const int irow = y + dy;
+  const int icol = x + dx;
+  float pixel = 0.0f;
+  const float clips[4] = { clip.x, clip.y, clip.z, clip.w };
+  if((icol >= 0) && (irow >= 0) && (irow < iheight) && (icol < iwidth))
+  {
+    const int color = fcol(irow, icol, uint(filters), xtrans);
+    pixel = in.Areadsingle(icol, irow);
+    pixel = min(clips[color], pixel);
+  }
+  out.write(int2(x, y), float4(pixel));
+}
+
+// the masks of the opposed method are byte arrays, as in OpenCL, packed four
+// to a word. Threads share words, so the masks start zeroed and bits are or-ed in.
+int _mask_get(RWStructuredBuffer<uint> mask, int i)
+{
+  return int((mask[i >> 2] >> uint((i & 3) * 8)) & 0xffu);
+}
+
+void _mask_set(RWStructuredBuffer<uint> mask, int i, int val)
+{
+  if(val != 0) InterlockedOr(mask[i >> 2], uint(val & 0xff) << uint((i & 3) * 8));
+}
+
+// OpenCL leaves the masks as allocated; here they are zeroed first, as the
+// kernels below only set bits. The words are laid out in rows of width.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_clearmask(uint3 gid : SV_DispatchThreadID,
+                          uniform RWStructuredBuffer<uint> mask, uniform int width, uniform int words)
+{
+  const int i = gid.y * width + gid.x;
+  if(gid.x < width && i < words) mask[i] = 0u;
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_initmask(uint3 gid : SV_DispatchThreadID,
+                         uniform ImageIn in, uniform RWStructuredBuffer<uint> inmask,
+                         uniform int msize, uniform int mwidth, uniform int mheight,
+                         uniform int iwidth, uniform int iheight,
+                         uniform uint filters, uniform StructuredBuffer<uint> xtrans,
+                         uniform StructuredBuffer<float> clips)
+{
+  const int mcol = gid.x;
+  const int mrow = gid.y;
+
+  if(mcol >= mwidth || mrow >= mheight)
+    return;
+
+  const int mdx = mrow * mwidth + mcol;
+  int mbuff[3] = { 0, 0, 0 };
+  const int irow = 3*mrow;
+  const int icol = 3*mcol;
+
+  for(int y = irow; y < irow + 3; y++)
+  {
+    for(int x = icol; x < icol + 3; x++)
+    {
+      if(y < iheight && x < iwidth)
+      {
+        const int color = fcol(y, x, filters, xtrans);
+        const float val = in.readsingle(x, y);
+        mbuff[color] += (val >= clips[color]) ? 1 : 0;
+      }
+    }
+  }
+
+  for(int c = 0; c < 3; c++)
+    _mask_set(inmask, c*msize + mdx, mbuff[c] != 0 ? 1 : 0);
+}
+
+int _mask_dilated(RWStructuredBuffer<uint> m, int i, int w1)
+{
+  if(_mask_get(m, i) != 0)
+    return 1;
+
+  if((_mask_get(m, i-w1-1) | _mask_get(m, i-w1) | _mask_get(m, i-w1+1) | _mask_get(m, i-1) | _mask_get(m, i+1)
+      | _mask_get(m, i+w1-1) | _mask_get(m, i+w1) | _mask_get(m, i+w1+1)) != 0)
+    return 1;
+
+  const int w2 = 2*w1;
+  const int w3 = 3*w1;
+  return (_mask_get(m, i-w3-2) | _mask_get(m, i-w3-1) | _mask_get(m, i-w3)   | _mask_get(m, i-w3+1) | _mask_get(m, i-w3+2) |
+          _mask_get(m, i-w2-3) | _mask_get(m, i-w2-2) | _mask_get(m, i-w2-1) | _mask_get(m, i-w2)   | _mask_get(m, i-w2+1) | _mask_get(m, i-w2+2) | _mask_get(m, i-w2+3) |
+          _mask_get(m, i-w1-3) | _mask_get(m, i-w1-2) | _mask_get(m, i-w1+2) | _mask_get(m, i-w1+3) |
+          _mask_get(m, i-3)    | _mask_get(m, i-2)    | _mask_get(m, i+2)     | _mask_get(m, i+3)     |
+          _mask_get(m, i+w1-3) | _mask_get(m, i+w1-2) | _mask_get(m, i+w1+2) | _mask_get(m, i+w1+3) |
+          _mask_get(m, i+w2-3) | _mask_get(m, i+w2-2) | _mask_get(m, i+w2-1) | _mask_get(m, i+w2)   | _mask_get(m, i+w2+1) | _mask_get(m, i+w2+2) | _mask_get(m, i+w2+3) |
+          _mask_get(m, i+w3-2) | _mask_get(m, i+w3-1) | _mask_get(m, i+w3)   | _mask_get(m, i+w3+1) | _mask_get(m, i+w3+2)) != 0 ? 1 : 0;
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_dilatemask(uint3 gid : SV_DispatchThreadID,
+                           uniform RWStructuredBuffer<uint> in, uniform RWStructuredBuffer<uint> out,
+                           uniform int msize, uniform int mwidth, uniform int mheight)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+
+  if(col >= mwidth || row >= mheight)
+    return;
+
+  const int mx = row * mwidth + col;
+  const bool safe = col >= 3 && row >= 3 && col < mwidth - 3 && row < mheight - 3;
+
+  for(int c = 0; c < 3; c++)
+  {
+    const int i = mx + c * msize;
+    _mask_set(out, i, safe ? _mask_dilated(in, i, mwidth) : _mask_get(in, i));
+  }
+}
+
+float _calc_refavg(ImageIn in, StructuredBuffer<uint> xtrans, uint filters,
+                   int row, int col, int maxrow, int maxcol, StructuredBuffer<float> correction)
+{
+  float mean[3] = { 0.0f, 0.0f, 0.0f };
+  float cnt[3]  = { 0.0f, 0.0f, 0.0f };
+
+  for(int dy = max(0, row - 1); dy < min(maxrow - 1, row + 2); dy++)
+  {
+    for(int dx = max(0, col - 1); dx < min(maxcol - 1, col + 2); dx++)
+    {
+      const float val = max(0.0f, in.Areadsingle(dx, dy));
+      const int c = fcol(dy, dx, filters, xtrans);
+      mean[c] += val;
+      cnt[c] += 1.0f;
+    }
+  }
+
+  for(int c = 0; c < 3; c++)
+    mean[c] = (cnt[c] > 0.0f) ? dt_cbrt((correction[c] * mean[c]) / cnt[c]) : 0.0f;
+
+  const float croot_refavg[3] = { 0.5f * (mean[1] + mean[2]), 0.5f * (mean[0] + mean[2]), 0.5f * (mean[0] + mean[1]) };
+  const int color = fcol(row, col, filters, xtrans);
+  return fcube(croot_refavg[color]);
+}
+
+// one row per work item, dispatched as height x 1
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_chroma(uint3 gid : SV_DispatchThreadID,
+                       uniform ImageIn in, uniform RWStructuredBuffer<uint> mask, uniform RWStructuredBuffer<float> accu,
+                       uniform int width, uniform int height, uniform int msize, uniform int mwidth,
+                       uniform uint filters, uniform StructuredBuffer<uint> xtrans,
+                       uniform StructuredBuffer<float> clips, uniform StructuredBuffer<float> correction)
+{
+  const int row = gid.x;
+  if(row >= height || gid.y != 0) return;
+
+  float sum[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+  float cnt[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+  float clipped = 0.0f;
+  for(int col = 0; col < width; col++)
+  {
+    const int color = fcol(row, col, filters, xtrans);
+    const float inval = in.Areadsingle(col, row);
+    const int px = color * msize + (row/3) * mwidth + col/3;
+    const bool masked = _mask_get(mask, px) != 0;
+    if(masked && (inval > 0.2f*clips[color]) && (inval < clips[color]))
+    {
+      const float ref = _calc_refavg(in, xtrans, filters, row, col, height, width, correction);
+      sum[color] += inval - ref;
+      cnt[color] += 1.0f;
+    }
+    if(masked) clipped += 1.0f;
+  }
+
+  for(int c = 0; c < 3; c++)
+  {
+    accu[row*8 + 2*c] = sum[c];
+    accu[row*8 + 2*c +1] = cnt[c];
+  }
+  accu[row*8 + 6] = clipped;
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_opposed(uint3 gid : SV_DispatchThreadID,
+                        uniform ImageIn in, uniform ImageOut out,
+                        uniform int owidth, uniform int oheight, uniform int iwidth, uniform int iheight,
+                        uniform int dx, uniform int dy,
+                        uniform uint filters, uniform StructuredBuffer<uint> xtrans,
+                        uniform StructuredBuffer<float> clips, uniform StructuredBuffer<float> chroma,
+                        uniform StructuredBuffer<float> correction)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= owidth || y >= oheight) return;
+
+  const int irow = y + dy;
+  const int icol = x + dx;
+  float val = 0.0f;
+
+  if((icol >= 0) && (icol < iwidth) && (irow >= 0) && (irow < iheight))
+  {
+    val = in.Areadsingle(icol, irow);
+    const int color = fcol(irow, icol, filters, xtrans);
+    if(val >= clips[color])
+    {
+      const float ref = _calc_refavg(in, xtrans, filters, irow, icol, iheight, iwidth, correction);
+      val = max(val, ref + chroma[color]);
+    }
+  }
+  out.write(int2(x, y), float4(val));
+}

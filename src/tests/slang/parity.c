@@ -49,6 +49,8 @@ typedef enum arg_kind_t
   ARG_FLOAT,
   ARG_FLOAT4,
   ARG_BUFFER,
+  ARG_BUFFER_OUT, // read and written by the kernel, and compared
+  ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
 } arg_kind_t;
 
 typedef struct arg_t
@@ -60,8 +62,9 @@ typedef struct arg_t
   int i;
   float f;
   float v[4];
-  const void *data; // buffers
+  const void *data; // buffers, and the initial contents of ARG_BUFFER_OUT (zeros if NULL)
   size_t size;
+  int bytes;        // ARG_BUFFER_OUT holds bytes, compared exactly
 } arg_t;
 
 typedef struct test_t
@@ -70,6 +73,7 @@ typedef struct test_t
   const char *program; // .cl file, also the .spv file name
   const char *kernel;
   double tolerance; // 0 for the default
+  int gw, gh;       // work items, W x H if 0
   int nargs;
   arg_t args[MAX_ARGS];
 } test_t;
@@ -87,7 +91,9 @@ typedef struct profile_info_t
   int hdr_transfer;
 } profile_info_t;
 
-static float *image_in, *image_lab, *lut_curve, *lut_profile;
+static float *image_in, *image_lab, *image_raw, *lut_curve, *lut_profile;
+static float *rcd_cfa, *rcd_lpf, *rcd_dir, *rcd_rgb[3];
+static uint8_t *mask_bytes;
 static profile_info_t profile_linear, profile_nonlinear, profile_pq;
 
 static float frand(void)
@@ -101,6 +107,38 @@ static void make_inputs(void)
   image_in = malloc(sizeof(float) * 4 * W * H);
   image_lab = malloc(sizeof(float) * 4 * W * H);
   for(size_t k = 0; k < (size_t)4 * W * H; k++) image_in[k] = frand() * 1.2f - 0.05f; // a few negatives, a few > 1
+  // a raw image: smooth gradients with noise and a few clipped areas, as a
+  // demosaic of pure noise would test little
+  image_raw = malloc(sizeof(float) * W * H);
+  for(int y = 0; y < H; y++)
+    for(int x = 0; x < W; x++)
+    {
+      const float base = 0.5f + 0.4f * sinf(x * 0.05f) * cosf(y * 0.07f) + 0.05f * frand();
+      const int bayer = ((y & 1) << 1) | (x & 1);
+      const float gain = bayer == 0 ? 0.6f : bayer == 3 ? 0.8f : 1.0f;
+      image_raw[(size_t)y * W + x] = ((x / 40 + y / 30) % 7 == 0) ? 1.05f : base * gain - 0.01f;
+    }
+
+  // intermediate RCD data: the normalized raw image, low pass values,
+  // directional weights in [0, 1] and color planes near the raw values
+  rcd_cfa = malloc(sizeof(float) * W * H);
+  rcd_lpf = malloc(sizeof(float) * W * H);
+  rcd_dir = malloc(sizeof(float) * W * H);
+  for(int c = 0; c < 3; c++) rcd_rgb[c] = malloc(sizeof(float) * W * H);
+  for(size_t k = 0; k < (size_t)W * H; k++)
+  {
+    rcd_cfa[k] = fmaxf(0.0f, image_raw[k]);
+    rcd_lpf[k] = 4.0f * rcd_cfa[k] + 0.1f * frand();
+    rcd_dir[k] = frand();
+    for(int c = 0; c < 3; c++) rcd_rgb[c][k] = rcd_cfa[k] * (0.9f + 0.2f * frand());
+  }
+
+  // a sparse mask of 3x3 cells for the opposed highlights, for three colors.
+  // highlights_chroma reads a cell past the end of a plane for the last
+  // column, as the host code allocates it, so there is some room after.
+  const int msize = ((W / 3 + 3) / 4 * 4) * ((H / 3 + 3) / 4 * 4);
+  mask_bytes = calloc(1, 3 * msize + 64);
+  for(int k = 0; k < 3 * msize; k++) mask_bytes[k] = frand() < 0.05f;
   for(size_t k = 0; k < (size_t)W * H; k++)
   {
     image_lab[4 * k + 0] = frand() * 100.0f;
@@ -148,6 +186,11 @@ static void make_inputs(void)
 #define IMG_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = 4, .pixels = px }
 #define LUT(n, px, lw, lh) { .kind = ARG_IMAGE_IN, .name = n, .w = lw, .h = lh, .channels = 1, .pixels = px }
 #define IMG_OUT(n) { .kind = ARG_IMAGE_OUT, .name = n, .w = W, .h = H, .channels = 4 }
+#define RAW_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = 1, .pixels = px }
+#define RAW_OUT(n) { .kind = ARG_IMAGE_OUT, .name = n, .w = W, .h = H, .channels = 1 }
+#define BUFFER_OUT(n, ptr, sz) { .kind = ARG_BUFFER_OUT, .name = n, .data = ptr, .size = sz }
+#define BYTES_OUT(n, sz) { .kind = ARG_BUFFER_OUT, .name = n, .size = sz, .bytes = 1 }
+#define LOCAL(n, sz) { .kind = ARG_LOCAL, .name = n, .size = sz }
 #define INT(n, val) { .kind = ARG_INT, .name = n, .i = val }
 #define FLOAT(n, val) { .kind = ARG_FLOAT, .name = n, .f = val }
 #define FLOAT4(n, a, b, c, d) { .kind = ARG_FLOAT4, .name = n, .v = { a, b, c, d } }
@@ -162,14 +205,15 @@ static const float matrix3x3[9] = { 0.9f, 0.05f, 0.05f, 0.1f, 0.8f, 0.1f, 0.0f, 
 static int make_tests(test_t *t)
 {
   int n = 0;
-#define TEST_TOL(lbl, prog, kern, tol, ...)                                               \
+#define TEST_GRID(lbl, prog, kern, tol, w, h, ...)                                        \
   {                                                                                      \
     const arg_t a[] = { __VA_ARGS__ };                                                   \
     t[n] = (test_t){ .label = lbl, .program = prog, .kernel = kern, .tolerance = tol,    \
-                     .nargs = sizeof(a) / sizeof(a[0]) };                                \
+                     .gw = w, .gh = h, .nargs = sizeof(a) / sizeof(a[0]) };             \
     memcpy(t[n].args, a, sizeof(a));                                                     \
     n++;                                                                                 \
   }
+#define TEST_TOL(lbl, prog, kern, tol, ...) TEST_GRID(lbl, prog, kern, tol, W, H, __VA_ARGS__)
 #define TEST(lbl, prog, kern, ...) TEST_TOL(lbl, prog, kern, 0.0, __VA_ARGS__)
 
   TEST("negadoctor", "negadoctor", "negadoctor",
@@ -357,8 +401,126 @@ static int make_tests(test_t *t)
            INT("apply_grey", mode == 2), INT("version", mode == 0 ? 2 : mode == 1 ? 0 : 1));
     }
 
+  // the raw stage. Two Bayer layouts, RGGB and BGGR, and an X-Trans pattern
+  // as the host passes it: 6x6 bytes
+  static const unsigned int bayer[2] = { 0x94949494u, 0x16161616u };
+  static const uint8_t xtrans[6][6] = { { 1, 1, 0, 1, 1, 2 }, { 1, 1, 2, 1, 1, 0 }, { 2, 0, 1, 0, 2, 1 },
+                                        { 1, 1, 2, 1, 1, 0 }, { 1, 1, 0, 1, 1, 2 }, { 0, 2, 1, 2, 0, 1 } };
+  static const float wb_coeffs[4] = { 2.1f, 1.0f, 1.6f, 1.0f };
+  static const float hl_clips[4] = { 0.95f, 0.98f, 0.9f, 1.0f };
+  static const float hl_correction[4] = { 1.1f, 1.0f, 0.9f, 1.0f };
+  static const float hl_chroma[4] = { 0.05f, -0.02f, 0.03f, 0.0f };
+  static const char *bayer_labels[2][6] = {
+    { "whitebalance_1f rggb", "highlights_1f_clip rggb", "highlights_initmask rggb", "highlights_chroma rggb",
+      "highlights_opposed rggb", "border_interpolate rggb" },
+    { "whitebalance_1f bggr", "highlights_1f_clip bggr", "highlights_initmask bggr", "highlights_chroma bggr",
+      "highlights_opposed bggr", "border_interpolate bggr" } };
+
+  // the opposed method's 3x3 downscaled masks, one byte per cell and color
+  const int mwidth = W / 3, mheight = H / 3;
+  const int msize = ((mwidth + 3) / 4 * 4) * ((mheight + 3) / 4 * 4);
+
+  for(int b = 0; b < 2; b++)
+  {
+    TEST(bayer_labels[b][0], "basic", "whitebalance_1f",
+         RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H),
+         BUFFER("coeffs", wb_coeffs, sizeof(wb_coeffs)), INT("filters", bayer[b]),
+         BUFFER("xtrans", xtrans, sizeof(xtrans)));
+    // a crop of 3 columns and 2 rows
+    TEST(bayer_labels[b][1], "basic", "highlights_1f_clip",
+         RAW_IN("in", image_raw), RAW_OUT("out"), INT("iwidth", W), INT("iheight", H),
+         INT("owidth", W - 5), INT("oheight", H - 4), FLOAT4("clip", 0.95f, 0.98f, 0.9f, 0.98f),
+         INT("dx", 3), INT("dy", 2), INT("filters", bayer[b]), BUFFER("xtrans", xtrans, sizeof(xtrans)));
+    TEST_GRID(bayer_labels[b][2], "basic", "highlights_initmask", 0.0, mwidth, mheight,
+         RAW_IN("in", image_raw), BYTES_OUT("inmask", 3 * msize), INT("msize", msize), INT("mwidth", mwidth),
+         INT("mheight", mheight), INT("iwidth", W), INT("iheight", H), INT("filters", bayer[b]),
+         BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)));
+    TEST_GRID(bayer_labels[b][3], "basic", "highlights_chroma", 0.0, H, 1,
+         RAW_IN("in", image_raw), BUFFER("mask", mask_bytes, 3 * msize + 64),
+         BUFFER_OUT("accu", NULL, sizeof(float) * 8 * H), INT("width", W), INT("height", H),
+         INT("msize", msize), INT("mwidth", mwidth), INT("filters", bayer[b]),
+         BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)),
+         BUFFER("correction", hl_correction, sizeof(hl_correction)));
+    TEST(bayer_labels[b][4], "basic", "highlights_opposed",
+         RAW_IN("in", image_raw), RAW_OUT("out"), INT("owidth", W), INT("oheight", H),
+         INT("iwidth", W), INT("iheight", H), INT("dx", 0), INT("dy", 0), INT("filters", bayer[b]),
+         BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)),
+         BUFFER("chroma", hl_chroma, sizeof(hl_chroma)), BUFFER("correction", hl_correction, sizeof(hl_correction)));
+    TEST(bayer_labels[b][5], "demosaic_ppg", "border_interpolate",
+         RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[b]));
+  }
+  TEST("whitebalance_1f_xtrans", "basic", "whitebalance_1f_xtrans",
+       RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H),
+       BUFFER("coeffs", wb_coeffs, sizeof(wb_coeffs)), INT("filters", 9),
+       BUFFER("xtrans", xtrans, sizeof(xtrans)));
+  TEST("whitebalance_4f", "basic", "whitebalance_4f",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+       BUFFER("coeffs", wb_coeffs, sizeof(wb_coeffs)), INT("filters", 0),
+       BUFFER("xtrans", xtrans, sizeof(xtrans)));
+  TEST_GRID("highlights_initmask xtrans", "basic", "highlights_initmask", 0.0, mwidth, mheight,
+       RAW_IN("in", image_raw), BYTES_OUT("inmask", 3 * msize), INT("msize", msize), INT("mwidth", mwidth),
+       INT("mheight", mheight), INT("iwidth", W), INT("iheight", H), INT("filters", 9),
+       BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)));
+  TEST_GRID("highlights_dilatemask", "basic", "highlights_dilatemask", 0.0, mwidth, mheight,
+       BUFFER("in", mask_bytes, 3 * msize), BYTES_OUT("out", 3 * msize),
+       INT("msize", msize), INT("mwidth", mwidth), INT("mheight", mheight));
+
+  // the PPG kernels that demosaic the borders for RCD, with the local memory
+  // the OpenCL kernels need for 16x16 work groups
+  TEST("ppg_demosaic_green", "demosaic_ppg", "ppg_demosaic_green",
+       RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
+       LOCAL("buffer", sizeof(float) * (16 + 6) * (16 + 6)), INT("border", 32));
+  TEST("ppg_demosaic_redblue", "demosaic_ppg", "ppg_demosaic_redblue",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
+       LOCAL("buffer", 4 * sizeof(float) * (16 + 2) * (16 + 2)), INT("border", 16));
+
+  // the RCD steps, on plausible intermediate data rather than the output of
+  // the step before, so that each step is compared on its own
+  const size_t plane = sizeof(float) * W * H;
+  for(int b = 0; b < 2; b++)
+  {
+    static const char *rcd_labels[2][9] = {
+      { "rcd_populate rggb", "rcd_step_1 rggb", "rcd_step_2 rggb", "rcd_step_3 rggb", "rcd_step_4_0 rggb",
+        "rcd_step_4_1 rggb", "rcd_step_4_2 rggb", "rcd_step_4_3 rggb", "rcd_write_output rggb" },
+      { "rcd_populate bggr", "rcd_step_1 bggr", "rcd_step_2 bggr", "rcd_step_3 bggr", "rcd_step_4_0 bggr",
+        "rcd_step_4_1 bggr", "rcd_step_4_2 bggr", "rcd_step_4_3 bggr", "rcd_write_output bggr" } };
+    const int f = bayer[b];
+    TEST(rcd_labels[b][0], "demosaic_rcd", "rcd_populate",
+         RAW_IN("in", image_raw), BUFFER_OUT("cfa", NULL, plane), BUFFER_OUT("rgb0", NULL, plane),
+         BUFFER_OUT("rgb1", NULL, plane), BUFFER_OUT("rgb2", NULL, plane), INT("w", W), INT("height", H),
+         INT("filters", f), FLOAT("scale", 1.0f / 1.05f));
+    TEST(rcd_labels[b][1], "demosaic_rcd", "rcd_step_1",
+         BUFFER("cfa", rcd_cfa, plane), BUFFER_OUT("VH_dir", NULL, plane), INT("w", W), INT("height", H),
+         LOCAL("buffer", sizeof(float) * (16 + 8) * (16 + 8)));
+    TEST_GRID(rcd_labels[b][2], "demosaic_rcd", "rcd_step_2", 0.0, W / 2, H,
+         BUFFER_OUT("lpf", NULL, plane), BUFFER("cfa", rcd_cfa, plane), INT("w", W), INT("height", H),
+         INT("filters", f));
+    TEST_GRID(rcd_labels[b][3], "demosaic_rcd", "rcd_step_3", 0.0, W / 2, H,
+         BUFFER("lpf", rcd_lpf, plane), BUFFER("cfa", rcd_cfa, plane), BUFFER_OUT("rgb1", rcd_rgb[1], plane),
+         BUFFER("VH_Dir", rcd_dir, plane), INT("w", W), INT("height", H), INT("filters", f));
+    TEST_GRID(rcd_labels[b][4], "demosaic_rcd", "rcd_step_4_0", 0.0, W / 2, H,
+         BUFFER("cfa", rcd_cfa, plane), BUFFER_OUT("p_diff", NULL, plane), BUFFER_OUT("q_diff", NULL, plane),
+         INT("w", W), INT("height", H), INT("filters", f));
+    TEST_GRID(rcd_labels[b][5], "demosaic_rcd", "rcd_step_4_1", 0.0, W / 2, H,
+         BUFFER_OUT("PQ_dir", NULL, plane), BUFFER("p_diff", rcd_lpf, plane), BUFFER("q_diff", rcd_cfa, plane),
+         INT("w", W), INT("height", H), INT("filters", f));
+    TEST_GRID(rcd_labels[b][6], "demosaic_rcd", "rcd_step_4_2", 0.0, W / 2, H,
+         BUFFER("PQ_dir", rcd_dir, plane), BUFFER_OUT("rgb0", rcd_rgb[0], plane),
+         BUFFER_OUT("rgb1", rcd_rgb[1], plane), BUFFER_OUT("rgb2", rcd_rgb[2], plane),
+         INT("w", W), INT("height", H), INT("filters", f));
+    TEST_GRID(rcd_labels[b][7], "demosaic_rcd", "rcd_step_4_3", 0.0, W / 2, H,
+         BUFFER("VH_dir", rcd_dir, plane), BUFFER_OUT("rgb0", rcd_rgb[0], plane),
+         BUFFER_OUT("rgb1", rcd_rgb[1], plane), BUFFER_OUT("rgb2", rcd_rgb[2], plane),
+         INT("w", W), INT("height", H), INT("filters", f));
+    TEST(rcd_labels[b][8], "demosaic_rcd", "rcd_write_output",
+         IMG_OUT("out"), BUFFER("rgb0", rcd_rgb[0], plane), BUFFER("rgb1", rcd_rgb[1], plane),
+         BUFFER("rgb2", rcd_rgb[2], plane), INT("w", W), INT("height", H), FLOAT("scale", 1.05f),
+         INT("border", 9));
+  }
+
 #undef TEST
 #undef TEST_TOL
+#undef TEST_GRID
   return n;
 }
 
@@ -418,7 +580,31 @@ static void cl_init(cl_env_t *e)
   CK(err);
 }
 
-static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, float *out)
+// bytes a kernel writes to an output argument, 0 for inputs
+static size_t out_size(const arg_t *arg)
+{
+  if(arg->kind == ARG_IMAGE_OUT) return sizeof(float) * arg->w * arg->h * arg->channels;
+  if(arg->kind == ARG_BUFFER_OUT) return arg->size;
+  return 0;
+}
+
+// outputs start zeroed, as some kernels write only part of them
+static const void *initial_data(const arg_t *arg)
+{
+  static void *zeros = NULL;
+  static size_t nzeros = 0;
+  if(arg->kind == ARG_BUFFER_OUT && arg->data) return arg->data;
+  const size_t sz = out_size(arg);
+  if(sz > nzeros)
+  {
+    free(zeros);
+    zeros = calloc(1, sz);
+    nzeros = sz;
+  }
+  return zeros;
+}
+
+static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs)
 {
   char path[1024], opts[1100];
   snprintf(path, sizeof(path), "%s/%s.cl", cl_dir, t->program);
@@ -440,7 +626,6 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, float *out)
   CK(err);
 
   cl_mem mem[MAX_ARGS] = { 0 };
-  cl_mem result = NULL;
   for(int a = 0; a < t->nargs; a++)
   {
     const arg_t *arg = &t->args[a];
@@ -454,9 +639,19 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, float *out)
         CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
         break;
       case ARG_IMAGE_OUT:
-        mem[a] = result = clCreateImage(e->ctx, CL_MEM_WRITE_ONLY, &fmt, &desc, NULL, &err);
+        mem[a] = clCreateImage(e->ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, &fmt, &desc,
+                               (void *)initial_data(arg), &err);
         CK(err);
         CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        break;
+      case ARG_BUFFER_OUT:
+        mem[a] = clCreateBuffer(e->ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, arg->size,
+                                (void *)initial_data(arg), &err);
+        CK(err);
+        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        break;
+      case ARG_LOCAL:
+        CK(clSetKernelArg(k, a, arg->size, NULL));
         break;
       case ARG_BUFFER:
         mem[a] = clCreateBuffer(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, arg->size, (void *)arg->data, &err);
@@ -475,11 +670,20 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, float *out)
     }
   }
 
-  const size_t global[2] = { (W + 15) / 16 * 16, (H + 15) / 16 * 16 };
-  const size_t local[2] = { 16, 16 };
+  // a single row is a 1D kernel
+  const size_t ly = t->gh == 1 ? 1 : 16;
+  const size_t global[2] = { (t->gw + 15) / 16 * 16, (t->gh + ly - 1) / ly * ly };
+  const size_t local[2] = { 16, ly };
   CK(clEnqueueNDRangeKernel(e->queue, k, 2, NULL, global, local, 0, NULL, NULL));
-  const size_t origin[3] = { 0, 0, 0 }, region[3] = { W, H, 1 };
-  CK(clEnqueueReadImage(e->queue, result, CL_TRUE, origin, region, 0, 0, out, 0, NULL, NULL));
+  for(int a = 0; a < t->nargs; a++)
+  {
+    const arg_t *arg = &t->args[a];
+    const size_t origin[3] = { 0, 0, 0 }, region[3] = { arg->w, arg->h, 1 };
+    if(arg->kind == ARG_IMAGE_OUT)
+      CK(clEnqueueReadImage(e->queue, mem[a], CL_TRUE, origin, region, 0, 0, outs[a], 0, NULL, NULL));
+    else if(arg->kind == ARG_BUFFER_OUT)
+      CK(clEnqueueReadBuffer(e->queue, mem[a], CL_TRUE, 0, arg->size, outs[a], 0, NULL, NULL));
+  }
 
   for(int a = 0; a < t->nargs; a++)
     if(mem[a]) clReleaseMemObject(mem[a]);
@@ -765,7 +969,7 @@ static void vk_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkIm
                        NULL, 1, &b);
 }
 
-static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, float *out)
+static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **outs)
 {
   char path[1024];
   snprintf(path, sizeof(path), "%s/%s.spv", spv_dir, t->program);
@@ -781,7 +985,7 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, float *out
   vk_image_t img[MAX_ARGS] = { 0 };
   vk_buffer_t buf[MAX_ARGS] = { 0 };
   vk_buffer_t stage[MAX_ARGS] = { 0 };
-  int nbind = 0, result = -1, have_img[MAX_ARGS] = { 0 }, have_buf[MAX_ARGS] = { 0 };
+  int nbind = 0, have_img[MAX_ARGS] = { 0 }, have_buf[MAX_ARGS] = { 0 };
   uint8_t push[128] = { 0 };
   int push_size = 0;
 
@@ -792,7 +996,7 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, float *out
     if(!p)
     {
       // a parameter the kernel never reads is dropped from the module
-      if(arg->kind == ARG_IMAGE_OUT) die("%s: output %s not in the SPIR-V", t->kernel, arg->name);
+      if(out_size(arg)) die("%s: output %s not in the SPIR-V", t->kernel, arg->name);
       continue;
     }
     const VkFormat fmt = arg->channels == 1 ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -803,13 +1007,12 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, float *out
       {
         const int is_out = arg->kind == ARG_IMAGE_OUT;
         img[a] = vk_image(e, arg->w, arg->h, fmt,
-                          is_out ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                                 : VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                          (is_out ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                  : VK_IMAGE_USAGE_SAMPLED_BIT) | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         have_img[a] = 1;
         const size_t bytes = (size_t)arg->w * arg->h * arg->channels * sizeof(float);
-        stage[a] = vk_buffer(e, bytes, is_out ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        if(!is_out) memcpy(stage[a].map, arg->pixels, bytes);
-        else result = a;
+        stage[a] = vk_buffer(e, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        memcpy(stage[a].map, is_out ? initial_data(arg) : arg->pixels, bytes);
         const VkDescriptorType type = is_out ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         lb[nbind] = (VkDescriptorSetLayoutBinding){ p->binding, type, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
         dii[nbind] = (VkDescriptorImageInfo){ .imageView = img[a].view,
@@ -820,10 +1023,13 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, float *out
         nbind++;
         break;
       }
+      case ARG_LOCAL:
+        break;
       case ARG_BUFFER:
+      case ARG_BUFFER_OUT:
         buf[a] = vk_buffer(e, arg->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         have_buf[a] = 1;
-        memcpy(buf[a].map, arg->data, arg->size);
+        memcpy(buf[a].map, arg->kind == ARG_BUFFER ? arg->data : initial_data(arg), arg->size);
         lb[nbind] = (VkDescriptorSetLayoutBinding){ p->binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                                     VK_SHADER_STAGE_COMPUTE_BIT, NULL };
         dbi[nbind] = (VkDescriptorBufferInfo){ buf[a].buf, 0, arg->size };
@@ -846,7 +1052,6 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, float *out
       }
     }
   }
-  if(result < 0) die("%s: no output image", t->kernel);
   push_size = (push_size + 3) & ~3;
 
   const VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -897,28 +1102,34 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, float *out
     if(!have_img[a]) continue;
     const VkBufferImageCopy cpy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                                     .imageExtent = { t->args[a].w, t->args[a].h, 1 } };
-    if(a == result)
-      vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    else
-    {
-      vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-      vkCmdCopyBufferToImage(cb, stage[a].buf, img[a].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cpy);
-      vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
+    vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdCopyBufferToImage(cb, stage[a].buf, img[a].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cpy);
+    vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               t->args[a].kind == ARG_IMAGE_OUT ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   }
   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
   vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &ds, 0, NULL);
   if(push_size) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
-  vkCmdDispatch(cb, (W + 15) / 16, (H + 15) / 16, 1);
-  const VkBufferImageCopy cpy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                                  .imageExtent = { W, H, 1 } };
-  vk_barrier(cb, img[result].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-  vkCmdCopyImageToBuffer(cb, img[result].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stage[result].buf, 1, &cpy);
+  // the kernels are written for 16x16 work groups, see [numthreads] in the .slang files
+  vkCmdDispatch(cb, (t->gw + 15) / 16, (t->gh + 15) / 16, 1);
+  for(int a = 0; a < t->nargs; a++)
+  {
+    if(!have_img[a] || t->args[a].kind != ARG_IMAGE_OUT) continue;
+    const VkBufferImageCopy cpy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                    .imageExtent = { t->args[a].w, t->args[a].h, 1 } };
+    vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vkCmdCopyImageToBuffer(cb, img[a].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stage[a].buf, 1, &cpy);
+  }
   CK(vkEndCommandBuffer(cb));
   const VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
   CK(vkQueueSubmit(e->queue, 1, &si, VK_NULL_HANDLE));
   CK(vkQueueWaitIdle(e->queue));
-  memcpy(out, stage[result].map, sizeof(float) * 4 * W * H);
+  for(int a = 0; a < t->nargs; a++)
+  {
+    const arg_t *arg = &t->args[a];
+    if(arg->kind == ARG_IMAGE_OUT && have_img[a]) memcpy(outs[a], stage[a].map, out_size(arg));
+    else if(arg->kind == ARG_BUFFER_OUT && have_buf[a]) memcpy(outs[a], buf[a].map, out_size(arg));
+  }
 
   vkFreeCommandBuffers(e->dev, e->pool, 1, &cb);
   vkDestroyDescriptorPool(e->dev, dp, NULL);
@@ -949,7 +1160,7 @@ int main(int argc, char **argv)
   if(sizeof(profile_info_t) != 160) die("profile_info_t is %zu bytes, the kernels expect 160", sizeof(profile_info_t));
 
   make_inputs();
-  static test_t tests[64];
+  static test_t tests[96];
   const int ntests = make_tests(tests);
 
   cl_env_t cl;
@@ -957,45 +1168,74 @@ int main(int argc, char **argv)
   cl_init(&cl);
   vk_init(&vk);
 
-  float *out_cl = malloc(sizeof(float) * 4 * W * H);
-  float *out_vk = malloc(sizeof(float) * 4 * W * H);
   int failed = 0, ran = 0;
   for(int k = 0; k < ntests; k++)
   {
-    const test_t *t = &tests[k];
+    test_t *t = &tests[k];
     if(argc > 3 && strcmp(argv[3], t->program)) continue;
-    memset(out_cl, 0, sizeof(float) * 4 * W * H);
-    memset(out_vk, 0, sizeof(float) * 4 * W * H);
+    void *out_cl[MAX_ARGS] = { 0 }, *out_vk[MAX_ARGS] = { 0 };
+    for(int a = 0; a < t->nargs; a++)
+      if(out_size(&t->args[a]))
+      {
+        out_cl[a] = calloc(1, out_size(&t->args[a]));
+        out_vk[a] = calloc(1, out_size(&t->args[a]));
+      }
     cl_run(&cl, argv[1], t, out_cl);
     vk_run(&vk, argv[2], t, out_vk);
 
+    // every output is compared, and the test fails on the worst of them
     double max_err = 0.0, max_abs = 0.0;
-    size_t worst = 0, nan_mismatch = 0;
-    for(size_t i = 0; i < (size_t)4 * W * H; i++)
+    size_t worst = 0, nan_mismatch = 0, byte_mismatch = 0;
+    int worst_arg = -1;
+    for(int a = 0; a < t->nargs; a++)
     {
-      if(isnan(out_cl[i]) || isnan(out_vk[i]))
+      const arg_t *arg = &t->args[a];
+      if(!out_cl[a]) continue;
+      if(arg->bytes)
       {
-        if(isnan(out_cl[i]) != isnan(out_vk[i])) nan_mismatch++;
+        for(size_t i = 0; i < arg->size; i++)
+          byte_mismatch += ((uint8_t *)out_cl[a])[i] != ((uint8_t *)out_vk[a])[i];
         continue;
       }
-      const double d = fabs((double)out_cl[i] - (double)out_vk[i]);
-      const double err = d / fmax(1.0, fabs((double)out_cl[i]));
-      if(err > max_err)
+      const float *fc = out_cl[a], *fv = out_vk[a];
+      for(size_t i = 0; i < out_size(arg) / sizeof(float); i++)
       {
-        max_err = err;
-        worst = i;
+        if(isnan(fc[i]) || isnan(fv[i]))
+        {
+          if(isnan(fc[i]) != isnan(fv[i])) nan_mismatch++;
+          continue;
+        }
+        const double d = fabs((double)fc[i] - (double)fv[i]);
+        const double err = d / fmax(1.0, fabs((double)fc[i]));
+        if(err > max_err || worst_arg < 0)
+        {
+          max_err = fmax(err, max_err);
+          worst = i;
+          worst_arg = a;
+        }
+        if(d > max_abs) max_abs = d;
       }
-      if(d > max_abs) max_abs = d;
     }
     const double tolerance = t->tolerance > 0.0 ? t->tolerance : TOLERANCE;
-    const int ok = max_err <= tolerance && nan_mismatch == 0;
+    const int ok = max_err <= tolerance && nan_mismatch == 0 && byte_mismatch == 0;
     printf("%-4s %-45s max error %.2e  max abs %.2e  nan mismatches %zu", ok ? "ok" : "FAIL", t->label, max_err,
            max_abs, nan_mismatch);
-    if(!ok)
-      printf("  (pixel %zu channel %zu: opencl %g, vulkan %g)", worst / 4, worst % 4, out_cl[worst], out_vk[worst]);
+    if(byte_mismatch) printf("  byte mismatches %zu", byte_mismatch);
+    if(!ok && worst_arg >= 0)
+    {
+      const arg_t *arg = &t->args[worst_arg];
+      const int ch = arg->kind == ARG_IMAGE_OUT ? arg->channels : 1;
+      printf("  (%s element %zu channel %zu: opencl %g, vulkan %g)", arg->name, worst / ch, worst % ch,
+             ((float *)out_cl[worst_arg])[worst], ((float *)out_vk[worst_arg])[worst]);
+    }
     printf("\n");
     failed += !ok;
     ran++;
+    for(int a = 0; a < t->nargs; a++)
+    {
+      free(out_cl[a]);
+      free(out_vk[a]);
+    }
   }
   printf("%d of %d kernel runs match\n", ran - failed, ran);
   return failed ? 1 : 0;

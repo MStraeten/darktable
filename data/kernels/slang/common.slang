@@ -127,15 +127,16 @@ public int FC(int row, int col, uint filters)
   return int(filters >> ((((row) << 1 & 14) + ((col) & 1)) << 1) & 3);
 }
 
-// the xtrans pattern is a 6x6 byte array in OpenCL; here it is passed as
-// 36 ints, since byte-sized buffer elements are not portable
-public int FCxtrans(int row, int col, StructuredBuffer<int> xtrans)
+// the xtrans pattern is the host's 6x6 byte array, read as 9 words since
+// byte-sized buffer elements are not portable
+public int FCxtrans(int row, int col, StructuredBuffer<uint> xtrans)
 {
   // the +600 ensures a non-negative array index as in CPU code
-  return xtrans[((row + 600) % 6) * 6 + (col + 600) % 6];
+  const int i = ((row + 600) % 6) * 6 + (col + 600) % 6;
+  return int((xtrans[i >> 2] >> uint((i & 3) * 8)) & 0xffu);
 }
 
-public int fcol(int row, int col, uint filters, StructuredBuffer<int> xtrans)
+public int fcol(int row, int col, uint filters, StructuredBuffer<uint> xtrans)
 {
   return (filters == 9) ? FCxtrans(row, col, xtrans) : FC(row, col, filters);
 }
