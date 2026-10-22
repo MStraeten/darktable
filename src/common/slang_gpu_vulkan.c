@@ -162,7 +162,9 @@ static gboolean _init_device(void)
                                         .queueFamilyIndex = family,
                                         .queueCount = 1,
                                         .pQueuePriorities = &priority };
-  const VkPhysicalDeviceFeatures enable = { .shaderStorageImageWriteWithoutFormat = VK_TRUE };
+  // 64-bit integers seed filmic's noise, as in OpenCL; nearly every device has them
+  const VkPhysicalDeviceFeatures enable = { .shaderStorageImageWriteWithoutFormat = VK_TRUE,
+                                            .shaderInt64 = features.shaderInt64 };
   const VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                    .queueCreateInfoCount = 1,
                                    .pQueueCreateInfos = &qci,

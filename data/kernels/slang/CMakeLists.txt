@@ -6,7 +6,7 @@
 #
 
 # modules are compiled as part of every kernel that imports them
-set(DT_SLANG_MODULES common colorspace hdr_transfer color_conversion rgb_norms)
+set(DT_SLANG_MODULES common colorspace hdr_transfer color_conversion rgb_norms noise_generator)
 
 set(DT_SLANG_MODULE_FILES "")
 foreach(MODULE IN ITEMS ${DT_SLANG_MODULES})
