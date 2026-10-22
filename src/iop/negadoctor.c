@@ -19,6 +19,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -332,6 +333,20 @@ void process(dt_iop_module_t *const self, dt_dev_pixelpipe_iop_t *const piece,
 
   const float *const restrict in = (float *)ivoid;
   float *const restrict out = (float *)ovoid;
+
+#ifdef HAVE_SLANG_GPU
+  if(dt_slang_gpu_enabled())
+  {
+    const int width = roi_out->width;
+    const int height = roi_out->height;
+    if(!dt_slang_gpu_run_2d_args("negadoctor", "negadoctor", width, height,
+                                 SLIMG_IN(in, width, height, 4), SLIMG_OUT(out, width, height, 4),
+                                 SLARG(width), SLARG(height), SLARG(d->Dmin), SLARG(d->wb_high),
+                                 SLARG(d->offset), SLARG(d->exposure), SLARG(d->black), SLARG(d->gamma),
+                                 SLARG(d->soft_clip), SLARG(d->soft_clip_comp)))
+      return;
+  }
+#endif
 
   dt_aligned_pixel_t gamma;
   dt_aligned_pixel_t black;
