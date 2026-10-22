@@ -316,6 +316,14 @@ typedef struct dt_dev_pixelpipe_t
   gboolean opencl_enabled;
   // opencl error detected?
   gboolean opencl_error;
+#ifdef HAVE_SLANG_GPU
+  // output of the last module run by process_slang(), still on the device.
+  // slang_host is its cacheline, which holds the same data only once
+  // slang_host_valid is set
+  struct dt_slang_gpu_image_t *slang_image;
+  void *slang_host;
+  gboolean slang_host_valid;
+#endif
   // running in a tiling context?
   gboolean tiling;
   // should this pixelpipe display a mask in the end?

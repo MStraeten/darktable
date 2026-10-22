@@ -1837,6 +1837,55 @@ cleanup:
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+float *dt_ioppr_build_iccprofile_params_slang(const dt_iop_order_iccprofile_info_t *const profile_info,
+                                              dt_colorspaces_iccprofile_info_slang_t *info,
+                                              int *lut_width,
+                                              int *lut_height)
+{
+  memset(info, 0, sizeof(*info));
+  if(!profile_info)
+  {
+    // the kernels take an image either way
+    *lut_width = 1;
+    *lut_height = 6;
+    return calloc(6, sizeof(float));
+  }
+
+  for(int i = 0; i < 9; i++)
+  {
+    info->matrix_in[i] = profile_info->matrix_in[i/3][i%3];
+    info->matrix_out[i] = profile_info->matrix_out[i/3][i%3];
+  }
+  info->lutsize = profile_info->lutsize;
+  for(int i = 0; i < 3; i++)
+    for(int j = 0; j < 3; j++)
+    {
+      info->unbounded_coeffs_in[i][j] = profile_info->unbounded_coeffs_in[i][j];
+      info->unbounded_coeffs_out[i][j] = profile_info->unbounded_coeffs_out[i][j];
+    }
+  info->nonlinearlut = profile_info->nonlinearlut;
+  info->grey = profile_info->grey;
+  info->hdr_transfer = dt_colorspaces_hdr_transfer(profile_info->type);
+
+  // three input curves, then three output curves, each lutsize = 256 x 256 long
+  *lut_width = 256;
+  *lut_height = 6 * profile_info->lutsize / 256;
+  float *lut = malloc(sizeof(float) * 6 * profile_info->lutsize);
+  if(lut)
+  {
+    int x = 0;
+    for(int c = 0; c < 3; c++)
+      for(int y = 0; y < profile_info->lutsize; y++, x++)
+        lut[x] = profile_info->lut_in[c][y];
+    for(int c = 0; c < 3; c++)
+      for(int y = 0; y < profile_info->lutsize; y++, x++)
+        lut[x] = profile_info->lut_out[c][y];
+  }
+  return lut;
+}
+#endif
+
 #undef DT_IOP_ORDER_PROFILE
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

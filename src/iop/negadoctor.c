@@ -334,20 +334,6 @@ void process(dt_iop_module_t *const self, dt_dev_pixelpipe_iop_t *const piece,
   const float *const restrict in = (float *)ivoid;
   float *const restrict out = (float *)ovoid;
 
-#ifdef HAVE_SLANG_GPU
-  if(dt_slang_gpu_enabled())
-  {
-    const int width = roi_out->width;
-    const int height = roi_out->height;
-    if(!dt_slang_gpu_run_2d_args("negadoctor", "negadoctor", width, height,
-                                 SLIMG_IN(in, width, height, 4), SLIMG_OUT(out, width, height, 4),
-                                 SLARG(width), SLARG(height), SLARG(d->Dmin), SLARG(d->wb_high),
-                                 SLARG(d->offset), SLARG(d->exposure), SLARG(d->black), SLARG(d->gamma),
-                                 SLARG(d->soft_clip), SLARG(d->soft_clip_comp)))
-      return;
-  }
-#endif
-
   dt_aligned_pixel_t gamma;
   dt_aligned_pixel_t black;
   dt_aligned_pixel_t exposure;
@@ -390,6 +376,21 @@ int process_cl(dt_iop_module_t *const self, dt_dev_pixelpipe_iop_t *const piece,
   return dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_negadoctor, width, height,
     CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(d->Dmin), CLARG(d->wb_high),
     CLARG(d->offset), CLARG(d->exposure), CLARG(d->black), CLARG(d->gamma), CLARG(d->soft_clip), CLARG(d->soft_clip_comp));
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *const self, dt_dev_pixelpipe_iop_t *const piece,
+                       dt_slang_gpu_image_t *dev_in, dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const restrict roi_in, const dt_iop_roi_t *const restrict roi_out)
+{
+  const dt_iop_negadoctor_data_t *const d = piece->data;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  return !dt_slang_gpu_run_2d_args("negadoctor", "negadoctor", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(d->Dmin), SLARG(d->wb_high),
+    SLARG(d->offset), SLARG(d->exposure), SLARG(d->black), SLARG(d->gamma), SLARG(d->soft_clip), SLARG(d->soft_clip_comp));
 }
 #endif
 

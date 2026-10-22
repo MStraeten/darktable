@@ -20,6 +20,7 @@
 #include "common/colorspaces.h"
 #include "common/histogram.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/iop_order.h"
 #include "common/imagebuf.h"
 #include "control/control.h"
@@ -297,6 +298,11 @@ static gboolean _dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
 
   dt_atomic_set_int(&pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
   pipe->opencl_error = FALSE;
+#ifdef HAVE_SLANG_GPU
+  pipe->slang_image = NULL;
+  pipe->slang_host = NULL;
+  pipe->slang_host_valid = FALSE;
+#endif
   pipe->tiling = FALSE;
   pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_NONE;
   pipe->mask_display_empty = FALSE;
@@ -2037,6 +2043,152 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
   return FALSE;
 }
 
+#ifdef HAVE_SLANG_GPU
+// copies the device-only output of the last process_slang() to its cacheline
+static gboolean _slang_sync_host(dt_dev_pixelpipe_t *pipe)
+{
+  if(!pipe->slang_image || pipe->slang_host_valid) return TRUE;
+  if(dt_slang_gpu_image_read(pipe->slang_image, pipe->slang_host))
+  {
+    dt_print_pipe(DT_DEBUG_OPENCL | DT_DEBUG_PIPE, "slang read failure",
+                  pipe, NULL, DT_DEVICE_NONE, NULL, NULL, "can't copy an image back to the host");
+    return FALSE;
+  }
+  pipe->slang_host_valid = TRUE;
+  return TRUE;
+}
+
+// frees the device image. If its cacheline never got the data, the cacheline
+// is cleared too, so that no later run takes the stale buffer from the cache.
+static void _slang_release(dt_dev_pixelpipe_t *pipe)
+{
+  if(!pipe->slang_image) return;
+  if(!pipe->slang_host_valid)
+    dt_dev_pixelpipe_clear_cacheline(pipe, pipe->slang_host, "slang output only on the device");
+  dt_slang_gpu_image_free(pipe->slang_image);
+  pipe->slang_image = NULL;
+  pipe->slang_host = NULL;
+  pipe->slang_host_valid = FALSE;
+}
+
+/* Runs the module's process_slang() if it has one and the module needs nothing
+   that only the CPU path does. The input stays on the device when the previous
+   module ran here too, and the output is left on the device for the next one;
+   it is only copied to the host cacheline when something there needs it.
+   Returns 1 if the module ran, 0 if it has to run on the CPU (its input is
+   then on the host), and -1 if the pipe has to stop. */
+static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
+                                       dt_develop_t *dev,
+                                       void *input,
+                                       const dt_iop_buffer_dsc_t *input_format,
+                                       const dt_iop_roi_t *roi_in,
+                                       void **output,
+                                       const dt_iop_buffer_dsc_t *out_format,
+                                       const dt_iop_roi_t *roi_out,
+                                       dt_iop_module_t *module,
+                                       dt_dev_pixelpipe_iop_t *piece,
+                                       dt_pixelpipe_flow_t *pixelpipe_flow,
+                                       const gboolean important_input,
+                                       const gboolean important_out)
+{
+  const gboolean resident = pipe->slang_image && pipe->slang_host == input;
+  const gboolean possible =
+    module->process_slang
+    && dt_slang_gpu_enabled()
+    && *output != input
+    && input_format->datatype == TYPE_FLOAT
+    && dt_iop_buffer_dsc_to_bpp(input_format) == 4 * sizeof(float)
+    && dt_iop_buffer_dsc_to_bpp(out_format) == 4 * sizeof(float)
+    && !_transform_for_blend(module, piece)
+    && !_piece_wants_blending(piece)
+    && !_request_color_pick(pipe, dev, module)
+    && !(darktable.dump_pfm_pipe && _is_debug_pipe(pipe));
+
+  if(!possible)
+  {
+    if(resident && !_slang_sync_host(pipe)) return -1;
+    _slang_release(pipe);
+    return 0;
+  }
+
+  // the cache keeps a focused module's input, and histograms are collected
+  // on the host, as is a colorspace conversion of the input. It goes to a
+  // separate buffer, which leaves the input cacheline valid for the next run.
+  const dt_iop_colorspace_type_t cst_to = module->input_colorspace(module, pipe, piece);
+  const gboolean convert = input_format->cst != cst_to;
+  const gboolean histogram = (dev->gui_attached || !(piece->request_histogram & DT_REQUEST_ONLY_IN_GUI))
+                             && (piece->request_histogram & DT_REQUEST_ON);
+  if(resident && (important_input || histogram || convert) && !_slang_sync_host(pipe)) return -1;
+
+  float *converted = NULL;
+  if(convert)
+  {
+    converted = dt_iop_image_alloc(roi_in->width, roi_in->height, 4);
+    if(!converted)
+    {
+      _slang_release(pipe);
+      return 0;
+    }
+    dt_iop_colorspace_type_t cst_tmp = input_format->cst;
+    dt_ioppr_transform_image_colorspace(module, input, converted, roi_in->width, roi_in->height,
+                                        input_format->cst, cst_to, &cst_tmp,
+                                        input_format->cst != IOP_CS_RAW
+                                          ? dt_ioppr_get_pipe_work_profile_info(pipe) : NULL);
+    _slang_release(pipe);
+  }
+  const float *host_in = converted ? converted : input;
+  _collect_histogram_on_CPU(pipe, dev, host_in, roi_in, module, piece, pixelpipe_flow);
+
+  const gboolean on_device = resident && !convert;
+  dt_slang_gpu_image_t *dev_in = on_device
+    ? pipe->slang_image
+    : dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, host_in);
+  dt_free_align(converted);
+  dt_slang_gpu_image_t *dev_out = dev_in
+    ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, 4, NULL)
+    : NULL;
+
+  const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
+  dt_print_pipe(DT_DEBUG_PIPE, on_device ? "process slang" : "process slang, upload",
+                pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "%s%s%s",
+                dt_iop_colorspace_to_name(cst_to),
+                cst_to != cst_out ? " -> " : "",
+                cst_to != cst_out ? dt_iop_colorspace_to_name(cst_out) : "");
+
+  if(!dev_out || !module->process_slang(module, piece, dev_in, dev_out, roi_in, roi_out))
+  {
+    dt_print_pipe(DT_DEBUG_OPENCL | DT_DEBUG_PIPE, "slang failure",
+                  pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "falling back to CPU");
+    dt_slang_gpu_image_free(dev_out);
+    if(!on_device) dt_slang_gpu_image_free(dev_in);
+    if(on_device && !_slang_sync_host(pipe)) return -1;
+    _slang_release(pipe);
+    return 0;
+  }
+
+  if(on_device)
+    _slang_release(pipe);
+  else
+    dt_slang_gpu_image_free(dev_in);
+
+  pipe->slang_image = dev_out;
+  pipe->slang_host = *output;
+  pipe->slang_host_valid = FALSE;
+  // important cachelines are kept for the GUI, and the NaN check reads the output
+  if((important_out || (darktable.unmuted & DT_DEBUG_NAN)) && !_slang_sync_host(pipe))
+    return -1;
+
+  *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
+  *pixelpipe_flow &= ~(PIXELPIPE_FLOW_PROCESSED_ON_CPU | PIXELPIPE_FLOW_PROCESSED_WITH_TILING);
+
+  if(_module_pipe_stop(pipe, module, *output) != DT_DEV_PIXELPIPE_STOP_NO)
+    return -1;
+
+  pipe->dsc.cst = cst_out;
+  return 1;
+}
+#endif // HAVE_SLANG_GPU
+
 #ifdef HAVE_OPENCL
 static inline gboolean _opencl_pipe_isok(const dt_dev_pixelpipe_t *pipe)
 {
@@ -2614,6 +2766,12 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
     return TRUE;
   }
 
+#ifdef HAVE_SLANG_GPU
+  // a device image that isn't this module's input belongs to no module any more
+  if(pipe->slang_image && pipe->slang_host != input)
+    _slang_release(pipe);
+#endif
+
   const size_t in_bpp = dt_iop_buffer_dsc_to_bpp(input_format);
   piece->dsc_out = piece->dsc_in = *input_format;
   module->output_format(module, pipe, piece, &piece->dsc_out);
@@ -2657,6 +2815,9 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
     // is the same as the input format
     **out_format = pipe->dsc = piece->dsc_out = piece->dsc_in;
 
+#ifdef HAVE_SLANG_GPU
+    if(!_slang_sync_host(pipe)) return TRUE;
+#endif
 #ifdef HAVE_OPENCL
     if(_opencl_pipe_isok(pipe) && (cl_mem_input != NULL))
       *cl_mem_output = cl_mem_input;
@@ -3474,6 +3635,14 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
 #endif // HAVE_OPENCL
   {
     /* opencl is not included, not inited, not enabled or we got no resource/device -> everything runs on cpu */
+#ifdef HAVE_SLANG_GPU
+    // or on the Slang kernels, for modules that have them
+    const int slang = _pixelpipe_process_on_slang(pipe, dev, input, input_format, &roi_in,
+                                                  output, *out_format, roi_out, module, piece,
+                                                  &pixelpipe_flow, important_input, important_out);
+    if(slang < 0) return TRUE;
+    if(slang == 0)
+#endif
     if(_pixelpipe_process_on_CPU(pipe, dev, input, input_format, &roi_in,
                                  output, out_format, roi_out,
                                  module, piece, &tiling, &pixelpipe_flow, pos))
@@ -3733,6 +3902,12 @@ static gboolean _dev_pixelpipe_process_rec_and_backcopy(dt_dev_pixelpipe_t *pipe
       }
     }
   }
+#endif
+#ifdef HAVE_SLANG_GPU
+  // the last module may have left the final output on the device
+  if(!ret && pipe->slang_image && pipe->slang_host == *output && !_slang_sync_host(pipe))
+    ret = TRUE;
+  _slang_release(pipe);
 #endif
   dt_pthread_mutex_unlock(&pipe->busy_mutex);
   return ret;

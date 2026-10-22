@@ -322,6 +322,31 @@ gboolean dt_ioppr_transform_image_colorspace_rgb_cl
    const char *message);
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// must be in sync with dt_colorspaces_iccprofile_info_cl_t in
+// data/kernels/slang/color_conversion.slang, which is laid out with std430
+typedef struct dt_colorspaces_iccprofile_info_slang_t
+{
+  float matrix_in[9];
+  float matrix_out[9];
+  int lutsize;
+  float unbounded_coeffs_in[3][3];
+  float unbounded_coeffs_out[3][3];
+  int nonlinearlut;
+  float grey;
+  int hdr_transfer;
+} dt_colorspaces_iccprofile_info_slang_t;
+
+/** the Slang equivalent of dt_ioppr_build_iccprofile_params_cl(): fills info
+ *  and returns the curves as a lut_width x lut_height single channel image,
+ *  to be freed with free(). profile_info may be NULL. */
+float *dt_ioppr_build_iccprofile_params_slang
+  (const dt_iop_order_iccprofile_info_t *const profile_info,
+   dt_colorspaces_iccprofile_info_slang_t *info,
+   int *lut_width,
+   int *lut_height);
+#endif
+
 /** the following must have the matrix_in and matrix_out generated */
 
 DT_OMP_DECLARE_SIMD(aligned(lut:64))
