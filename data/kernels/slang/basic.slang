@@ -560,3 +560,58 @@ void highlights_opposed(uint3 gid : SV_DispatchThreadID,
   }
   out.write(int2(x, y), float4(val));
 }
+
+// interpolation_resample in ../basic.cl splits each output pixel's vertical
+// taps across a work group and sums them in local memory. Here one work item
+// does all taps of its pixel, so the sums differ in the last bits.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void interpolation_resample(uint3 gid : SV_DispatchThreadID,
+                            uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                            uniform StructuredBuffer<int> hmeta, uniform StructuredBuffer<int> vmeta,
+                            uniform StructuredBuffer<int> hlength, uniform StructuredBuffer<int> vlength,
+                            uniform StructuredBuffer<int> hindex, uniform StructuredBuffer<int> vindex,
+                            uniform StructuredBuffer<float> hkernel, uniform StructuredBuffer<float> vkernel,
+                            uniform int htaps, uniform int vtaps)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int hl = hlength[hmeta[x * 3]];
+  const int hkidx = hmeta[x * 3 + 1];
+  const int hiidx = hmeta[x * 3 + 2];
+  const int vl = vlength[vmeta[y * 3]];
+  const int vkidx = vmeta[y * 3 + 1];
+  const int viidx = vmeta[y * 3 + 2];
+
+  float4 pixel = float4(0.0f);
+  for(int iy = 0; iy < vl; iy++)
+  {
+    const int yy = vindex[viidx + iy];
+    float4 hpixel = float4(0.0f);
+    for(int ix = 0; ix < hl; ix++)
+      hpixel += in.readpixel(hindex[hiidx + ix], yy) * hkernel[hkidx + ix];
+    pixel += hpixel * vkernel[vkidx + iy];
+  }
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void interpolation_copy(uint3 gid : SV_DispatchThreadID,
+                        uniform ImageIn dev_in, uniform ImageOut dev_out,
+                        uniform int owidth, uniform int oheight, uniform int iwidth, uniform int iheight,
+                        uniform int dx, uniform int dy)
+{
+  const int ocol = gid.x;
+  const int orow = gid.y;
+  if(ocol >= owidth || orow >= oheight) return;
+
+  float4 pix = float4(0.0f);
+  const int irow = orow + dy;
+  const int icol = ocol + dx;
+  if(irow < iheight && irow >= 0 && icol < iwidth && icol >= 0)
+    pix = dev_in.Areadpixel(icol, irow);
+  dev_out.write(int2(ocol, orow), pix);
+}

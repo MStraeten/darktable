@@ -74,6 +74,7 @@ typedef struct test_t
   const char *kernel;
   double tolerance; // 0 for the default
   int gw, gh;       // work items, W x H if 0
+  int clgw, clgh, cllx, clly; // OpenCL global and local sizes, if they differ from the above
   int nargs;
   arg_t args[MAX_ARGS];
 } test_t;
@@ -518,6 +519,62 @@ static int make_tests(test_t *t)
          INT("border", 9));
   }
 
+  // resampling, with plans like _prepare_resampling_plan() makes them: per
+  // output pixel a length index, a kernel offset and an index offset, here
+  // with 2 to 6 taps
+  {
+    enum { OW = 331, OH = 157, TAPS = 6, VTAPS = 8 };
+    static int hmeta[OW * 3], vmeta[OH * 3], hlength[OW], vlength[OH];
+    static int hindex[OW * (TAPS + 1)], vindex[OH * (TAPS + 1)];
+    static float hkernel[OW * (TAPS + 1)], vkernel[OH * (TAPS + 1)];
+    for(int pass = 0; pass < 2; pass++)
+    {
+      const int out = pass ? OH : OW, in = pass ? H : W;
+      int *meta = pass ? vmeta : hmeta, *length = pass ? vlength : hlength, *index = pass ? vindex : hindex;
+      float *kernel = pass ? vkernel : hkernel;
+      for(int k = 0; k < out; k++)
+      {
+        const int taps = 2 + k % (TAPS - 1);
+        const int center = (int)((k + 0.5f) * in / out);
+        meta[k * 3] = k;
+        meta[k * 3 + 1] = k * (TAPS + 1);
+        meta[k * 3 + 2] = k * (TAPS + 1);
+        length[k] = taps;
+        float norm = 0.0f;
+        for(int tap = 0; tap < taps; tap++)
+        {
+          const int i = center - taps / 2 + tap;
+          index[k * (TAPS + 1) + tap] = i < 0 ? 0 : i >= in ? in - 1 : i;
+          kernel[k * (TAPS + 1) + tap] = 0.5f + frand();
+          norm += kernel[k * (TAPS + 1) + tap];
+        }
+        for(int tap = 0; tap < taps; tap++) kernel[k * (TAPS + 1) + tap] /= norm;
+      }
+    }
+    // one work group per column and VTAPS work items per output pixel, as
+    // dt_interpolation_resample_cl() runs it
+    t[n] = (test_t){ .label = "interpolation_resample", .program = "basic", .kernel = "interpolation_resample",
+                     .tolerance = 1e-5, .gw = OW, .gh = OH,
+                     .clgw = OW, .clgh = OH * VTAPS, .cllx = 1, .clly = 4 * VTAPS };
+    const arg_t ra[] = {
+      IMG_IN("in", image_in), { .kind = ARG_IMAGE_OUT, .name = "out", .w = OW, .h = OH, .channels = 4 },
+      INT("width", OW), INT("height", OH), BUFFER("hmeta", hmeta, sizeof(hmeta)),
+      BUFFER("vmeta", vmeta, sizeof(vmeta)), BUFFER("hlength", hlength, sizeof(hlength)),
+      BUFFER("vlength", vlength, sizeof(vlength)), BUFFER("hindex", hindex, sizeof(hindex)),
+      BUFFER("vindex", vindex, sizeof(vindex)), BUFFER("hkernel", hkernel, sizeof(hkernel)),
+      BUFFER("vkernel", vkernel, sizeof(vkernel)), INT("htaps", TAPS), INT("vtaps", VTAPS),
+      LOCAL("lkernel", TAPS * sizeof(float)), LOCAL("lindex", TAPS * sizeof(int)),
+      LOCAL("buffer", 4 * VTAPS * 4 * sizeof(float)) };
+    t[n].nargs = sizeof(ra) / sizeof(ra[0]);
+    memcpy(t[n].args, ra, sizeof(ra));
+    n++;
+
+    TEST_GRID("interpolation_copy", "basic", "interpolation_copy", 0.0, OW, OH,
+              IMG_IN("dev_in", image_in), { .kind = ARG_IMAGE_OUT, .name = "dev_out", .w = OW, .h = OH, .channels = 4 },
+              INT("owidth", OW), INT("oheight", OH), INT("iwidth", W), INT("iheight", H),
+              INT("dx", W - OW / 2), INT("dy", 7));
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
@@ -671,9 +728,12 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
   }
 
   // a single row is a 1D kernel
-  const size_t ly = t->gh == 1 ? 1 : 16;
-  const size_t global[2] = { (t->gw + 15) / 16 * 16, (t->gh + ly - 1) / ly * ly };
-  const size_t local[2] = { 16, ly };
+  const size_t ly = t->clly ? t->clly : t->gh == 1 ? 1 : 16;
+  const size_t lx = t->cllx ? t->cllx : 16;
+  const size_t gw = t->clgw ? t->clgw : t->gw;
+  const size_t gh = t->clgh ? t->clgh : t->gh;
+  const size_t global[2] = { (gw + lx - 1) / lx * lx, (gh + ly - 1) / ly * ly };
+  const size_t local[2] = { lx, ly };
   CK(clEnqueueNDRangeKernel(e->queue, k, 2, NULL, global, local, 0, NULL, NULL));
   for(int a = 0; a < t->nargs; a++)
   {
