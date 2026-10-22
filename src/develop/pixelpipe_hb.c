@@ -2078,6 +2078,23 @@ static void _slang_release(dt_dev_pixelpipe_t *pipe)
    Images are float, with 4 channels or 1 for raw data.
    Returns 1 if the module ran, 0 if it has to run on the CPU (its input is
    then on the host), and -1 if the pipe has to stop. */
+// a 1-channel float image of uint16 raw data
+static dt_slang_gpu_image_t *_slang_upload_u16(const int width,
+                                               const int height,
+                                               const void *host)
+{
+  dt_slang_gpu_buffer_t *buf = dt_slang_gpu_buffer_new((size_t)width * height * sizeof(uint16_t), host);
+  dt_slang_gpu_image_t *img = buf ? dt_slang_gpu_image_new(width, height, 1, NULL) : NULL;
+  if(img && dt_slang_gpu_run_2d_args("basic", "u16_to_float", width, height,
+                                     SLBUF_DEV(buf), SLIMG_DEV(img), SLARG(width), SLARG(height)))
+  {
+    dt_slang_gpu_image_free(img);
+    img = NULL;
+  }
+  dt_slang_gpu_buffer_free(buf);
+  return img;
+}
+
 static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                                        dt_develop_t *dev,
                                        void *input,
@@ -2095,16 +2112,24 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   const gboolean resident = pipe->slang_image && pipe->slang_host == input;
   const int ch_in = input_format->channels;
   const int ch_out = out_format->channels;
+  // raw uint16 data is converted to float on the device. It is uploaded as
+  // pairs of values, so an odd pixel count would read past the host buffer.
+  const gboolean raw_u16 = input_format->datatype == TYPE_UINT16
+    && ch_in == 1
+    && dt_iop_buffer_dsc_to_bpp(input_format) == sizeof(uint16_t)
+    && ((size_t)roi_in->width * roi_in->height) % 2 == 0
+    && !resident;
   const gboolean possible =
     module->process_slang
     && piece->process_cl_ready
     && dt_slang_gpu_enabled()
     && *output != input
-    && input_format->datatype == TYPE_FLOAT
+    && ((input_format->datatype == TYPE_FLOAT
+         && (ch_in == 1 || ch_in == 4)
+         && dt_iop_buffer_dsc_to_bpp(input_format) == ch_in * sizeof(float))
+        || raw_u16)
     && out_format->datatype == TYPE_FLOAT
-    && (ch_in == 1 || ch_in == 4)
     && (ch_out == 1 || ch_out == 4)
-    && dt_iop_buffer_dsc_to_bpp(input_format) == ch_in * sizeof(float)
     && dt_iop_buffer_dsc_to_bpp(out_format) == ch_out * sizeof(float)
     && !_transform_for_blend(module, piece)
     && !_piece_wants_blending(piece)
@@ -2129,6 +2154,12 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                              && (piece->request_histogram & DT_REQUEST_ON);
   const dt_iop_order_iccprofile_info_t *const work_profile =
     input_format->cst != IOP_CS_RAW ? dt_ioppr_get_pipe_work_profile_info(pipe) : NULL;
+  if(raw_u16 && convert)
+  {
+    if(resident && !_slang_sync_host(pipe)) return -1;
+    _slang_release(pipe);
+    return 0;
+  }
   if(resident && (important_input || histogram) && !_slang_sync_host(pipe)) return -1;
 
   // a colorspace conversion of the input runs on the device if it can, and
@@ -2174,7 +2205,9 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   // a wrapped input may share host_in's memory until it is freed below, so
   // converted is only freed after that
   const gboolean on_device = resident && !convert;
-  if(!converted_on_device)
+  if(raw_u16)
+    dev_in = _slang_upload_u16(roi_in->width, roi_in->height, input);
+  else if(!converted_on_device)
     dev_in = on_device
       ? pipe->slang_image
       : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, ch_in, host_in);
