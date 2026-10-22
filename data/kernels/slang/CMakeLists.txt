@@ -23,21 +23,11 @@ set(DT_SLANG_FLAGS -I ${CMAKE_CURRENT_SOURCE_DIR} -fvk-use-entrypoint-name -warn
 
 # keep unused parameters, so that src/common/slang_gpu can bind arguments by
 # position, as OpenCL does. Only for SPIR-V: slangc 2026.12 crashes on
-# colorspaces.slang with -target metal -preserve-params.
+# colorspaces.slang with -target metal -preserve-params, and 2026.20 on every
+# kernel. The Metal backend relies on the kernels using all their parameters.
 set(DT_SLANG_SPIRV_FLAGS -preserve-params)
 
-# slangc hands .metallib builds to Apple's metal compiler, which ships with
-# Xcode but not with the Command Line Tools
-set(DT_SLANG_METALLIB OFF)
-if(APPLE)
-  execute_process(COMMAND xcrun -sdk macosx -f metal
-                  RESULT_VARIABLE XCRUN_METAL_RESULT OUTPUT_QUIET ERROR_QUIET)
-  if(XCRUN_METAL_RESULT EQUAL 0)
-    set(DT_SLANG_METALLIB ON)
-  else()
-    message(STATUS "Metal compiler not found (needs Xcode), Slang kernels are translated to Metal source only")
-  endif()
-endif()
+# DT_SLANG_METALLIB comes from the probe for Apple's metal compiler in the top CMakeLists.txt
 
 set(DT_SLANG_OUTPUTS "")
 set(DT_SLANG_INSTALL "")

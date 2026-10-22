@@ -856,7 +856,7 @@ if(USE_OPENCL)
   add_definitions("-DHAVE_OPENCL")
 endif(USE_OPENCL)
 
-# runs the Slang kernels from data/kernels/slang through Vulkan
+# runs the Slang kernels from data/kernels/slang through Vulkan, or Metal on macOS
 if(USE_SLANG AND NOT APPLE)
   find_package(Vulkan)
   if(Vulkan_FOUND)
@@ -865,6 +865,19 @@ if(USE_SLANG AND NOT APPLE)
     list(APPEND LIBS Vulkan::Vulkan)
   else()
     message(STATUS "Vulkan not found, the Slang kernels will not run")
+  endif()
+elseif(USE_SLANG AND APPLE)
+  # without .metallib files there is nothing to load
+  if(DT_SLANG_METALLIB)
+    # CMAKE_C_FLAGS, where the top CMakeLists.txt puts _DARWIN_C_SOURCE and the
+    # warning options, does not reach Objective-C
+    enable_language(OBJC)
+    add_definitions("-DHAVE_SLANG_GPU")
+    list(APPEND SOURCES "common/slang_gpu_metal.m")
+    set_source_files_properties(common/slang_gpu_metal.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-D_DARWIN_C_SOURCE;-Wall;-Wno-unknown-pragmas")
+    list(APPEND LIBS "-framework Metal" "-framework Foundation")
+  else()
+    message(STATUS "no Metal compiler, the Slang kernels will not run")
   endif()
 endif()
 
