@@ -2195,10 +2195,13 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                 cst_to != cst_out ? " -> " : "",
                 cst_to != cst_out ? dt_iop_colorspace_to_name(cst_out) : "");
 
+  // modules return FALSE for settings they have no kernels for, like
+  // demosaic in a thumbnail's downscaling pipe, which is expected. Kernels
+  // that fail are reported by the dispatcher.
   if(!dev_out || !module->process_slang(module, piece, dev_in, dev_out, roi_in, roi_out))
   {
-    dt_print_pipe(DT_DEBUG_OPENCL | DT_DEBUG_PIPE, "slang failure",
-                  pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "falling back to CPU");
+    dt_print_pipe(DT_DEBUG_PIPE, "slang fallback",
+                  pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "running on the CPU");
     // kernels the module started may still write to an output in the cacheline
     dt_slang_gpu_wait();
     dt_slang_gpu_image_free(dev_out);
