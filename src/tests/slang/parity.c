@@ -1,0 +1,885 @@
+/*
+    This file is part of darktable,
+    Copyright (C) 2026 darktable developers.
+
+    darktable is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    darktable is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with darktable.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+// Runs each ported kernel twice on the same input, once from its .cl source
+// through OpenCL and once from the Slang-built SPIR-V through Vulkan, and
+// compares the output images. It needs no GPU: Mesa's lavapipe and PoCL are
+// enough, which is how it runs in CI.
+//
+// usage: darktable-test-slang-parity <dir with .cl files> <dir with .spv files>
+
+#define CL_TARGET_OPENCL_VERSION 120
+#include <CL/cl.h>
+#include <vulkan/vulkan.h>
+
+#include <math.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define W 517
+#define H 263
+#define MAX_ARGS 24
+
+// -------------------------------------------------------------------------------------------------
+// test cases
+
+typedef enum arg_kind_t
+{
+  ARG_IMAGE_IN,
+  ARG_IMAGE_OUT,
+  ARG_INT,
+  ARG_FLOAT,
+  ARG_FLOAT4,
+  ARG_BUFFER,
+} arg_kind_t;
+
+typedef struct arg_t
+{
+  arg_kind_t kind;
+  const char *name;   // parameter name in the Slang entry point
+  int w, h, channels; // images
+  const float *pixels;
+  int i;
+  float f;
+  float v[4];
+  const void *data; // buffers
+  size_t size;
+} arg_t;
+
+typedef struct test_t
+{
+  const char *label;
+  const char *program; // .cl file, also the .spv file name
+  const char *kernel;
+  double tolerance; // 0 for the default
+  int nargs;
+  arg_t args[MAX_ARGS];
+} test_t;
+
+// must match dt_colorspaces_iccprofile_info_cl_t in src/common/iop_profile.h
+typedef struct profile_info_t
+{
+  float matrix_in[9];
+  float matrix_out[9];
+  int lutsize;
+  float unbounded_coeffs_in[3][3];
+  float unbounded_coeffs_out[3][3];
+  int nonlinearlut;
+  float grey;
+  int hdr_transfer;
+} profile_info_t;
+
+static float *image_in, *image_lab, *lut_curve, *lut_profile;
+static profile_info_t profile_linear, profile_nonlinear, profile_pq;
+
+static float frand(void)
+{
+  return (float)rand() / (float)RAND_MAX;
+}
+
+static void make_inputs(void)
+{
+  srand(42);
+  image_in = malloc(sizeof(float) * 4 * W * H);
+  image_lab = malloc(sizeof(float) * 4 * W * H);
+  for(size_t k = 0; k < (size_t)4 * W * H; k++) image_in[k] = frand() * 1.2f - 0.05f; // a few negatives, a few > 1
+  for(size_t k = 0; k < (size_t)W * H; k++)
+  {
+    image_lab[4 * k + 0] = frand() * 100.0f;
+    image_lab[4 * k + 1] = frand() * 160.0f - 80.0f;
+    image_lab[4 * k + 2] = frand() * 160.0f - 80.0f;
+    image_lab[4 * k + 3] = frand();
+  }
+
+  // 256x256 tone curve, like the tables rgbcurve and rgblevels upload
+  lut_curve = malloc(sizeof(float) * 256 * 256);
+  for(int k = 0; k < 256 * 256; k++) lut_curve[k] = powf(k / 65535.0f, 0.6f);
+
+  // 256x(256*6) profile LUT: three input and three output curves
+  lut_profile = malloc(sizeof(float) * 256 * 256 * 6);
+  for(int n = 0; n < 6; n++)
+    for(int k = 0; k < 256 * 256; k++)
+      lut_profile[n * 65536 + k] = n < 3 ? powf(k / 65535.0f, 2.2f) : powf(k / 65535.0f, 1.0f / 2.2f);
+
+  const float m_in[9] = { 0.4361f, 0.3851f, 0.1431f, 0.2225f, 0.7169f, 0.0606f, 0.0139f, 0.0971f, 0.7141f };
+  const float m_out[9] = { 3.1339f, -1.6169f, -0.4906f, -0.9788f, 1.9161f, 0.0335f, 0.0719f, -0.2290f, 1.4052f };
+  profile_info_t *all[3] = { &profile_linear, &profile_nonlinear, &profile_pq };
+  for(int p = 0; p < 3; p++)
+  {
+    memset(all[p], 0, sizeof(profile_info_t));
+    memcpy(all[p]->matrix_in, m_in, sizeof(m_in));
+    memcpy(all[p]->matrix_out, m_out, sizeof(m_out));
+    all[p]->lutsize = 65536;
+    all[p]->grey = 0.1842f;
+    for(int c = 0; c < 3; c++)
+    {
+      // extrapolation above 1: a * (x * b)^g, as fitted by dt_iop_estimate_exp()
+      all[p]->unbounded_coeffs_in[c][0] = 1.0f;
+      all[p]->unbounded_coeffs_in[c][1] = 1.0f;
+      all[p]->unbounded_coeffs_in[c][2] = 2.2f;
+      all[p]->unbounded_coeffs_out[c][0] = 1.0f;
+      all[p]->unbounded_coeffs_out[c][1] = 1.0f;
+      all[p]->unbounded_coeffs_out[c][2] = 1.0f / 2.2f;
+    }
+  }
+  profile_nonlinear.nonlinearlut = 1;
+  profile_pq.nonlinearlut = 1;
+  profile_pq.hdr_transfer = 1; // DT_HDR_PQ
+}
+
+#define IMG_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = 4, .pixels = px }
+#define LUT(n, px, lw, lh) { .kind = ARG_IMAGE_IN, .name = n, .w = lw, .h = lh, .channels = 1, .pixels = px }
+#define IMG_OUT(n) { .kind = ARG_IMAGE_OUT, .name = n, .w = W, .h = H, .channels = 4 }
+#define INT(n, val) { .kind = ARG_INT, .name = n, .i = val }
+#define FLOAT(n, val) { .kind = ARG_FLOAT, .name = n, .f = val }
+#define FLOAT4(n, a, b, c, d) { .kind = ARG_FLOAT4, .name = n, .v = { a, b, c, d } }
+#define BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz }
+
+static const float levels[9] = { 0.05f, 0.45f, 0.9f, 0.0f, 0.5f, 1.0f, 0.1f, 0.4f, 0.95f };
+static const float inv_gamma[3] = { 1.1f, 0.9f, 1.3f };
+static const float coeffs_linear[3] = { 1.0f, 1.0f, 0.6f };
+static const float coeffs_off[3] = { -1.0f, 0.0f, 0.0f };
+static const float matrix3x3[9] = { 0.9f, 0.05f, 0.05f, 0.1f, 0.8f, 0.1f, 0.0f, 0.2f, 0.8f };
+
+static int make_tests(test_t *t)
+{
+  int n = 0;
+#define TEST_TOL(lbl, prog, kern, tol, ...)                                               \
+  {                                                                                      \
+    const arg_t a[] = { __VA_ARGS__ };                                                   \
+    t[n] = (test_t){ .label = lbl, .program = prog, .kernel = kern, .tolerance = tol,    \
+                     .nargs = sizeof(a) / sizeof(a[0]) };                                \
+    memcpy(t[n].args, a, sizeof(a));                                                     \
+    n++;                                                                                 \
+  }
+#define TEST(lbl, prog, kern, ...) TEST_TOL(lbl, prog, kern, 0.0, __VA_ARGS__)
+
+  TEST("negadoctor", "negadoctor", "negadoctor",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+       FLOAT4("Dmin", 1.13f, 0.49f, 0.27f, 1.0f), FLOAT4("wb_high", 1.6f, 1.7f, 1.8f, 1.0f),
+       FLOAT4("offset", -0.05f, -0.02f, -0.01f, 0.0f), FLOAT("exposure", -0.9f), FLOAT("black", 0.0755f),
+       FLOAT("gamma", 4.0f), FLOAT("soft_clip", 0.75f), FLOAT("soft_clip_comp", 0.25f));
+
+  for(int mode = 0; mode < 3; mode++)
+  {
+    // independent channels; preserve colors by luminance (work profile); by power norm
+    const int autoscale = mode == 0 ? 1 : 0;
+    const int preserve = mode == 0 ? 0 : mode == 1 ? 1 : 6;
+    static const char *labels[3] = { "rgblevels independent", "rgblevels luminance", "rgblevels power" };
+    // with preserved colors the curve is looked up, without interpolation, at
+    // a computed norm: float noise can move that to the next of the 65536 LUT
+    // entries, which changes the output by up to about 2e-4
+    TEST_TOL(labels[mode], "rgblevels", "rgblevels", mode == 0 ? 0.0 : 1e-3,
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         INT("autoscale", autoscale), INT("preserve_colors", preserve),
+         LUT("lutr", lut_curve, 256, 256), LUT("lutg", lut_curve, 256, 256), LUT("lutb", lut_curve, 256, 256),
+         BUFFER("levels", levels, sizeof(levels)), BUFFER("inv_gamma", inv_gamma, sizeof(inv_gamma)),
+         BUFFER("profile_info", &profile_nonlinear, sizeof(profile_info_t)),
+         LUT("lut", lut_profile, 256, 256 * 6), INT("use_work_profile", 1));
+  }
+
+  for(int mode = 0; mode < 3; mode++)
+  {
+    // manual RGB; automatic without norm; automatic with luminance norm and camera profile
+    const int autoscale = mode == 0 ? 1 : 0;
+    const int preserve = mode == 2 ? 1 : 0;
+    static const char *labels[3] = { "rgbcurve manual", "rgbcurve automatic", "rgbcurve luminance" };
+    // same LUT step as for rgblevels above
+    TEST_TOL(labels[mode], "rgbcurve", "rgbcurve", mode == 2 ? 1e-3 : 0.0,
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         LUT("table_r", lut_curve, 256, 256), LUT("table_g", lut_curve, 256, 256),
+         LUT("table_b", lut_curve, 256, 256),
+         BUFFER("coeffs_r", coeffs_linear, sizeof(coeffs_linear)), BUFFER("coeffs_g", coeffs_off, sizeof(coeffs_off)),
+         BUFFER("coeffs_b", coeffs_linear, sizeof(coeffs_linear)),
+         INT("autoscale", autoscale), INT("preserve_colors", preserve),
+         BUFFER("profile_info", &profile_linear, sizeof(profile_info_t)),
+         LUT("lut", lut_profile, 256, 256 * 6), INT("use_work_profile", 0));
+  }
+
+  const profile_info_t *profiles[3] = { &profile_linear, &profile_nonlinear, &profile_pq };
+  static const char *suffix[3] = { "linear", "lut", "pq" };
+  static char labels[3][4][96];
+  for(int p = 0; p < 3; p++)
+  {
+    snprintf(labels[p][0], sizeof(labels[p][0]), "colorspaces lab_to_rgb_matrix %s", suffix[p]);
+    // Lab to linear RGB cancels large terms for saturated colors, and the
+    // output LUT is steep near zero: OpenCL and Vulkan both land about 1e-4
+    // from a double precision reference there, on opposite sides
+    TEST_TOL(labels[p][0], "colorspaces", "colorspaces_transform_lab_to_rgb_matrix", 5e-4,
+         IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+         BUFFER("profile_info", profiles[p], sizeof(profile_info_t)), LUT("lut", lut_profile, 256, 256 * 6));
+    snprintf(labels[p][1], sizeof(labels[p][1]), "colorspaces rgb_matrix_to_lab %s", suffix[p]);
+    // a and b are 500 and 200 times a difference of cube roots. For PQ input
+    // L reaches 300, where Vulkan's pow() leaves a off by 0.01 (OpenCL 0.003)
+    // against a double precision reference, a dE of about 0.03
+    TEST_TOL(labels[p][1], "colorspaces", "colorspaces_transform_rgb_matrix_to_lab", 0.05,
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         BUFFER("profile_info", profiles[p], sizeof(profile_info_t)), LUT("lut", lut_profile, 256, 256 * 6));
+    snprintf(labels[p][2], sizeof(labels[p][2]), "colorspaces rgb_matrix_to_rgb %s", suffix[p]);
+    TEST(labels[p][2], "colorspaces", "colorspaces_transform_rgb_matrix_to_rgb",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         BUFFER("profile_info_from", profiles[p], sizeof(profile_info_t)),
+         LUT("lut_from", lut_profile, 256, 256 * 6),
+         BUFFER("profile_info_to", profiles[p], sizeof(profile_info_t)),
+         LUT("lut_to", lut_profile, 256, 256 * 6), BUFFER("matrix", matrix3x3, sizeof(matrix3x3)));
+  }
+
+  TEST("colorspaces gamma", "colorspaces", "colorspaces_transform_gamma",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), FLOAT("gamma", 0.45f));
+
+#undef TEST
+#undef TEST_TOL
+  return n;
+}
+
+// -------------------------------------------------------------------------------------------------
+// helpers
+
+static void die(const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  fputc('\n', stderr);
+  exit(2);
+}
+
+#define CK(x)                                                                                        \
+  do                                                                                                 \
+  {                                                                                                  \
+    const int _e = (int)(x);                                                                         \
+    if(_e) die("%s:%d: %s returned %d", __FILE__, __LINE__, #x, _e);                                 \
+  } while(0)
+
+static char *slurp(const char *path, size_t *len)
+{
+  FILE *f = fopen(path, "rb");
+  if(!f) die("cannot open %s", path);
+  fseek(f, 0, SEEK_END);
+  *len = ftell(f);
+  rewind(f);
+  char *buf = malloc(*len + 1);
+  if(fread(buf, 1, *len, f) != *len) die("cannot read %s", path);
+  buf[*len] = 0;
+  fclose(f);
+  return buf;
+}
+
+// -------------------------------------------------------------------------------------------------
+// OpenCL
+
+typedef struct cl_env_t
+{
+  cl_context ctx;
+  cl_command_queue queue;
+  cl_device_id dev;
+} cl_env_t;
+
+static void cl_init(cl_env_t *e)
+{
+  cl_platform_id platform;
+  cl_int err;
+  CK(clGetPlatformIDs(1, &platform, NULL));
+  CK(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &e->dev, NULL));
+  e->ctx = clCreateContext(NULL, 1, &e->dev, NULL, NULL, &err);
+  CK(err);
+  e->queue = clCreateCommandQueue(e->ctx, e->dev, 0, &err);
+  CK(err);
+}
+
+static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, float *out)
+{
+  char path[1024], opts[1100];
+  snprintf(path, sizeof(path), "%s/%s.cl", cl_dir, t->program);
+  // the same include path darktable passes, plus hdr-transfer.h which lives in src/common
+  snprintf(opts, sizeof(opts), "-I%s -I%s/../../src/common", cl_dir, cl_dir);
+
+  size_t len;
+  const char *src = slurp(path, &len);
+  cl_int err;
+  cl_program prog = clCreateProgramWithSource(e->ctx, 1, &src, &len, &err);
+  CK(err);
+  if(clBuildProgram(prog, 1, &e->dev, opts, NULL, NULL) != CL_SUCCESS)
+  {
+    static char log[1 << 16];
+    clGetProgramBuildInfo(prog, e->dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+    die("building %s failed:\n%s", path, log);
+  }
+  cl_kernel k = clCreateKernel(prog, t->kernel, &err);
+  CK(err);
+
+  cl_mem mem[MAX_ARGS] = { 0 };
+  cl_mem result = NULL;
+  for(int a = 0; a < t->nargs; a++)
+  {
+    const arg_t *arg = &t->args[a];
+    const cl_image_format fmt = { arg->channels == 1 ? CL_R : CL_RGBA, CL_FLOAT };
+    const cl_image_desc desc = { .image_type = CL_MEM_OBJECT_IMAGE2D, .image_width = arg->w, .image_height = arg->h };
+    switch(arg->kind)
+    {
+      case ARG_IMAGE_IN:
+        mem[a] = clCreateImage(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, &fmt, &desc, (void *)arg->pixels, &err);
+        CK(err);
+        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        break;
+      case ARG_IMAGE_OUT:
+        mem[a] = result = clCreateImage(e->ctx, CL_MEM_WRITE_ONLY, &fmt, &desc, NULL, &err);
+        CK(err);
+        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        break;
+      case ARG_BUFFER:
+        mem[a] = clCreateBuffer(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, arg->size, (void *)arg->data, &err);
+        CK(err);
+        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        break;
+      case ARG_INT:
+        CK(clSetKernelArg(k, a, sizeof(int), &arg->i));
+        break;
+      case ARG_FLOAT:
+        CK(clSetKernelArg(k, a, sizeof(float), &arg->f));
+        break;
+      case ARG_FLOAT4:
+        CK(clSetKernelArg(k, a, 4 * sizeof(float), arg->v));
+        break;
+    }
+  }
+
+  const size_t global[2] = { (W + 15) / 16 * 16, (H + 15) / 16 * 16 };
+  const size_t local[2] = { 16, 16 };
+  CK(clEnqueueNDRangeKernel(e->queue, k, 2, NULL, global, local, 0, NULL, NULL));
+  const size_t origin[3] = { 0, 0, 0 }, region[3] = { W, H, 1 };
+  CK(clEnqueueReadImage(e->queue, result, CL_TRUE, origin, region, 0, 0, out, 0, NULL, NULL));
+
+  for(int a = 0; a < t->nargs; a++)
+    if(mem[a]) clReleaseMemObject(mem[a]);
+  clReleaseKernel(k);
+  clReleaseProgram(prog);
+  free((void *)src);
+}
+
+// -------------------------------------------------------------------------------------------------
+// SPIR-V: find each parameter's binding and push constant offset by name, so that
+// the test cases only list parameters in OpenCL argument order
+
+typedef struct spv_param_t
+{
+  char name[128];
+  int binding;
+  int offset;
+} spv_param_t;
+
+typedef struct spv_info_t
+{
+  int nparams;
+  spv_param_t params[MAX_ARGS];
+} spv_info_t;
+
+static const char *spv_string(const uint32_t *w)
+{
+  return (const char *)w;
+}
+
+static void spv_reflect(const uint32_t *code, size_t words, const char *entry, spv_info_t *info)
+{
+  // pass 1: names, decorations, the entry point's interface and push constant type
+  enum { MAXID = 1 << 20 };
+  const char **names = calloc(MAXID, sizeof(char *));
+  int *binding = malloc(MAXID * sizeof(int));
+  int *ptr_pointee = calloc(MAXID, sizeof(int));
+  int *var_ptrtype = calloc(MAXID, sizeof(int));
+  int *var_storage = calloc(MAXID, sizeof(int));
+  memset(binding, -1, MAXID * sizeof(int));
+  const uint32_t *iface = NULL;
+  int niface = 0;
+  typedef struct { int type, member, offset; const char *name; } member_t;
+  member_t *members = calloc(4096, sizeof(member_t));
+  int nmembers = 0;
+
+  if(code[0] != 0x07230203) die("not a SPIR-V module");
+  if(code[3] >= MAXID) die("SPIR-V id bound too large");
+  for(size_t i = 5; i < words;)
+  {
+    const uint32_t op = code[i] & 0xffff, n = code[i] >> 16;
+    const uint32_t *w = code + i;
+    if(n == 0) die("broken SPIR-V");
+    switch(op)
+    {
+      case 5: // OpName
+        names[w[1]] = spv_string(w + 2);
+        break;
+      case 6: // OpMemberName
+        members[nmembers++] = (member_t){ .type = w[1], .member = w[2], .offset = -1, .name = spv_string(w + 3) };
+        break;
+      case 15: // OpEntryPoint
+        if(!strcmp(spv_string(w + 3), entry))
+        {
+          const size_t slen = strlen(spv_string(w + 3)) / 4 + 1;
+          iface = w + 3 + slen;
+          niface = n - 3 - slen;
+        }
+        break;
+      case 32: // OpTypePointer
+        ptr_pointee[w[1]] = w[3];
+        break;
+      case 59: // OpVariable
+        var_ptrtype[w[2]] = w[1];
+        var_storage[w[2]] = w[3];
+        break;
+      case 71: // OpDecorate
+        if(w[2] == 33) binding[w[1]] = w[3]; // Binding
+        break;
+      case 72: // OpMemberDecorate
+        if(w[3] == 35) // Offset
+        {
+          int found = 0;
+          for(int m = 0; m < nmembers; m++)
+            if(members[m].type == (int)w[1] && members[m].member == (int)w[2])
+            {
+              members[m].offset = w[4];
+              found = 1;
+            }
+          if(!found) members[nmembers++] = (member_t){ .type = w[1], .member = w[2], .offset = w[4], .name = "" };
+        }
+        break;
+    }
+    i += n;
+  }
+  if(!iface) die("entry point %s not found", entry);
+
+  info->nparams = 0;
+  for(int k = 0; k < niface; k++)
+  {
+    const uint32_t id = iface[k];
+    const char *nm = names[id];
+    if(!nm) continue;
+    if(var_storage[id] == 9) // PushConstant: the uniform scalars
+    {
+      const int st = ptr_pointee[var_ptrtype[id]];
+      for(int m = 0; m < nmembers; m++)
+        if(members[m].type == st && members[m].name[0])
+        {
+          spv_param_t *p = &info->params[info->nparams++];
+          snprintf(p->name, sizeof(p->name), "%s", members[m].name);
+          p->binding = -1;
+          p->offset = members[m].offset;
+        }
+    }
+    else if(binding[id] >= 0 && !strncmp(nm, "entryPointParams.", 17))
+    {
+      // "entryPointParams.<param>" or "entryPointParams.<param>.tex"
+      spv_param_t *p = &info->params[info->nparams++];
+      snprintf(p->name, sizeof(p->name), "%s", nm + 17);
+      char *dot = strchr(p->name, '.');
+      if(dot) *dot = 0;
+      p->binding = binding[id];
+      p->offset = -1;
+    }
+  }
+  // member offsets are only known after the whole module was read
+  for(int k = 0; k < info->nparams; k++)
+    if(info->params[k].binding < 0)
+      for(int m = 0; m < nmembers; m++)
+        if(!strcmp(members[m].name, info->params[k].name) && members[m].offset >= 0)
+          info->params[k].offset = members[m].offset;
+
+  free(names);
+  free(binding);
+  free(ptr_pointee);
+  free(var_ptrtype);
+  free(var_storage);
+  free(members);
+}
+
+static const spv_param_t *spv_find(const spv_info_t *info, const char *name)
+{
+  for(int k = 0; k < info->nparams; k++)
+    if(!strcmp(info->params[k].name, name)) return &info->params[k];
+  return NULL;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Vulkan
+
+typedef struct vk_env_t
+{
+  VkInstance instance;
+  VkPhysicalDevice pdev;
+  VkDevice dev;
+  VkQueue queue;
+  uint32_t family;
+  VkCommandPool pool;
+} vk_env_t;
+
+typedef struct vk_buffer_t
+{
+  VkBuffer buf;
+  VkDeviceMemory mem;
+  void *map;
+} vk_buffer_t;
+
+typedef struct vk_image_t
+{
+  VkImage img;
+  VkDeviceMemory mem;
+  VkImageView view;
+} vk_image_t;
+
+static void vk_init(vk_env_t *e)
+{
+  const VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2 };
+  const VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+  CK(vkCreateInstance(&ici, NULL, &e->instance));
+  uint32_t n = 1;
+  vkEnumeratePhysicalDevices(e->instance, &n, &e->pdev);
+  if(n == 0) die("no Vulkan device");
+
+  uint32_t nf = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(e->pdev, &nf, NULL);
+  VkQueueFamilyProperties *qf = calloc(nf, sizeof(*qf));
+  vkGetPhysicalDeviceQueueFamilyProperties(e->pdev, &nf, qf);
+  e->family = UINT32_MAX;
+  for(uint32_t f = 0; f < nf && e->family == UINT32_MAX; f++)
+    if(qf[f].queueFlags & VK_QUEUE_COMPUTE_BIT) e->family = f;
+  free(qf);
+  if(e->family == UINT32_MAX) die("no Vulkan compute queue");
+
+  const float prio = 1.0f;
+  const VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                        .queueFamilyIndex = e->family, .queueCount = 1, .pQueuePriorities = &prio };
+  // the kernels write images declared without a format
+  const VkPhysicalDeviceFeatures features = { .shaderStorageImageWriteWithoutFormat = VK_TRUE };
+  const VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1,
+                                   .pQueueCreateInfos = &qci, .pEnabledFeatures = &features };
+  CK(vkCreateDevice(e->pdev, &dci, NULL, &e->dev));
+  vkGetDeviceQueue(e->dev, e->family, 0, &e->queue);
+  const VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                         .queueFamilyIndex = e->family };
+  CK(vkCreateCommandPool(e->dev, &cpci, NULL, &e->pool));
+}
+
+static uint32_t vk_memtype(vk_env_t *e, uint32_t bits, VkMemoryPropertyFlags want)
+{
+  VkPhysicalDeviceMemoryProperties mp;
+  vkGetPhysicalDeviceMemoryProperties(e->pdev, &mp);
+  for(uint32_t i = 0; i < mp.memoryTypeCount; i++)
+    if((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+  die("no suitable Vulkan memory type");
+  return 0;
+}
+
+static vk_buffer_t vk_buffer(vk_env_t *e, VkDeviceSize size, VkBufferUsageFlags usage)
+{
+  vk_buffer_t b;
+  const VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage };
+  CK(vkCreateBuffer(e->dev, &bci, NULL, &b.buf));
+  VkMemoryRequirements req;
+  vkGetBufferMemoryRequirements(e->dev, b.buf, &req);
+  const VkMemoryAllocateInfo mai = {
+    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+    .memoryTypeIndex = vk_memtype(e, req.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
+  CK(vkAllocateMemory(e->dev, &mai, NULL, &b.mem));
+  CK(vkBindBufferMemory(e->dev, b.buf, b.mem, 0));
+  CK(vkMapMemory(e->dev, b.mem, 0, size, 0, &b.map));
+  return b;
+}
+
+static void vk_buffer_free(vk_env_t *e, vk_buffer_t *b)
+{
+  vkDestroyBuffer(e->dev, b->buf, NULL);
+  vkFreeMemory(e->dev, b->mem, NULL);
+}
+
+static vk_image_t vk_image(vk_env_t *e, int w, int h, VkFormat fmt, VkImageUsageFlags usage)
+{
+  vk_image_t im;
+  const VkImageCreateInfo ici = {
+    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
+    .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+    .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+  CK(vkCreateImage(e->dev, &ici, NULL, &im.img));
+  VkMemoryRequirements req;
+  vkGetImageMemoryRequirements(e->dev, im.img, &req);
+  const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+                                     .memoryTypeIndex = vk_memtype(e, req.memoryTypeBits, 0) };
+  CK(vkAllocateMemory(e->dev, &mai, NULL, &im.mem));
+  CK(vkBindImageMemory(e->dev, im.img, im.mem, 0));
+  const VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im.img,
+                                      .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+                                      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+  CK(vkCreateImageView(e->dev, &vci, NULL, &im.view));
+  return im;
+}
+
+static void vk_image_free(vk_env_t *e, vk_image_t *im)
+{
+  vkDestroyImageView(e->dev, im->view, NULL);
+  vkDestroyImage(e->dev, im->img, NULL);
+  vkFreeMemory(e->dev, im->mem, NULL);
+}
+
+static void vk_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to)
+{
+  const VkImageMemoryBarrier b = {
+    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, .oldLayout = from, .newLayout = to,
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = img,
+    .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+                       NULL, 1, &b);
+}
+
+static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, float *out)
+{
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/%s.spv", spv_dir, t->program);
+  size_t len;
+  uint32_t *code = (uint32_t *)slurp(path, &len);
+  spv_info_t info;
+  spv_reflect(code, len / 4, t->kernel, &info);
+
+  VkDescriptorSetLayoutBinding lb[MAX_ARGS];
+  VkWriteDescriptorSet wr[MAX_ARGS];
+  VkDescriptorImageInfo dii[MAX_ARGS];
+  VkDescriptorBufferInfo dbi[MAX_ARGS];
+  vk_image_t img[MAX_ARGS] = { 0 };
+  vk_buffer_t buf[MAX_ARGS] = { 0 };
+  vk_buffer_t stage[MAX_ARGS] = { 0 };
+  int nbind = 0, result = -1, have_img[MAX_ARGS] = { 0 }, have_buf[MAX_ARGS] = { 0 };
+  uint8_t push[128] = { 0 };
+  int push_size = 0;
+
+  for(int a = 0; a < t->nargs; a++)
+  {
+    const arg_t *arg = &t->args[a];
+    const spv_param_t *p = spv_find(&info, arg->name);
+    if(!p)
+    {
+      // a parameter the kernel never reads is dropped from the module
+      if(arg->kind == ARG_IMAGE_OUT) die("%s: output %s not in the SPIR-V", t->kernel, arg->name);
+      continue;
+    }
+    const VkFormat fmt = arg->channels == 1 ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+    switch(arg->kind)
+    {
+      case ARG_IMAGE_IN:
+      case ARG_IMAGE_OUT:
+      {
+        const int is_out = arg->kind == ARG_IMAGE_OUT;
+        img[a] = vk_image(e, arg->w, arg->h, fmt,
+                          is_out ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                                 : VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        have_img[a] = 1;
+        const size_t bytes = (size_t)arg->w * arg->h * arg->channels * sizeof(float);
+        stage[a] = vk_buffer(e, bytes, is_out ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        if(!is_out) memcpy(stage[a].map, arg->pixels, bytes);
+        else result = a;
+        const VkDescriptorType type = is_out ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        lb[nbind] = (VkDescriptorSetLayoutBinding){ p->binding, type, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+        dii[nbind] = (VkDescriptorImageInfo){ .imageView = img[a].view,
+                                              .imageLayout = is_out ? VK_IMAGE_LAYOUT_GENERAL
+                                                                    : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        wr[nbind] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = p->binding,
+                                            .descriptorCount = 1, .descriptorType = type, .pImageInfo = &dii[nbind] };
+        nbind++;
+        break;
+      }
+      case ARG_BUFFER:
+        buf[a] = vk_buffer(e, arg->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        have_buf[a] = 1;
+        memcpy(buf[a].map, arg->data, arg->size);
+        lb[nbind] = (VkDescriptorSetLayoutBinding){ p->binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                                    VK_SHADER_STAGE_COMPUTE_BIT, NULL };
+        dbi[nbind] = (VkDescriptorBufferInfo){ buf[a].buf, 0, arg->size };
+        wr[nbind] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = p->binding,
+                                            .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                            .pBufferInfo = &dbi[nbind] };
+        nbind++;
+        break;
+      case ARG_INT:
+      case ARG_FLOAT:
+      case ARG_FLOAT4:
+      {
+        const size_t sz = arg->kind == ARG_FLOAT4 ? 16 : 4;
+        const void *src = arg->kind == ARG_INT ? (const void *)&arg->i
+                        : arg->kind == ARG_FLOAT ? (const void *)&arg->f : (const void *)arg->v;
+        if(p->offset < 0 || p->offset + sz > sizeof(push)) die("%s: bad offset for %s", t->kernel, arg->name);
+        memcpy(push + p->offset, src, sz);
+        if(p->offset + (int)sz > push_size) push_size = p->offset + sz;
+        break;
+      }
+    }
+  }
+  if(result < 0) die("%s: no output image", t->kernel);
+  push_size = (push_size + 3) & ~3;
+
+  const VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                                  .bindingCount = nbind, .pBindings = lb };
+  VkDescriptorSetLayout dsl;
+  CK(vkCreateDescriptorSetLayout(e->dev, &dslci, NULL, &dsl));
+  const VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size };
+  const VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                            .setLayoutCount = 1, .pSetLayouts = &dsl,
+                                            .pushConstantRangeCount = push_size ? 1 : 0, .pPushConstantRanges = &pcr };
+  VkPipelineLayout layout;
+  CK(vkCreatePipelineLayout(e->dev, &plci, NULL, &layout));
+  const VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = len,
+                                          .pCode = code };
+  VkShaderModule sm;
+  CK(vkCreateShaderModule(e->dev, &smci, NULL, &sm));
+  const VkComputePipelineCreateInfo cpci = {
+    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+    .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+               .module = sm, .pName = t->kernel },
+    .layout = layout };
+  VkPipeline pipe;
+  CK(vkCreateComputePipelines(e->dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe));
+
+  const VkDescriptorPoolSize ps[3] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_ARGS },
+                                       { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_ARGS },
+                                       { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_ARGS } };
+  const VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
+                                            .poolSizeCount = 3, .pPoolSizes = ps };
+  VkDescriptorPool dp;
+  CK(vkCreateDescriptorPool(e->dev, &dpci, NULL, &dp));
+  const VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                             .descriptorPool = dp, .descriptorSetCount = 1, .pSetLayouts = &dsl };
+  VkDescriptorSet ds;
+  CK(vkAllocateDescriptorSets(e->dev, &dsai, &ds));
+  for(int b = 0; b < nbind; b++) wr[b].dstSet = ds;
+  vkUpdateDescriptorSets(e->dev, nbind, wr, 0, NULL);
+
+  const VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                             .commandPool = e->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                             .commandBufferCount = 1 };
+  VkCommandBuffer cb;
+  CK(vkAllocateCommandBuffers(e->dev, &cbai, &cb));
+  const VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+  CK(vkBeginCommandBuffer(cb, &cbbi));
+  for(int a = 0; a < t->nargs; a++)
+  {
+    if(!have_img[a]) continue;
+    const VkBufferImageCopy cpy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                    .imageExtent = { t->args[a].w, t->args[a].h, 1 } };
+    if(a == result)
+      vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    else
+    {
+      vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+      vkCmdCopyBufferToImage(cb, stage[a].buf, img[a].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cpy);
+      vk_barrier(cb, img[a].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+  }
+  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+  vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &ds, 0, NULL);
+  if(push_size) vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
+  vkCmdDispatch(cb, (W + 15) / 16, (H + 15) / 16, 1);
+  const VkBufferImageCopy cpy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                  .imageExtent = { W, H, 1 } };
+  vk_barrier(cb, img[result].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  vkCmdCopyImageToBuffer(cb, img[result].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stage[result].buf, 1, &cpy);
+  CK(vkEndCommandBuffer(cb));
+  const VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+  CK(vkQueueSubmit(e->queue, 1, &si, VK_NULL_HANDLE));
+  CK(vkQueueWaitIdle(e->queue));
+  memcpy(out, stage[result].map, sizeof(float) * 4 * W * H);
+
+  vkFreeCommandBuffers(e->dev, e->pool, 1, &cb);
+  vkDestroyDescriptorPool(e->dev, dp, NULL);
+  vkDestroyPipeline(e->dev, pipe, NULL);
+  vkDestroyShaderModule(e->dev, sm, NULL);
+  vkDestroyPipelineLayout(e->dev, layout, NULL);
+  vkDestroyDescriptorSetLayout(e->dev, dsl, NULL);
+  for(int a = 0; a < t->nargs; a++)
+  {
+    if(have_img[a])
+    {
+      vk_image_free(e, &img[a]);
+      vk_buffer_free(e, &stage[a]);
+    }
+    if(have_buf[a]) vk_buffer_free(e, &buf[a]);
+  }
+  free(code);
+}
+
+// -------------------------------------------------------------------------------------------------
+
+// relative error with an absolute floor, so values near zero do not dominate
+#define TOLERANCE 1e-4
+
+int main(int argc, char **argv)
+{
+  if(argc < 3) die("usage: %s <dir with .cl files> <dir with .spv files> [kernel]", argv[0]);
+  if(sizeof(profile_info_t) != 160) die("profile_info_t is %zu bytes, the kernels expect 160", sizeof(profile_info_t));
+
+  make_inputs();
+  static test_t tests[64];
+  const int ntests = make_tests(tests);
+
+  cl_env_t cl;
+  vk_env_t vk;
+  cl_init(&cl);
+  vk_init(&vk);
+
+  float *out_cl = malloc(sizeof(float) * 4 * W * H);
+  float *out_vk = malloc(sizeof(float) * 4 * W * H);
+  int failed = 0, ran = 0;
+  for(int k = 0; k < ntests; k++)
+  {
+    const test_t *t = &tests[k];
+    if(argc > 3 && strcmp(argv[3], t->program)) continue;
+    memset(out_cl, 0, sizeof(float) * 4 * W * H);
+    memset(out_vk, 0, sizeof(float) * 4 * W * H);
+    cl_run(&cl, argv[1], t, out_cl);
+    vk_run(&vk, argv[2], t, out_vk);
+
+    double max_err = 0.0, max_abs = 0.0;
+    size_t worst = 0, nan_mismatch = 0;
+    for(size_t i = 0; i < (size_t)4 * W * H; i++)
+    {
+      if(isnan(out_cl[i]) || isnan(out_vk[i]))
+      {
+        if(isnan(out_cl[i]) != isnan(out_vk[i])) nan_mismatch++;
+        continue;
+      }
+      const double d = fabs((double)out_cl[i] - (double)out_vk[i]);
+      const double err = d / fmax(1.0, fabs((double)out_cl[i]));
+      if(err > max_err)
+      {
+        max_err = err;
+        worst = i;
+      }
+      if(d > max_abs) max_abs = d;
+    }
+    const double tolerance = t->tolerance > 0.0 ? t->tolerance : TOLERANCE;
+    const int ok = max_err <= tolerance && nan_mismatch == 0;
+    printf("%-4s %-45s max error %.2e  max abs %.2e  nan mismatches %zu", ok ? "ok" : "FAIL", t->label, max_err,
+           max_abs, nan_mismatch);
+    if(!ok)
+      printf("  (pixel %zu channel %zu: opencl %g, vulkan %g)", worst / 4, worst % 4, out_cl[worst], out_vk[worst]);
+    printf("\n");
+    failed += !ok;
+    ran++;
+  }
+  printf("%d of %d kernel runs match\n", ran - failed, ran);
+  return failed ? 1 : 0;
+}
