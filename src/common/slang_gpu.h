@@ -93,6 +93,14 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_wrap(const int width,
                                               const int height,
                                               const int channels,
                                               const void *host);
+// an image in host's memory, which kernels then write directly, so reading
+// it into host only waits for them. host must stay valid until the next read
+// or dt_slang_gpu_wait(), and freeing the image does not wait. Returns NULL
+// where the device can't use host memory, which is always the case on Vulkan.
+dt_slang_gpu_image_t *dt_slang_gpu_image_alias(const int width,
+                                               const int height,
+                                               const int channels,
+                                               void *host);
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img);
 int dt_slang_gpu_image_width(const dt_slang_gpu_image_t *img);
 int dt_slang_gpu_image_height(const dt_slang_gpu_image_t *img);
@@ -100,6 +108,8 @@ int dt_slang_gpu_image_height(const dt_slang_gpu_image_t *img);
 // a read waits for the kernels writing the image to finish.
 int dt_slang_gpu_image_read(dt_slang_gpu_image_t *img, void *host);
 int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host);
+// waits for every kernel that has been started
+void dt_slang_gpu_wait(void);
 
 // a buffer of size bytes on the device, for the intermediate results of a
 // chain of kernels. It is filled from host if that is not NULL, and zeroed

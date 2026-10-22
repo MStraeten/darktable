@@ -2178,9 +2178,14 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     dev_in = on_device
       ? pipe->slang_image
       : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, ch_in, host_in);
-  dt_slang_gpu_image_t *dev_out = dev_in
-    ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL)
-    : NULL;
+  // on unified memory the output can be its cacheline, which makes syncing
+  // the cacheline free
+  dt_slang_gpu_image_t *dev_out = NULL;
+  if(dev_in)
+  {
+    dev_out = dt_slang_gpu_image_alias(roi_out->width, roi_out->height, ch_out, *output);
+    if(!dev_out) dev_out = dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL);
+  }
 
   const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
   dt_print_pipe(DT_DEBUG_PIPE,
@@ -2194,6 +2199,8 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   {
     dt_print_pipe(DT_DEBUG_OPENCL | DT_DEBUG_PIPE, "slang failure",
                   pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "falling back to CPU");
+    // kernels the module started may still write to an output in the cacheline
+    dt_slang_gpu_wait();
     dt_slang_gpu_image_free(dev_out);
     if(!on_device) dt_slang_gpu_image_free(dev_in);
     dt_free_align(converted);
@@ -3945,6 +3952,8 @@ static gboolean _dev_pixelpipe_process_rec_and_backcopy(dt_dev_pixelpipe_t *pipe
   if(!ret && pipe->slang_image && pipe->slang_host == *output && !_slang_sync_host(pipe))
     ret = TRUE;
   _slang_release(pipe);
+  // a pipe stopped early may leave kernels writing to cachelines
+  dt_slang_gpu_wait();
 #endif
   dt_pthread_mutex_unlock(&pipe->busy_mutex);
   return ret;

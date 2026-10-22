@@ -784,6 +784,19 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_wrap(const int width,
   return host ? dt_slang_gpu_image_new(width, height, channels, host) : NULL;
 }
 
+dt_slang_gpu_image_t *dt_slang_gpu_image_alias(const int width,
+                                               const int height,
+                                               const int channels,
+                                               void *host)
+{
+  return NULL;
+}
+
+// kernels run synchronously here
+void dt_slang_gpu_wait(void)
+{
+}
+
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img)
 {
   if(!img) return;

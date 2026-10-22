@@ -329,6 +329,7 @@ void dt_slang_gpu_prepare(void)
   int width, height, channels;
   size_t pitch;
   gboolean wrapped; // buffer is the caller's memory
+  gboolean aliased; // and the caller keeps it valid, see dt_slang_gpu_image_alias()
 }
 @end
 
@@ -661,10 +662,38 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_wrap(const int width,
              : dt_slang_gpu_image_new(width, height, channels, host);
 }
 
+dt_slang_gpu_image_t *dt_slang_gpu_image_alias(const int width,
+                                               const int height,
+                                               const int channels,
+                                               void *host)
+{
+  if(!dt_slang_gpu_enabled() || !host || !_image_fits(width, height, channels)) return NULL;
+  DtSlangImage *img;
+  g_mutex_lock(&_mtl_lock);
+  @autoreleasepool
+  {
+    img = _image_wrap(host, width, height, channels);
+  }
+  g_mutex_unlock(&_mtl_lock);
+  if(!img) return NULL;
+  img->aliased = TRUE;
+  return (__bridge_retained dt_slang_gpu_image_t *)img;
+}
+
+void dt_slang_gpu_wait(void)
+{
+  if(!dt_slang_gpu_enabled()) return;
+  g_mutex_lock(&_mtl_lock);
+  _finish();
+  g_mutex_unlock(&_mtl_lock);
+}
+
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *image)
 {
   if(!image) return;
   DtSlangImage *img = CFBridgingRelease(image);
+  // a pending command buffer keeps the buffer, and the caller the memory
+  if(img->aliased) return;
   g_mutex_lock(&_mtl_lock);
   // the caller may reuse the memory of a wrapped image as soon as we return,
   // and it belongs to the caller, so it never goes to the pool
@@ -710,7 +739,8 @@ int dt_slang_gpu_image_read(dt_slang_gpu_image_t *image, void *host)
     return 1;
   }
   const size_t row = sizeof(float) * img->channels * img->width;
-  _copy_rows(host, row, img->buffer.contents, img->pitch, row, img->height);
+  if(host != img->buffer.contents)
+    _copy_rows(host, row, img->buffer.contents, img->pitch, row, img->height);
   dt_print(DT_DEBUG_PERF, "[slang_gpu] reading %dx%d from the device took %.3f secs",
            img->width, img->height, dt_get_debug_wtime() - start);
   return 0;
