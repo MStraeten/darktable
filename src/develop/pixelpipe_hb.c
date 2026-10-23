@@ -2116,6 +2116,16 @@ static dt_slang_gpu_image_t *_slang_upload_u16(const int width,
   return img;
 }
 
+// a picker that reads the blend colorspace needs the CPU path's conversions
+static gboolean _slang_blend_picking(dt_dev_pixelpipe_t *pipe,
+                                     dt_iop_module_t *module,
+                                     dt_dev_pixelpipe_iop_t *piece)
+{
+  const dt_iop_colorspace_type_t cst_in = module->input_colorspace(module, pipe, piece);
+  const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
+  return _transform_for_blend(module, piece) && dt_develop_blend_colorspace(piece, cst_out) != cst_in;
+}
+
 static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                                        dt_develop_t *dev,
                                        void *input,
@@ -2153,7 +2163,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     && (ch_out == 1 || ch_out == 4)
     && dt_iop_buffer_dsc_to_bpp(out_format) == ch_out * sizeof(float)
     && _slang_blend_possible(module, piece, roi_in, roi_out, ch_in, ch_out)
-    && !_request_color_pick(pipe, dev, module)
+    && !(_request_color_pick(pipe, dev, module) && _slang_blend_picking(pipe, module, piece))
     && !(darktable.dump_pfm_pipe && _is_debug_pipe(pipe));
 
   if(!possible)
@@ -2172,6 +2182,9 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   const gboolean convert = input_format->cst != cst_to;
   const gboolean histogram = (dev->gui_attached || !(piece->request_histogram & DT_REQUEST_ONLY_IN_GUI))
                              && (piece->request_histogram & DT_REQUEST_ON);
+  // the color picker reads the input and output on the host, as the
+  // OpenCL path does after reading them back
+  const gboolean picking = _request_color_pick(pipe, dev, module);
   const dt_iop_order_iccprofile_info_t *const work_profile =
     input_format->cst != IOP_CS_RAW ? dt_ioppr_get_pipe_work_profile_info(pipe) : NULL;
   if(raw_u16 && convert)
@@ -2180,12 +2193,12 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     _slang_release(pipe);
     return 0;
   }
-  if(resident && (important_input || histogram) && !_slang_sync_host(pipe)) return -1;
+  if(resident && (important_input || histogram || picking) && !_slang_sync_host(pipe)) return -1;
 
   // a colorspace conversion of the input runs on the device if it can, and
   // the histogram is taken from the converted input
   dt_slang_gpu_image_t *dev_in = NULL;
-  if(convert && !histogram)
+  if(convert && !histogram && !picking)
   {
     dt_slang_gpu_image_t *src = resident
       ? pipe->slang_image
@@ -2279,14 +2292,36 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   // CPU fallback above needs it on the host
   if(!on_device) dt_slang_gpu_image_free(dev_in);
   _slang_release(pipe);
-  dt_free_align(converted);
 
   pipe->slang_image = dev_out;
   pipe->slang_host = *output;
   pipe->slang_host_valid = FALSE;
   // important cachelines are kept for the GUI, and the NaN check reads the output
-  if((important_out || (darktable.unmuted & DT_DEBUG_NAN)) && !_slang_sync_host(pipe))
+  if((important_out || picking || (darktable.unmuted & DT_DEBUG_NAN)) && !_slang_sync_host(pipe))
+  {
+    dt_free_align(converted);
     return -1;
+  }
+
+  if(picking)
+  {
+    dt_iop_buffer_dsc_t dsc_out = pipe->dsc;
+    dsc_out.cst = cst_out;
+    _pixelpipe_picker(module, piece, &piece->dsc_in, host_in, roi_in,
+                      module->picked_color,
+                      module->picked_color_min,
+                      module->picked_color_max,
+                      cst_to, PIXELPIPE_PICKER_INPUT);
+
+    _pixelpipe_picker(module, piece, &dsc_out, (float *)(*output), roi_out,
+                      module->picked_output_color,
+                      module->picked_output_color_min,
+                      module->picked_output_color_max,
+                      cst_out, PIXELPIPE_PICKER_OUTPUT);
+
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
+  }
+  dt_free_align(converted);
 
   *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
   *pixelpipe_flow &= ~(PIXELPIPE_FLOW_PROCESSED_ON_CPU | PIXELPIPE_FLOW_PROCESSED_WITH_TILING);
