@@ -1490,6 +1490,107 @@ static int make_tests(test_t *t)
                INT("pass_mode", d == 3));
   }
 
+  // denoise (profiled): the variance stabilizing transforms and their
+  // inverses, one step of non-local means and one wavelet scale
+  {
+    static const float dp_y0u0v0[9] = { 0.33f, 0.34f, 0.33f, 0.5f, 0.0f, -0.5f, 0.25f, -0.5f, 0.25f };
+    static const float dp_rgb[9] = { 1.0f, 1.2f, 0.6f, 1.0f, 0.0f, -0.7f, 1.0f, -1.1f, 0.6f };
+#define DP_VST FLOAT4("a", 0.012f, 0.011f, 0.013f, 1.0f), FLOAT4("p", 0.4f, 0.5f, 0.45f, 1.0f), \
+               FLOAT4("b", 0.0004f, 0.0003f, 0.0005f, 1.0f)
+    TEST("denoiseprofile_precondition", "denoiseprofile", "denoiseprofile_precondition",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         FLOAT4("a", 0.012f, 0.011f, 0.013f, 1.0f), FLOAT4("sigma2", 0.002f, 0.003f, 0.001f, 0.0f));
+    TEST("denoiseprofile_precondition_v2", "denoiseprofile", "denoiseprofile_precondition_v2",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), DP_VST,
+         FLOAT4("wb", 2.1f, 1.0f, 1.6f, 0.0f));
+    TEST("denoiseprofile_precondition_Y0U0V0", "denoiseprofile", "denoiseprofile_precondition_Y0U0V0",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), DP_VST,
+         BUFFER("toY0U0V0", dp_y0u0v0, sizeof(dp_y0u0v0)));
+
+    // non-local means on preconditioned data, which is around 2 sqrt(x / a)
+    static float dp_pre[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++) dp_pre[k] = (k % 4 == 3) ? 1.0f : 2.0f * sqrtf(fmaxf(image_in[k], 0.0f) / 0.012f);
+    static float dp_u4[W * H], dp_u4b[W * H];
+    for(int k = 0; k < W * H; k++)
+    {
+      dp_u4[k] = 4.0f * image_in[4 * k];
+      dp_u4b[k] = 30.0f * image_in[4 * k + 1] * image_in[4 * k + 2];
+    }
+    TEST("denoiseprofile_dist", "denoiseprofile", "denoiseprofile_dist",
+         IMG_IN("in", dp_pre), BUFFER_OUT("U4", NULL, sizeof(float) * W * H), INT("width", W), INT("height", H),
+         INT2("q", 3, -2));
+    enum { DP_P = 3, DP_BS = 16 };
+    TEST("denoiseprofile_horiz", "denoiseprofile", "denoiseprofile_horiz",
+         BUFFER("U4_in", dp_u4, sizeof(dp_u4)), BUFFER_OUT("U4_out", NULL, sizeof(float) * W * H),
+         INT("width", W), INT("height", H), INT2("q", 3, -2), INT("P", DP_P),
+         LOCAL("buffer", sizeof(float) * (DP_BS + 2 * DP_P)));
+    t[n - 1].clgw = (W + DP_BS - 1) / DP_BS * DP_BS;
+    t[n - 1].cllx = DP_BS;
+    t[n - 1].clly = 1;
+    TEST("denoiseprofile_vert", "denoiseprofile", "denoiseprofile_vert",
+         BUFFER("U4_in", dp_u4b, sizeof(dp_u4b)), BUFFER_OUT("U4_out", NULL, sizeof(float) * W * H),
+         INT("width", W), INT("height", H), INT2("q", 3, -2), INT("P", DP_P), FLOAT("norm", 0.04f),
+         LOCAL("buffer", sizeof(float) * (DP_BS + 2 * DP_P)), FLOAT("central_pixel_weight", 0.1f),
+         BUFFER("U4_single_pixel", dp_u4, sizeof(dp_u4)));
+    t[n - 1].clgh = (H + DP_BS - 1) / DP_BS * DP_BS;
+    t[n - 1].cllx = 1;
+    t[n - 1].clly = DP_BS;
+    // accumulated weights so far, then one more offset
+    static float dp_u2[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++) dp_u2[k] = (k % 4 == 3) ? 3.0f + image_in[k] : 3.0f * dp_pre[k];
+    static float dp_w[W * H];
+    for(int k = 0; k < W * H; k++) dp_w[k] = image_in[4 * k + 2];
+    TEST("denoiseprofile_accu", "denoiseprofile", "denoiseprofile_accu",
+         IMG_IN("in", dp_pre), BUFFER_OUT("U2", dp_u2, sizeof(dp_u2)), BUFFER("U4", dp_w, sizeof(dp_w)),
+         INT("width", W), INT("height", H), INT2("q", -2, 3));
+    TEST("denoiseprofile_finish", "denoiseprofile", "denoiseprofile_finish",
+         IMG_IN("in", image_in), BUFFER("U2", dp_u2, sizeof(dp_u2)), IMG_OUT("out"), INT("width", W),
+         INT("height", H), FLOAT4("a", 0.012f, 0.011f, 0.013f, 1.0f), FLOAT4("sigma2", 0.002f, 0.003f, 0.001f, 0.0f));
+    TEST("denoiseprofile_finish_v2", "denoiseprofile", "denoiseprofile_finish_v2",
+         IMG_IN("in", image_in), BUFFER("U2", dp_u2, sizeof(dp_u2)), IMG_OUT("out"), INT("width", W),
+         INT("height", H), DP_VST, FLOAT("bias", 0.3f), FLOAT4("wb", 2.1f, 1.0f, 1.6f, 0.0f));
+
+    TEST("denoiseprofile_backtransform", "denoiseprofile", "denoiseprofile_backtransform",
+         IMG_IN("in", dp_pre), IMG_OUT("out"), INT("width", W), INT("height", H),
+         FLOAT4("a", 0.012f, 0.011f, 0.013f, 1.0f), FLOAT4("sigma2", 0.002f, 0.003f, 0.001f, 0.0f));
+    TEST("denoiseprofile_backtransform_v2", "denoiseprofile", "denoiseprofile_backtransform_v2",
+         IMG_IN("in", dp_pre), IMG_OUT("out"), INT("width", W), INT("height", H), DP_VST,
+         FLOAT("bias", 0.3f), FLOAT4("wb", 2.1f, 1.0f, 1.6f, 0.0f));
+    TEST("denoiseprofile_backtransform_Y0U0V0", "denoiseprofile", "denoiseprofile_backtransform_Y0U0V0",
+         IMG_IN("in", dp_pre), IMG_OUT("out"), INT("width", W), INT("height", H), DP_VST,
+         FLOAT("bias", 0.3f), FLOAT4("wb", 2.1f, 1.0f, 1.6f, 0.0f), BUFFER("toRGB", dp_rgb, sizeof(dp_rgb)));
+#undef DP_VST
+
+    // the 5x5 a-trous filter, on scales 0 and 2
+    static float dp_filter[25];
+    static const float dp_m[5] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f };
+    for(int j = 0; j < 5; j++)
+      for(int i = 0; i < 5; i++) dp_filter[5 * j + i] = dp_m[i] * dp_m[j];
+    for(int sc = 0; sc < 3; sc += 2)
+      TEST_TOL(sc ? "denoiseprofile_decompose scale 2" : "denoiseprofile_decompose", "denoiseprofile",
+               "denoiseprofile_decompose", 1e-4,
+               IMG_IN("in", dp_pre), IMG_OUT("coarse"), IMG_OUT("detail"), INT("width", W), INT("height", H),
+               INT("scale", sc), FLOAT("inv_sigma2", 1.0f / (0.25f * sc + 1.0f)),
+               BUFFER("filter", dp_filter, sizeof(dp_filter)));
+    static float dp_detail[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++) dp_detail[k] = 0.6f * (image_in[(k + 4 * 29) % (4 * W * H)] - 0.5f);
+    TEST("denoiseprofile_synthesize", "denoiseprofile", "denoiseprofile_synthesize",
+         IMG_IN("coarse", dp_pre), IMG_IN("detail", dp_detail), IMG_OUT("out"), INT("width", W), INT("height", H),
+         FLOAT4("threshold", 0.1f, 0.05f, 0.15f, 0.0f), FLOAT4("boost", 1.0f, 1.0f, 1.0f, 1.0f));
+
+    // block sums of the squared detail. The OpenCL kernel adds up each
+    // block as a tree, the Slang one in rows, so they differ in the last bits
+    enum { DP_NBX = (W + 15) / 16, DP_NBY = (H + 15) / 16 };
+    TEST_GRID("denoiseprofile_reduce_first", "denoiseprofile", "denoiseprofile_reduce_first", 1e-5,
+              DP_NBX, DP_NBY,
+              IMG_IN("in", dp_detail), INT("width", W), INT("height", H),
+              BUFFER_OUT("accu", NULL, sizeof(float) * 4 * DP_NBX * DP_NBY), LOCAL("buffer", sizeof(float) * 4 * 256));
+    t[n - 1].clgw = DP_NBX * 16;
+    t[n - 1].clgh = DP_NBY * 16;
+    t[n - 1].cllx = 16;
+    t[n - 1].clly = 16;
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
