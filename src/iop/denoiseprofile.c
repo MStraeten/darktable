@@ -2775,7 +2775,8 @@ static int process_wavelets_slang(dt_iop_module_t *self,
   // (n-1) below
   if(npixels < 2) return _copy_slang(dev_in, dev_out, width, height);
 
-  // denoiseprofile_reduce_first sums 16x16 blocks, which the host adds up
+  // denoiseprofile_reduce_first sums 16x16 blocks, which
+  // denoiseprofile_threshold adds up on the device
   const int nbx = (width + 15) / 16;
   const int nby = (height + 15) / 16;
   const size_t bufsize = (size_t)nbx * nby;
@@ -2783,9 +2784,10 @@ static int process_wavelets_slang(dt_iop_module_t *self,
   int err = 1;
   dt_slang_gpu_image_t *dev_detail[DT_IOP_DENOISE_PROFILE_BANDS] = { NULL };
   dt_slang_gpu_buffer_t *dev_m = dt_slang_gpu_buffer_new(sizeof(float) * 4 * bufsize, NULL);
+  dt_slang_gpu_buffer_t *dev_thrs
+    = dt_slang_gpu_buffer_new(sizeof(float) * 4 * DT_IOP_DENOISE_PROFILE_BANDS, NULL);
   dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
-  float *sumsum = dt_alloc_align_float((size_t)4 * bufsize);
-  if(!dev_m || !dev_tmp || !sumsum) goto error;
+  if(!dev_m || !dev_thrs || !dev_tmp) goto error;
 
   const float m[] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f }; // 1/16, 4/16, 6/16, 4/16, 1/16
   float mm[5][5];
@@ -2897,29 +2899,7 @@ static int process_wavelets_slang(dt_iop_module_t *self,
     const float varf = sqrtf(2.0f + 2.0f * 4.0f * 4.0f + 6.0f * 6.0f) / 16.0f; // about 0.5
     const float sigma_band = powf(varf, s) * sigma;
 
-    // determine thrs as bayesshrink
-    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_reduce_first", nbx, nby,
-                                   SLIMG_DEV(dev_detail[s]), SLARG(width), SLARG(height), SLBUF_DEV(dev_m));
-    if(!err) err = dt_slang_gpu_buffer_read(dev_m, sumsum, sizeof(float) * 4 * bufsize);
-    if(err) goto error;
-
-    // the OpenCL path adds up 64 partial sums in float; the many block sums
-    // here keep their precision in double
-    double sum[4] = { 0.0 };
-    for(size_t k = 0; k < bufsize; k++)
-      for_four_channels(c) sum[c] += sumsum[4 * k + c];
-    const dt_aligned_pixel_t sum_y2 = { sum[0], sum[1], sum[2], sum[3] };
-
     const float sb2 = sigma_band * sigma_band;
-    const dt_aligned_pixel_t var_y = { sum_y2[0] / (npixels - 1.0f),
-                                       sum_y2[1] / (npixels - 1.0f),
-                                       sum_y2[2] / (npixels - 1.0f),
-                                       0.0f };
-
-    const dt_aligned_pixel_t std_x = { sqrtf(MAX(1e-6f, var_y[0] - sb2)),
-                                       sqrtf(MAX(1e-6f, var_y[1] - sb2)),
-                                       sqrtf(MAX(1e-6f, var_y[2] - sb2)),
-                                       1.0f };
     // add 8.0 here because it seemed a little weak
     dt_aligned_pixel_t adjt = { 8.0f, 8.0f, 8.0f, 0.0f };
 
@@ -2962,15 +2942,19 @@ static int process_wavelets_slang(dt_iop_module_t *self,
       adjt[2] *= band_force_exp_2;
     }
 
-    const dt_aligned_pixel_t thrs = { adjt[0] * sb2 / std_x[0],
-                                      adjt[1] * sb2 / std_x[1],
-                                      adjt[2] * sb2 / std_x[2],
-                                      0.0f };
-
+    // determine thrs as bayesshrink, on the device: reading the sums back
+    // would make the host wait for every scale
+    const int nblocks = bufsize;
+    const float fpixels = npixels;
     const dt_aligned_pixel_t boost = { 1.0f, 1.0f, 1.0f, 1.0f };
-    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_synthesize", width, height,
-                                   SLIMG_DEV(dev_buf1), SLIMG_DEV(dev_detail[s]), SLIMG_DEV(dev_buf2),
-                                   SLARG(width), SLARG(height), SLARG(thrs), SLARG(boost));
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_reduce_first", nbx, nby,
+                                   SLIMG_DEV(dev_detail[s]), SLARG(width), SLARG(height), SLBUF_DEV(dev_m))
+      || dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_threshold", 16, 16,
+                                  SLBUF_DEV(dev_m), SLARG(nblocks), SLARG(fpixels), SLARG(sb2), SLARG(adjt),
+                                  SLBUF_DEV(dev_thrs), SLARG(s))
+      || dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_synthesize", width, height,
+                                  SLIMG_DEV(dev_buf1), SLIMG_DEV(dev_detail[s]), SLIMG_DEV(dev_buf2),
+                                  SLARG(width), SLARG(height), SLBUF_DEV(dev_thrs), SLARG(s), SLARG(boost));
     if(err) goto error;
 
     dt_slang_gpu_image_t *dev_buf3 = dev_buf2;
@@ -3008,10 +2992,10 @@ static int process_wavelets_slang(dt_iop_module_t *self,
 
 error:
   dt_slang_gpu_buffer_free(dev_m);
+  dt_slang_gpu_buffer_free(dev_thrs);
   dt_slang_gpu_image_free(dev_tmp);
   for(int k = 0; k < max_scale; k++)
     dt_slang_gpu_image_free(dev_detail[k]);
-  dt_free_align(sumsum);
   return err;
 }
 

@@ -56,6 +56,7 @@ typedef enum arg_kind_t
   ARG_BUFFER_OUT, // read and written by the kernel, and compared
   ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
   ARG_RAW_U16,    // uint16 raw data: an unsigned integer image in OpenCL, a buffer of value pairs in Slang
+  ARG_FLOAT4_BUF, // a float4 value in OpenCL, a buffer holding it in Slang
 } arg_kind_t;
 
 typedef struct arg_t
@@ -71,6 +72,7 @@ typedef struct arg_t
   const void *data; // buffers, and the initial contents of ARG_BUFFER_OUT (zeros if NULL)
   size_t size;
   int bytes;        // ARG_BUFFER_OUT holds bytes, compared exactly
+  int slang_only;   // a Slang parameter the OpenCL kernel does not have
 } arg_t;
 
 typedef struct test_t
@@ -208,6 +210,8 @@ static void make_inputs(void)
 #define STRUCT(n, ptr) { .kind = ARG_STRUCT, .name = n, .data = &(ptr), .size = sizeof(ptr) }
 #define FLOAT2(n, a, b) { .kind = ARG_FLOAT2, .name = n, .v = { a, b } }
 #define BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz }
+#define FLOAT4_BUF(n, a, b, c, d) { .kind = ARG_FLOAT4_BUF, .name = n, .v = { a, b, c, d } }
+#define SLANG_INT(n, val) { .kind = ARG_INT, .name = n, .i = val, .slang_only = 1 }
 #define RAW_U16(n, ptr, rw, rh) { .kind = ARG_RAW_U16, .name = n, .data = ptr, .w = rw, .h = rh, \
                                   .size = (size_t)(rw) * (rh) * sizeof(uint16_t) }
 
@@ -1654,7 +1658,8 @@ static int make_tests(test_t *t)
     for(int k = 0; k < 4 * W * H; k++) dp_detail[k] = 0.6f * (image_in[(k + 4 * 29) % (4 * W * H)] - 0.5f);
     TEST("denoiseprofile_synthesize", "denoiseprofile", "denoiseprofile_synthesize",
          IMG_IN("coarse", dp_pre), IMG_IN("detail", dp_detail), IMG_OUT("out"), INT("width", W), INT("height", H),
-         FLOAT4("threshold", 0.1f, 0.05f, 0.15f, 0.0f), FLOAT4("boost", 1.0f, 1.0f, 1.0f, 1.0f));
+         FLOAT4_BUF("threshold", 0.1f, 0.05f, 0.15f, 0.0f), SLANG_INT("band", 0),
+         FLOAT4("boost", 1.0f, 1.0f, 1.0f, 1.0f));
 
     // block sums of the squared detail. The OpenCL kernel adds up each
     // block as a tree, the Slang one in rows, so they differ in the last bits
@@ -1777,9 +1782,11 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
   CK(err);
 
   cl_mem mem[MAX_ARGS] = { 0 };
-  for(int a = 0; a < t->nargs; a++)
+  for(int a = 0, ca = 0; a < t->nargs; a++)
   {
     const arg_t *arg = &t->args[a];
+    if(arg->slang_only) continue;
+    const int a_cl = ca++;
     const cl_image_format fmt = { arg->channels == 1 ? CL_R : CL_RGBA, CL_FLOAT };
     const cl_image_desc desc = { .image_type = CL_MEM_OBJECT_IMAGE2D, .image_width = arg->w, .image_height = arg->h };
     switch(arg->kind)
@@ -1787,56 +1794,57 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
       case ARG_IMAGE_IN:
         mem[a] = clCreateImage(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, &fmt, &desc, (void *)arg->pixels, &err);
         CK(err);
-        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
         break;
       case ARG_IMAGE_OUT:
         mem[a] = clCreateImage(e->ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, &fmt, &desc,
                                (void *)initial_data(arg), &err);
         CK(err);
-        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
         break;
       case ARG_BUFFER_OUT:
         mem[a] = clCreateBuffer(e->ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, arg->size,
                                 (void *)initial_data(arg), &err);
         CK(err);
-        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
         break;
       case ARG_LOCAL:
-        CK(clSetKernelArg(k, a, arg->size, NULL));
+        CK(clSetKernelArg(k, a_cl, arg->size, NULL));
         break;
       case ARG_RAW_U16:
       {
         const cl_image_format ufmt = { CL_R, CL_UNSIGNED_INT16 };
         mem[a] = clCreateImage(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, &ufmt, &desc, (void *)arg->data, &err);
         CK(err);
-        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
         break;
       }
       case ARG_BUFFER:
         mem[a] = clCreateBuffer(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, arg->size, (void *)arg->data, &err);
         CK(err);
-        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
         break;
       case ARG_INT:
-        CK(clSetKernelArg(k, a, sizeof(int), &arg->i));
+        CK(clSetKernelArg(k, a_cl, sizeof(int), &arg->i));
         break;
       case ARG_FLOAT:
-        CK(clSetKernelArg(k, a, sizeof(float), &arg->f));
+        CK(clSetKernelArg(k, a_cl, sizeof(float), &arg->f));
         break;
       case ARG_FLOAT4:
-        CK(clSetKernelArg(k, a, 4 * sizeof(float), arg->v));
+      case ARG_FLOAT4_BUF:
+        CK(clSetKernelArg(k, a_cl, 4 * sizeof(float), arg->v));
         break;
       case ARG_INT2:
-        CK(clSetKernelArg(k, a, 2 * sizeof(int), arg->iv));
+        CK(clSetKernelArg(k, a_cl, 2 * sizeof(int), arg->iv));
         break;
       case ARG_INT4:
-        CK(clSetKernelArg(k, a, 4 * sizeof(int), arg->iv));
+        CK(clSetKernelArg(k, a_cl, 4 * sizeof(int), arg->iv));
         break;
       case ARG_STRUCT:
-        CK(clSetKernelArg(k, a, arg->size, arg->data));
+        CK(clSetKernelArg(k, a_cl, arg->size, arg->data));
         break;
       case ARG_FLOAT2:
-        CK(clSetKernelArg(k, a, 2 * sizeof(float), arg->v));
+        CK(clSetKernelArg(k, a_cl, 2 * sizeof(float), arg->v));
         break;
     }
   }
@@ -2204,17 +2212,23 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
       case ARG_BUFFER:
       case ARG_BUFFER_OUT:
       case ARG_RAW_U16:
-        buf[a] = vk_buffer(e, arg->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+      case ARG_FLOAT4_BUF:
+      {
+        const int is_value = arg->kind == ARG_FLOAT4_BUF;
+        const size_t size = is_value ? sizeof(arg->v) : arg->size;
+        buf[a] = vk_buffer(e, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         have_buf[a] = 1;
-        memcpy(buf[a].map, arg->kind == ARG_BUFFER_OUT ? initial_data(arg) : arg->data, arg->size);
+        memcpy(buf[a].map, is_value ? (const void *)arg->v
+                           : arg->kind == ARG_BUFFER_OUT ? initial_data(arg) : arg->data, size);
         lb[nbind] = (VkDescriptorSetLayoutBinding){ p->binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                                     VK_SHADER_STAGE_COMPUTE_BIT, NULL };
-        dbi[nbind] = (VkDescriptorBufferInfo){ buf[a].buf, 0, arg->size };
+        dbi[nbind] = (VkDescriptorBufferInfo){ buf[a].buf, 0, size };
         wr[nbind] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = p->binding,
                                             .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                             .pBufferInfo = &dbi[nbind] };
         nbind++;
         break;
+      }
       case ARG_INT:
       case ARG_FLOAT:
       case ARG_FLOAT4:

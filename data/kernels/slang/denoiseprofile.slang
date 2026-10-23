@@ -413,15 +413,18 @@ void denoiseprofile_decompose(uint3 gid : SV_DispatchThreadID,
 void denoiseprofile_synthesize(uint3 gid : SV_DispatchThreadID,
                                uniform ImageIn coarse, uniform ImageIn detail, uniform ImageOut out,
                                uniform int width, uniform int height,
-                               uniform float4 threshold, uniform float4 boost)
+                               uniform StructuredBuffer<float4> threshold, uniform int band,
+                               uniform float4 boost)
 {
   const int x = gid.x;
   const int y = gid.y;
   if(x >= width || y >= height) return;
 
+  // the threshold comes from denoiseprofile_threshold() on the device, so
+  // that the host does not wait for each scale's sums
   const float4 c = coarse.readpixel(x, y);
   const float4 d = detail.readpixel(x, y);
-  const float4 amount = copysign(max(float4(0.0f), abs(d) - threshold), d);
+  const float4 amount = copysign(max(float4(0.0f), abs(d) - threshold[band]), d);
   float4 sum = c + boost * amount;
   sum.w = c.w;
   out.write(int2(x, y), sum);
@@ -457,4 +460,38 @@ void denoiseprofile_reduce_first(uint3 gid : SV_DispatchThreadID,
     }
   }
   accu[by * nbx + bx] = sum;
+}
+
+// adds up the block sums of denoiseprofile_reduce_first() and turns them
+// into the BayesShrink threshold of process_wavelets_cl(), in a single
+// 16x16 work group
+groupshared float4 threshold_sums[256];
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void denoiseprofile_threshold(uint3 lid : SV_GroupThreadID,
+                              uniform StructuredBuffer<float4> accu, uniform int nblocks,
+                              uniform float npixels, uniform float sb2, uniform float4 adjt,
+                              uniform RWStructuredBuffer<float4> threshold, uniform int band)
+{
+  const int l = lid.y * 16 + lid.x;
+  float4 sum = float4(0.0f);
+  for(int k = l; k < nblocks; k += 256) sum += accu[k];
+  threshold_sums[l] = sum;
+  GroupMemoryBarrierWithGroupSync();
+
+  for(int offset = 128; offset > 0; offset >>= 1)
+  {
+    if(l < offset) threshold_sums[l] += threshold_sums[l + offset];
+    GroupMemoryBarrierWithGroupSync();
+  }
+
+  if(l == 0)
+  {
+    const float4 var_y = threshold_sums[0] / (npixels - 1.0f);
+    const float4 std_x = sqrt(max(float4(1e-6f), var_y - sb2));
+    float4 thrs = adjt * sb2 / std_x;
+    thrs.w = 0.0f;
+    threshold[band] = thrs;
+  }
 }
