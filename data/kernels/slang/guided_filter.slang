@@ -50,8 +50,8 @@ void guided_filter_box_mean_x(uint3 gid : SV_DispatchThreadID,
                               uniform int width, uniform int height,
                               uniform ImageIn in, uniform ImageOut out, uniform int w)
 {
-  const int y = gid.x;
-  if(y >= height || gid.y != 0) return;
+  const int y = gid.y * 16 + gid.x;
+  if(y >= height) return;
 
   float m = 0.f, n_box = 0.f, c = 0.f;
   if(width > 2 * w)
@@ -110,8 +110,8 @@ void guided_filter_box_mean_y(uint3 gid : SV_DispatchThreadID,
                               uniform int width, uniform int height,
                               uniform ImageIn in, uniform ImageOut out, uniform int w)
 {
-  const int x = gid.x;
-  if(x >= width || gid.y != 0) return;
+  const int x = gid.y * 16 + gid.x;
+  if(x >= width) return;
 
   float m = 0.f, n_box = 0.f, c = 0.f;
   if(height > 2 * w)

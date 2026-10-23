@@ -146,6 +146,13 @@ G_BEGIN_DECLS
                       (dt_slang_arg_t[]){ __VA_ARGS__ })
 #endif
 
+// a kernel that walks whole rows or columns needs only one work item per
+// line. The kernels are written for 16x16 work groups, so the n items are
+// laid out 16 wide and the kernel takes its index as gid.y * 16 + gid.x;
+// a plain n x 1 dispatch would leave 15 of every 16 threads idle
+#define dt_slang_gpu_run_1d_args(program, kernel, n, ...)                                \
+  dt_slang_gpu_run_2d_args((program), (kernel), 16, ((n) + 15) / 16, __VA_ARGS__)
+
 #else
 
 static inline gboolean dt_slang_gpu_enabled(void) { return FALSE; }

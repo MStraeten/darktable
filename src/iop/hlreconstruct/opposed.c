@@ -911,7 +911,7 @@ static gboolean process_opposed_slang(dt_iop_module_t *self,
       && !dt_slang_gpu_run_2d_args("basic", "highlights_dilatemask", mwidth, mheight,
                                    SLBUF_DEV(inmask), SLBUF_DEV(outmask),
                                    SLARG(msize), SLARG(mwidth), SLARG(mheight))
-      && !dt_slang_gpu_run_2d_args("basic", "highlights_chroma", iheight, 1,
+      && !dt_slang_gpu_run_1d_args("basic", "highlights_chroma", iheight,
                                    SLIMG_DEV(dev_in), SLBUF_DEV(outmask), SLBUF_DEV(accu),
                                    SLARG(iwidth), SLARG(iheight), SLARG(msize), SLARG(mwidth),
                                    SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)),

@@ -225,6 +225,15 @@ static int make_tests(test_t *t)
     memcpy(t[n].args, a, sizeof(a));                                                     \
     n++;                                                                                 \
   }
+// a line kernel runs one work item per row or column, laid out 16 wide on
+// the Slang side (see dt_slang_gpu_run_1d_args) and as len x 1 in OpenCL
+#define TEST_LINE(lbl, prog, kern, tol, len, ...)                                         \
+  {                                                                                      \
+    TEST_GRID(lbl, prog, kern, tol, 16, ((len) + 15) / 16, __VA_ARGS__);                 \
+    t[n - 1].clgw = (len);                                                               \
+    t[n - 1].clgh = 1;                                                                   \
+    t[n - 1].clly = 1;                                                                   \
+  }
 #define TEST_TOL(lbl, prog, kern, tol, ...) TEST_GRID(lbl, prog, kern, tol, W, H, __VA_ARGS__)
 #define TEST(lbl, prog, kern, ...) TEST_TOL(lbl, prog, kern, 0.0, __VA_ARGS__)
 
@@ -447,7 +456,7 @@ static int make_tests(test_t *t)
          RAW_IN("in", image_raw), BYTES_OUT("inmask", 3 * msize), INT("msize", msize), INT("mwidth", mwidth),
          INT("mheight", mheight), INT("iwidth", W), INT("iheight", H), INT("filters", bayer[b]),
          BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)));
-    TEST_GRID(bayer_labels[b][3], "basic", "highlights_chroma", 0.0, H, 1,
+    TEST_LINE(bayer_labels[b][3], "basic", "highlights_chroma", 0.0, H,
          RAW_IN("in", image_raw), BUFFER("mask", mask_bytes, 3 * msize + 64),
          BUFFER_OUT("accu", NULL, sizeof(float) * 8 * H), INT("width", W), INT("height", H),
          INT("msize", msize), INT("mwidth", mwidth), INT("filters", bayer[b]),
@@ -953,7 +962,7 @@ static int make_tests(test_t *t)
     const float k = (1.0f - ema) * (1.0f - ema) / (1.0f + (2.0f * alpha * ema) - ema2);
     const float a0 = k, a1 = k * (alpha - 1.0f) * ema, a2 = k * (alpha + 1.0f) * ema, a3 = -k * ema2;
     const float coefp = (a0 + a1) / (1.0f + b1 + b2), coefn = (a2 + a3) / (1.0f + b1 + b2);
-    TEST_GRID("gaussian_column_1c", "gaussian", "gaussian_column_1c", 1e-6, W, 1,
+    TEST_LINE("gaussian_column_1c", "gaussian", "gaussian_column_1c", 1e-6, W,
               BUFFER("in", image_raw, plane), BUFFER_OUT("out", NULL, plane), INT("width", W), INT("height", H),
               FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
               FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT("Labmax", 1.0f), FLOAT("Labmin", 0.0f));
@@ -986,13 +995,13 @@ static int make_tests(test_t *t)
               INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in),
               GF_OUT("out_r"), GF_OUT("out_g"), GF_OUT("out_b"), FLOAT("guide_weight", 10.0f));
     // a narrow window, and one wider than half the image
-    TEST_GRID("guided_filter_box_mean_x w7", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH, 1,
+    TEST_LINE("guided_filter_box_mean_x w7", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH,
               INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 7));
-    TEST_GRID("guided_filter_box_mean_x w300", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH, 1,
+    TEST_LINE("guided_filter_box_mean_x w300", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH,
               INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 300));
-    TEST_GRID("guided_filter_box_mean_y w7", "guided_filter", "guided_filter_box_mean_y", 1e-6, W, 1,
+    TEST_LINE("guided_filter_box_mean_y w7", "guided_filter", "guided_filter_box_mean_y", 1e-6, W,
               INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 7));
-    TEST_GRID("guided_filter_box_mean_y w150", "guided_filter", "guided_filter_box_mean_y", 1e-6, W, 1,
+    TEST_LINE("guided_filter_box_mean_y w150", "guided_filter", "guided_filter_box_mean_y", 1e-6, W,
               INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 150));
     TEST_GRID("guided_filter_covariances", "guided_filter", "guided_filter_covariances", 0.0, W, GH,
               INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in), GF_IN("img", rcd_dir),
@@ -1143,12 +1152,12 @@ static int make_tests(test_t *t)
     const float a0 = k, a1 = k * (alpha - 1.0f) * ema, a2 = k * (alpha + 1.0f) * ema, a3 = -k * ema2;
     const float coefp = (a0 + a1) / (1.0f + b1 + b2), coefn = (a2 + a3) / (1.0f + b1 + b2);
     const size_t plane2 = 2 * sizeof(float) * W * H, plane4 = 4 * sizeof(float) * W * H;
-    TEST_GRID("gaussian_column_2c", "gaussian", "gaussian_column_2c", 1e-6, W, 1,
+    TEST_LINE("gaussian_column_2c", "gaussian", "gaussian_column_2c", 1e-6, W,
               BUFFER("in", image_in, plane2), BUFFER_OUT("out", NULL, plane2), INT("width", W), INT("height", H),
               FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
               FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT2("Labmax", 1.0f, 1.0f),
               FLOAT2("Labmin", 0.0f, 0.0f));
-    TEST_GRID("gaussian_column_4c", "gaussian", "gaussian_column_4c", 1e-6, W, 1,
+    TEST_LINE("gaussian_column_4c", "gaussian", "gaussian_column_4c", 1e-6, W,
               BUFFER("in", image_in, plane4), BUFFER_OUT("out", NULL, plane4), INT("width", W), INT("height", H),
               FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
               FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT4("Labmax", 1.0f, 1.0f, 1.0f, 1.0f),
@@ -1280,7 +1289,7 @@ static int make_tests(test_t *t)
            CE_BUF("weights", ce_weights, sizeof(ce_weights)), FLOAT("bright_shift", -0.1f),
            FLOAT("sat_shift", 0.1f), FLOAT("white", 1.2f), INT("mode", ce_modes[m]), INT("width", W),
            INT("height", H));
-    TEST_GRID("draw_weight", "colorequal", "draw_weight", 0.0, W, 1,
+    TEST_LINE("draw_weight", "colorequal", "draw_weight", 0.0, W,
               IMG_OUT("dev_out"), CE_BUF("weights", ce_weights, sizeof(ce_weights)), FLOAT("bright_shift", -0.1f),
               FLOAT("sat_shift", 0.1f), INT("mode", 6), INT("width", W), INT("height", H));
     for(int guiding = 0; guiding < 2; guiding++)
@@ -1362,7 +1371,7 @@ static int make_tests(test_t *t)
         snprintf(te_box[r][b], sizeof(te_box[r][b]), "%s r%d", te_box_kernels[b], te_radius[r]);
         const int is_y = b & 1;
         const size_t sz = b < 2 ? s2 : s4;
-        TEST_GRID(te_box[r][b], "toneequal", te_box_kernels[b], 1e-5, is_y ? W : H, 1,
+        TEST_LINE(te_box[r][b], "toneequal", te_box_kernels[b], 1e-5, is_y ? W : H,
                   BUFFER("input", b < 2 ? te_ab : te_packed, sz), BUFFER_OUT("output", NULL, sz),
                   INT("width", W), INT("height", H), INT("radius", te_radius[r]));
       }

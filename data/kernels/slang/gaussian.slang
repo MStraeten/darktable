@@ -33,8 +33,8 @@ void gaussian_column_1c(uint3 gid : SV_DispatchThreadID,
                         uniform float b1, uniform float b2, uniform float coefp, uniform float coefn,
                         uniform float Labmax, uniform float Labmin)
 {
-  const int x = gid.x;
-  if(x >= width || gid.y != 0) return;
+  const int x = gid.y * 16 + gid.x;
+  if(x >= width) return;
 
   // forward filter
   float xp = clamp(in[x], Labmin, Labmax);
@@ -94,8 +94,8 @@ void gaussian_column_2c(uint3 gid : SV_DispatchThreadID,
                         uniform float b1, uniform float b2, uniform float coefp, uniform float coefn,
                         uniform float2 Labmax, uniform float2 Labmin)
 {
-  const int x = gid.x;
-  if(x >= width || gid.y != 0) return;
+  const int x = gid.y * 16 + gid.x;
+  if(x >= width) return;
 
   // forward filter
   float2 xp = clamp(in[x], Labmin, Labmax);
@@ -141,8 +141,8 @@ void gaussian_column_4c(uint3 gid : SV_DispatchThreadID,
                         uniform float b1, uniform float b2, uniform float coefp, uniform float coefn,
                         uniform float4 Labmax, uniform float4 Labmin)
 {
-  const int x = gid.x;
-  if(x >= width || gid.y != 0) return;
+  const int x = gid.y * 16 + gid.x;
+  if(x >= width) return;
 
   // forward filter
   float4 xp = clamp(in[x], Labmin, Labmax);

@@ -376,8 +376,8 @@ void draw_weight(uint3 gid : SV_DispatchThreadID,
                  uniform float bright_shift, uniform float sat_shift, uniform int mode,
                  uniform int width, uniform int height)
 {
-  const int col = int(gid.x);
-  if(col >= width || gid.y != 0) return;
+  const int col = int(gid.y * 16 + gid.x);
+  if(col >= width) return;
 
   const float eps = 0.5f / float(height);
   const float shift = (mode == SATURATION_GRAD) ? sat_shift : bright_shift;

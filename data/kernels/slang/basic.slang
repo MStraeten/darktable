@@ -500,8 +500,8 @@ void highlights_chroma(uint3 gid : SV_DispatchThreadID,
                        uniform uint filters, uniform StructuredBuffer<uint> xtrans,
                        uniform StructuredBuffer<float> clips, uniform StructuredBuffer<float> correction)
 {
-  const int row = gid.x;
-  if(row >= height || gid.y != 0) return;
+  const int row = gid.y * 16 + gid.x;
+  if(row >= height) return;
 
   float sum[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
   float cnt[4] = { 0.0f, 0.0f, 0.0f, 0.0f };

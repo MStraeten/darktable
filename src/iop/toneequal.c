@@ -1777,9 +1777,9 @@ static int _box_mean_slang(dt_slang_gpu_buffer_t *buf,
   const char *kernel_x = (ch == 4) ? "toneequal_box_mean_x_4c" : "toneequal_box_mean_x_2c";
   const char *kernel_y = (ch == 4) ? "toneequal_box_mean_y_4c" : "toneequal_box_mean_y_2c";
 
-  return dt_slang_gpu_run_2d_args("toneequal", kernel_x, height, 1,
+  return dt_slang_gpu_run_1d_args("toneequal", kernel_x, height,
            SLBUF_DEV(buf), SLBUF_DEV(tmp), SLARG(width), SLARG(height), SLARG(radius))
-      || dt_slang_gpu_run_2d_args("toneequal", kernel_y, width, 1,
+      || dt_slang_gpu_run_1d_args("toneequal", kernel_y, width,
            SLBUF_DEV(tmp), SLBUF_DEV(buf), SLARG(width), SLARG(height), SLARG(radius));
 }
 

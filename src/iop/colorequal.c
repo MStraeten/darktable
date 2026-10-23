@@ -2014,7 +2014,7 @@ gboolean process_slang(dt_iop_module_t *self,
             SLBUF_DEV(saturation), SLBUF_DEV(Lscharr), SLBUF(satweights, sizeof(satweights)),
             SLARG(bright_shift), SLARG(sat_shift), SLARG(white), SLARG(mode), SLARG(width), SLARG(height));
     if(!err && (mode == BRIGHTNESS_GRAD || mode == SATURATION_GRAD))
-      err = dt_slang_gpu_run_2d_args("colorequal", "draw_weight", width, 1,
+      err = dt_slang_gpu_run_1d_args("colorequal", "draw_weight", width,
               SLIMG_DEV(dev_out), SLBUF(satweights, sizeof(satweights)), SLARG(bright_shift), SLARG(sat_shift),
               SLARG(mode), SLARG(width), SLARG(height));
   }

@@ -727,10 +727,10 @@ static int _slang_box_mean(const int width,
                            dt_slang_gpu_image_t *out,
                            dt_slang_gpu_image_t *temp)
 {
-  const int err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_x", height, 1,
+  const int err = dt_slang_gpu_run_1d_args("guided_filter", "guided_filter_box_mean_x", height,
                                            SLARG(width), SLARG(height), SLIMG_DEV(in), SLIMG_DEV(temp), SLARG(w));
   if(err) return err;
-  return dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_y", width, 1,
+  return dt_slang_gpu_run_1d_args("guided_filter", "guided_filter_box_mean_y", width,
                                   SLARG(width), SLARG(height), SLIMG_DEV(temp), SLIMG_DEV(out), SLARG(w));
 }
 

@@ -298,8 +298,8 @@ void toneequal_box_mean_x_2c(uint3 gid : SV_DispatchThreadID,
                              uniform StructuredBuffer<float2> input, uniform RWStructuredBuffer<float2> output,
                              uniform int width, uniform int height, uniform int radius)
 {
-  const int y = gid.x;
-  if(y >= height || gid.y != 0) return;
+  const int y = gid.y * 16 + gid.x;
+  if(y >= height) return;
   _box_mean_line<2>(input, output, y * width, width, 1, radius);
 }
 
@@ -309,8 +309,8 @@ void toneequal_box_mean_y_2c(uint3 gid : SV_DispatchThreadID,
                              uniform StructuredBuffer<float2> input, uniform RWStructuredBuffer<float2> output,
                              uniform int width, uniform int height, uniform int radius)
 {
-  const int x = gid.x;
-  if(x >= width || gid.y != 0) return;
+  const int x = gid.y * 16 + gid.x;
+  if(x >= width) return;
   _box_mean_line<2>(input, output, x, height, width, radius);
 }
 
@@ -320,8 +320,8 @@ void toneequal_box_mean_x_4c(uint3 gid : SV_DispatchThreadID,
                              uniform StructuredBuffer<float4> input, uniform RWStructuredBuffer<float4> output,
                              uniform int width, uniform int height, uniform int radius)
 {
-  const int y = gid.x;
-  if(y >= height || gid.y != 0) return;
+  const int y = gid.y * 16 + gid.x;
+  if(y >= height) return;
   _box_mean_line<4>(input, output, y * width, width, 1, radius);
 }
 
@@ -331,8 +331,8 @@ void toneequal_box_mean_y_4c(uint3 gid : SV_DispatchThreadID,
                              uniform StructuredBuffer<float4> input, uniform RWStructuredBuffer<float4> output,
                              uniform int width, uniform int height, uniform int radius)
 {
-  const int x = gid.x;
-  if(x >= width || gid.y != 0) return;
+  const int x = gid.y * 16 + gid.x;
+  if(x >= width) return;
   _box_mean_line<4>(input, output, x, height, width, radius);
 }
 
