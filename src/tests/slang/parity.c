@@ -1096,6 +1096,40 @@ static int make_tests(test_t *t)
            INT("base_working_same_profile", d));
   }
 
+  // sharpen on the L channel of Lab, with a radius of 5 as at 100% zoom. The
+  // OpenCL blurs run in work groups of 16 along the blur, with a local buffer
+  // for the group and its wings, as process_cl() sets them up
+  {
+    enum { SH_RAD = 5, SH_WD = 2 * SH_RAD + 1, SH_BS = 16 };
+    static float sh_m[SH_WD];
+    float weight = 0.0f;
+    for(int l = -SH_RAD; l <= SH_RAD; l++)
+      weight += sh_m[l + SH_RAD] = expf(-l * l / (2.f * 0.64f * SH_RAD * SH_RAD));
+    for(int l = 0; l < SH_WD; l++) sh_m[l] /= weight;
+    static float sh_blurred[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++) sh_blurred[k] = image_lab[k] + 4.0f * (image_in[k] - 0.5f);
+
+    TEST("sharpen_hblur", "sharpen", "sharpen_hblur",
+         IMG_IN("in", image_lab), IMG_OUT("out"), BUFFER("m", sh_m, sizeof(sh_m)), INT("rad", SH_RAD),
+         INT("width", W), INT("height", H), INT("blocksize", SH_BS),
+         LOCAL("buffer", (SH_BS + 2 * SH_RAD) * sizeof(float)));
+    t[n - 1].clgw = (W + SH_BS - 1) / SH_BS * SH_BS;
+    t[n - 1].clgh = H;
+    t[n - 1].cllx = SH_BS;
+    t[n - 1].clly = 1;
+    TEST("sharpen_vblur", "sharpen", "sharpen_vblur",
+         IMG_IN("in", image_lab), IMG_OUT("out"), BUFFER("m", sh_m, sizeof(sh_m)), INT("rad", SH_RAD),
+         INT("width", W), INT("height", H), INT("blocksize", SH_BS),
+         LOCAL("buffer", (SH_BS + 2 * SH_RAD) * sizeof(float)));
+    t[n - 1].clgw = W;
+    t[n - 1].clgh = (H + SH_BS - 1) / SH_BS * SH_BS;
+    t[n - 1].cllx = 1;
+    t[n - 1].clly = SH_BS;
+    TEST("sharpen_mix", "sharpen", "sharpen_mix",
+         IMG_IN("in_a", image_lab), IMG_IN("in_b", sh_blurred), IMG_OUT("out"), INT("width", W),
+         INT("height", H), FLOAT("sharpen", 0.5f), FLOAT("thrs", 0.5f), INT("rad", SH_RAD));
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
