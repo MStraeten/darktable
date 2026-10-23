@@ -613,13 +613,16 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_in,
                        const dt_iop_roi_t *const roi_out)
 {
-  // the copy of process(), which fills what roi_in lacks with zeros
+  // the copy of process(), which fills what roi_in lacks with zeros. Like
+  // dt_iop_copy_image_roi(), rois of the same size are copied as they are:
+  // modify_roi_in() moves roi_in to the crop origin without resizing it
   const int owidth = roi_out->width;
   const int oheight = roi_out->height;
   const int iwidth = roi_in->width;
   const int iheight = roi_in->height;
-  const int dx = roi_out->x - roi_in->x;
-  const int dy = roi_out->y - roi_in->y;
+  const gboolean same_size = iwidth == owidth && iheight == oheight;
+  const int dx = same_size ? 0 : roi_out->x - roi_in->x;
+  const int dy = same_size ? 0 : roi_out->y - roi_in->y;
   return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", owidth, oheight,
     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight), SLARG(iwidth), SLARG(iheight),
     SLARG(dx), SLARG(dy));
