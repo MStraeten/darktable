@@ -50,6 +50,7 @@ typedef enum arg_kind_t
   ARG_FLOAT4,
   ARG_INT2,
   ARG_INT4,
+  ARG_STRUCT,     // passed by value, from data and size
   ARG_BUFFER,
   ARG_BUFFER_OUT, // read and written by the kernel, and compared
   ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
@@ -202,6 +203,7 @@ static void make_inputs(void)
 #define FLOAT4(n, a, b, c, d) { .kind = ARG_FLOAT4, .name = n, .v = { a, b, c, d } }
 #define INT2(n, a, b) { .kind = ARG_INT2, .name = n, .iv = { a, b } }
 #define INT4(n, a, b, c, d) { .kind = ARG_INT4, .name = n, .iv = { a, b, c, d } }
+#define STRUCT(n, ptr) { .kind = ARG_STRUCT, .name = n, .data = &(ptr), .size = sizeof(ptr) }
 #define BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz }
 
 static const float levels[9] = { 0.05f, 0.45f, 0.9f, 0.0f, 0.5f, 1.0f, 0.1f, 0.4f, 0.95f };
@@ -1036,6 +1038,64 @@ static int make_tests(test_t *t)
                FLOAT4("ABCD", -0.06f, 0.05f, 0.04f, -0.03f), FLOAT("strength", 1.1f));
   }
 
+  // agx on scene-referred data from about -7 to +5 EV around middle gray. One
+  // set of params takes the sigmoid toe and shoulder with the look and hue
+  // restoration, the other the fallback curves and the hdr darkening
+  {
+    // tone_mapping_params_t in agx.c, with its hdr_params_t at the end
+    typedef struct
+    {
+      float min_ev, max_ev, range_in_ev, curve_gamma, pivot_x, pivot_y, target_black, toe_power,
+          toe_transition_x, toe_transition_y, toe_scale;
+      int need_convex_toe;
+      float toe_fallback_coefficient, toe_fallback_power, slope, intercept, target_white, shoulder_power,
+          shoulder_transition_x, shoulder_transition_y, shoulder_scale;
+      int need_concave_shoulder;
+      float shoulder_fallback_coefficient, shoulder_fallback_power, look_offset, look_slope, look_power,
+          look_saturation, look_original_hue_mix_ratio;
+      int look_tuned, restore_hue;
+      int hdr_enabled;
+      float hdr_headroom, hdr_purity, hdr_log_min, hdr_pivot_x, hdr_pivot_y, hdr_toe_scale, hdr_shoulder_scale;
+    } agx_params_t;
+    static float ag_image[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++)
+      ag_image[k] = (k % 4 == 3) ? image_in[k] : 0.18f * exp2f(12.0f * image_in[k] - 7.0f);
+    static const float to_xyz[16] = { 0.41f, 0.36f, 0.18f, 0.0f, 0.21f, 0.72f, 0.07f, 0.0f, 0.02f, 0.12f, 0.95f, 0.0f };
+    static agx_params_t ag_params[2];
+    ag_params[0] = (agx_params_t){ .min_ev = -10.0f, .max_ev = 6.5f, .range_in_ev = 16.5f, .curve_gamma = 2.2f,
+                                   .pivot_x = 10.0f / 16.5f, .pivot_y = 0.459f, .target_black = 0.0f,
+                                   .toe_power = 1.5f, .toe_transition_x = 0.4f, .toe_transition_y = 0.047f,
+                                   .toe_scale = -0.1f, .need_convex_toe = 0, .toe_fallback_coefficient = 0.3f,
+                                   .toe_fallback_power = 1.6f, .slope = 2.0f, .intercept = -0.753f,
+                                   .target_white = 1.0f, .shoulder_power = 1.5f, .shoulder_transition_x = 0.75f,
+                                   .shoulder_transition_y = 0.747f, .shoulder_scale = 0.3f,
+                                   .need_concave_shoulder = 0, .shoulder_fallback_coefficient = 0.5f,
+                                   .shoulder_fallback_power = 1.4f, .look_offset = 0.02f, .look_slope = 1.1f,
+                                   .look_power = 1.2f, .look_saturation = 1.3f, .look_original_hue_mix_ratio = 0.4f,
+                                   .look_tuned = 1, .restore_hue = 1 };
+    ag_params[1] = ag_params[0];
+    ag_params[1].need_convex_toe = 1;
+    ag_params[1].need_concave_shoulder = 1;
+    ag_params[1].look_tuned = 0;
+    ag_params[1].restore_hue = 0;
+    ag_params[1].hdr_enabled = 1;
+    ag_params[1].hdr_headroom = 2.0f;
+    ag_params[1].hdr_purity = 0.5f;
+    ag_params[1].hdr_log_min = -12.0f;
+    ag_params[1].hdr_pivot_x = 0.5f;
+    ag_params[1].hdr_pivot_y = 0.5f;
+    ag_params[1].hdr_toe_scale = -0.4f;
+    ag_params[1].hdr_shoulder_scale = 0.5f;
+    static const char *ag_labels[2] = { "agx sigmoid look hue", "agx fallback hdr" };
+    for(int d = 0; d < 2; d++)
+      TEST(ag_labels[d], "agx", "kernel_agx",
+           IMG_IN("input", ag_image), IMG_OUT("output"), INT("width", W), INT("height", H),
+           STRUCT("params", ag_params[d]),
+           BUFFER("pipe_to_base", to_base, sizeof(to_base)), BUFFER("base_to_rendering", to_rendering, sizeof(to_rendering)),
+           BUFFER("rendering_to_pipe", to_pipe, sizeof(to_pipe)), BUFFER("rendering_to_xyz", to_xyz, sizeof(to_xyz)),
+           INT("base_working_same_profile", d));
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
@@ -1190,6 +1250,9 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
         break;
       case ARG_INT4:
         CK(clSetKernelArg(k, a, 4 * sizeof(int), arg->iv));
+        break;
+      case ARG_STRUCT:
+        CK(clSetKernelArg(k, a, arg->size, arg->data));
         break;
     }
   }
@@ -1572,9 +1635,12 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
       case ARG_FLOAT4:
       case ARG_INT2:
       case ARG_INT4:
+      case ARG_STRUCT:
       {
-        const size_t sz = arg->kind == ARG_FLOAT4 || arg->kind == ARG_INT4 ? 16 : arg->kind == ARG_INT2 ? 8 : 4;
-        const void *src = arg->kind == ARG_INT ? (const void *)&arg->i
+        const size_t sz = arg->kind == ARG_STRUCT ? arg->size
+                        : arg->kind == ARG_FLOAT4 || arg->kind == ARG_INT4 ? 16 : arg->kind == ARG_INT2 ? 8 : 4;
+        const void *src = arg->kind == ARG_STRUCT ? arg->data
+                        : arg->kind == ARG_INT ? (const void *)&arg->i
                         : arg->kind == ARG_FLOAT ? (const void *)&arg->f
                         : arg->kind == ARG_INT2 || arg->kind == ARG_INT4 ? (const void *)arg->iv
                         : (const void *)arg->v;
