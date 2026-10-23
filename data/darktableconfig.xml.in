@@ -569,6 +569,13 @@
     <shortdescription>run ported modules through the Slang GPU kernels</shortdescription>
     <longdescription>experimental: modules with a Slang port run their CPU path on a Vulkan or Metal device instead</longdescription>
   </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_device</name>
+    <type>string</type>
+    <default></default>
+    <shortdescription>Vulkan device for the Slang GPU kernels</shortdescription>
+    <longdescription>experimental: the index or part of the name of the Vulkan device to run the Slang kernels on. empty picks a discrete GPU, then an integrated one</longdescription>
+  </dtconfig>
   <dtconfig prefs="processing" section="opencl" capability="opencl">
     <name>opencl_scheduling_profile</name>
     <type>

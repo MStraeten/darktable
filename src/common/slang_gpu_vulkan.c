@@ -114,19 +114,46 @@ static gboolean _init_device(void)
   }
   VkPhysicalDevice *devs = g_new(VkPhysicalDevice, ndev);
   vkEnumeratePhysicalDevices(_vk.instance, &ndev, devs);
-  // prefer a real GPU over a CPU implementation such as lavapipe
-  _vk.pdev = devs[0];
+
+  // slang_gpu_device picks a device by index or by part of its name. Without
+  // it a discrete GPU wins over an integrated one, which wins over the rest:
+  // on hybrid laptops the integrated GPU is usually enumerated first, and a
+  // CPU implementation such as lavapipe is only a last resort
+  const char *wanted = dt_conf_get_string_const("slang_gpu_device");
+  char *end = NULL;
+  const long wanted_index = wanted && *wanted ? strtol(wanted, &end, 10) : -1;
+  const gboolean by_index = wanted && *wanted && end && *end == '\0';
+  gchar *wanted_name = wanted && *wanted && !by_index ? g_utf8_casefold(wanted, -1) : NULL;
+
+  int best = -1, best_rank = -1;
   for(uint32_t d = 0; d < ndev; d++)
   {
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(devs[d], &props);
-    if(props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
-       || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
+    gchar *name = g_utf8_casefold(props.deviceName, -1);
+    const gboolean match = by_index ? wanted_index == (long)d : wanted_name && strstr(name, wanted_name) != NULL;
+    g_free(name);
+    const int rank = match ? 4
+      : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
+      : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
+      : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 1
+      : 0;
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] Vulkan device %u: %s, %s, vendor 0x%04x%s", d, props.deviceName,
+             props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
+             : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+             : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? "virtual"
+             : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? "cpu" : "other",
+             props.vendorID, match ? ", requested" : "");
+    if(rank > best_rank)
     {
-      _vk.pdev = devs[d];
-      break;
+      best = d;
+      best_rank = rank;
     }
   }
+  if((wanted_name || by_index) && best_rank < 4)
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] no Vulkan device matches slang_gpu_device '%s'", wanted);
+  g_free(wanted_name);
+  _vk.pdev = devs[best];
   g_free(devs);
 
   VkPhysicalDeviceProperties props;
