@@ -19,6 +19,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -229,6 +230,51 @@ error:
   dt_opencl_release_mem_object(dev_tmp);
   dt_free_align(mat);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_sharpen_data_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int rad = MIN(MAXR, ceilf(d->radius * roi_in->scale / piece->iscale));
+  const int wd = 2 * rad + 1;
+
+  // as in process(), images too small for the kernel are passed through
+  if(rad == 0 || width < wd || height < wd)
+  {
+    const int zero = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+      SLARG(zero), SLARG(zero));
+  }
+
+  const float sigma2 = (1.0f / (2.5 * 2.5)) * (d->radius * roi_in->scale / piece->iscale)
+                       * (d->radius * roi_in->scale / piece->iscale);
+  float *mat = init_gaussian_kernel(rad, wd, sigma2);
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  const int err = !mat || !tmp
+    || dt_slang_gpu_run_2d_args("sharpen", "sharpen_hblur", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLBUF(mat, sizeof(float) * wd), SLARG(rad),
+         SLARG(width), SLARG(height))
+    || dt_slang_gpu_run_2d_args("sharpen", "sharpen_vblur", width, height,
+         SLIMG_DEV(dev_out), SLIMG_DEV(tmp), SLBUF(mat, sizeof(float) * wd), SLARG(rad),
+         SLARG(width), SLARG(height))
+    || dt_slang_gpu_run_2d_args("sharpen", "sharpen_mix", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+         SLARG(d->amount), SLARG(d->threshold), SLARG(rad));
+  dt_slang_gpu_image_free(tmp);
+  dt_free_align(mat);
+  return !err;
 }
 #endif
 
