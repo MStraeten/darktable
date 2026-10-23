@@ -47,8 +47,12 @@ A third argument sets the export's longest side in pixels (`0`, the default,
 is full resolution). `RESOURCES` sets darktable's `resourcelevel`: the default,
 `default`, is what users get, and the summary lists any module that had to be
 tiled because of it. Extra `darktable-cli` arguments go in `BENCH_ARGS`, for
-example to pick an OpenCL platform. With several Vulkan GPUs the first integrated or discrete
-one is used.
+example to pick an OpenCL platform.
+
+With several Vulkan devices, Slang uses a discrete GPU first, then an
+integrated one. To choose another, pass its index or part of its name, for
+example `BENCH_ARGS="--conf slang_gpu_device=nvidia"`; `slang.log` lists
+every device it found.
 
 ## report
 
