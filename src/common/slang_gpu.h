@@ -27,6 +27,8 @@
 #include <glib.h>
 #include <stddef.h>
 
+G_BEGIN_DECLS
+
 typedef enum dt_slang_arg_kind_t
 {
   DT_SLANG_ARG_IMAGE_IN,
@@ -50,14 +52,19 @@ typedef struct dt_slang_arg_t
 
 // arguments are given in the order of the kernel's parameters, like CLARG()
 // for OpenCL. Images are float, with 1 or 4 channels.
-#define SLIMG_IN(p, w, h, c) ((dt_slang_arg_t){ DT_SLANG_ARG_IMAGE_IN, (p), 0, (w), (h), (c) })
-#define SLIMG_OUT(p, w, h, c) ((dt_slang_arg_t){ DT_SLANG_ARG_IMAGE_OUT, (p), 0, (w), (h), (c) })
-#define SLBUF(p, s) ((dt_slang_arg_t){ DT_SLANG_ARG_BUFFER, (p), (s), 0, 0, 0 })
-#define SLARG(v) ((dt_slang_arg_t){ DT_SLANG_ARG_VALUE, &(v), sizeof(v), 0, 0, 0 })
+#ifdef __cplusplus
+#define _DT_SLANG_ARG(...) (dt_slang_arg_t{ __VA_ARGS__ })
+#else
+#define _DT_SLANG_ARG(...) ((dt_slang_arg_t){ __VA_ARGS__ })
+#endif
+#define SLIMG_IN(p, w, h, c) _DT_SLANG_ARG(DT_SLANG_ARG_IMAGE_IN, (p), 0, (w), (h), (c))
+#define SLIMG_OUT(p, w, h, c) _DT_SLANG_ARG(DT_SLANG_ARG_IMAGE_OUT, (p), 0, (w), (h), (c))
+#define SLBUF(p, s) _DT_SLANG_ARG(DT_SLANG_ARG_BUFFER, (p), (s), 0, 0, 0)
+#define SLARG(v) _DT_SLANG_ARG(DT_SLANG_ARG_VALUE, &(v), sizeof(v), 0, 0, 0)
 // a device image, as the kernel's input or output
-#define SLIMG_DEV(img) ((dt_slang_arg_t){ DT_SLANG_ARG_IMAGE_DEV, (img), 0, 0, 0, 0 })
+#define SLIMG_DEV(img) _DT_SLANG_ARG(DT_SLANG_ARG_IMAGE_DEV, (img), 0, 0, 0, 0)
 // a device buffer, which kernels can read and write
-#define SLBUF_DEV(buf) ((dt_slang_arg_t){ DT_SLANG_ARG_BUFFER_DEV, (buf), 0, 0, 0, 0 })
+#define SLBUF_DEV(buf) _DT_SLANG_ARG(DT_SLANG_ARG_BUFFER_DEV, (buf), 0, 0, 0, 0)
 
 #ifdef HAVE_SLANG_GPU
 
@@ -120,10 +127,24 @@ void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buf);
 // have finished. Returns 0 on success.
 int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buf, void *host, const size_t size);
 
+#ifdef __cplusplus
+// C++ has no compound literals, so the arguments go in a list
+G_END_DECLS
+#include <initializer_list>
+static inline int _dt_slang_gpu_run_2d_list(const char *program, const char *kernel, const int width,
+                                            const int height, std::initializer_list<dt_slang_arg_t> args)
+{
+  return dt_slang_gpu_run_2d(program, kernel, width, height, (int)args.size(), args.begin());
+}
+G_BEGIN_DECLS
+#define dt_slang_gpu_run_2d_args(program, kernel, width, height, ...)                    \
+  _dt_slang_gpu_run_2d_list((program), (kernel), (width), (height), { __VA_ARGS__ })
+#else
 #define dt_slang_gpu_run_2d_args(program, kernel, width, height, ...)                    \
   dt_slang_gpu_run_2d((program), (kernel), (width), (height),                           \
                       sizeof((dt_slang_arg_t[]){ __VA_ARGS__ }) / sizeof(dt_slang_arg_t),  \
                       (dt_slang_arg_t[]){ __VA_ARGS__ })
+#endif
 
 #else
 
@@ -132,3 +153,5 @@ static inline void dt_slang_gpu_cleanup(void) {}
 static inline void dt_slang_gpu_prepare(void) {}
 
 #endif
+
+G_END_DECLS
