@@ -49,6 +49,7 @@ typedef enum arg_kind_t
   ARG_FLOAT,
   ARG_FLOAT4,
   ARG_INT2,
+  ARG_INT4,
   ARG_BUFFER,
   ARG_BUFFER_OUT, // read and written by the kernel, and compared
   ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
@@ -63,7 +64,7 @@ typedef struct arg_t
   int i;
   float f;
   float v[4];
-  int iv[2];
+  int iv[4];
   const void *data; // buffers, and the initial contents of ARG_BUFFER_OUT (zeros if NULL)
   size_t size;
   int bytes;        // ARG_BUFFER_OUT holds bytes, compared exactly
@@ -200,6 +201,7 @@ static void make_inputs(void)
 #define FLOAT(n, val) { .kind = ARG_FLOAT, .name = n, .f = val }
 #define FLOAT4(n, a, b, c, d) { .kind = ARG_FLOAT4, .name = n, .v = { a, b, c, d } }
 #define INT2(n, a, b) { .kind = ARG_INT2, .name = n, .iv = { a, b } }
+#define INT4(n, a, b, c, d) { .kind = ARG_INT4, .name = n, .iv = { a, b, c, d } }
 #define BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz }
 
 static const float levels[9] = { 0.05f, 0.45f, 0.9f, 0.0f, 0.5f, 1.0f, 0.1f, 0.4f, 0.95f };
@@ -1015,6 +1017,25 @@ static int make_tests(test_t *t)
 #undef GF_OUT
   }
 
+  // one diffusion step of each isotropy type, on plausible wavelet data: a
+  // positive low frequency layer and signed details. The mask is an 8 bit
+  // image in OpenCL and a float one here, so only the unmasked path compares
+  {
+    static float df_hf[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++) df_hf[k] = 0.2f * (image_in[(k + 4 * 37) % (4 * W * H)] - 0.5f);
+    static const int df_types[3][4] = { { 0, 0, 0, 0 }, { 1, 1, 1, 1 }, { 2, 1, 0, 2 } };
+    static const char *df_labels[3] = { "diffuse_pde isotrope", "diffuse_pde isophote", "diffuse_pde mixed" };
+    for(int d = 0; d < 3; d++)
+      TEST_TOL(df_labels[d], "diffuse", "diffuse_pde", 1e-4,
+               IMG_IN("HF", df_hf), IMG_IN("LF", image_in), RAW_IN("mask", rcd_dir), INT("has_mask", 0),
+               IMG_OUT("output"), INT("width", W), INT("height", H),
+               FLOAT4("anisotropy", 2.5f, 1.0f, 0.5f, 4.0f),
+               INT4("isotropy_type", df_types[d][0], df_types[d][1], df_types[d][2], df_types[d][3]),
+               FLOAT("regularization", 0.7f), FLOAT("variance_threshold", 0.01f),
+               FLOAT("current_radius_square", 4.0f + 3.0f * d), INT("mult", 1 << (d + 1)),
+               FLOAT4("ABCD", -0.06f, 0.05f, 0.04f, -0.03f), FLOAT("strength", 1.1f));
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
@@ -1166,6 +1187,9 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
         break;
       case ARG_INT2:
         CK(clSetKernelArg(k, a, 2 * sizeof(int), arg->iv));
+        break;
+      case ARG_INT4:
+        CK(clSetKernelArg(k, a, 4 * sizeof(int), arg->iv));
         break;
     }
   }
@@ -1547,11 +1571,13 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
       case ARG_FLOAT:
       case ARG_FLOAT4:
       case ARG_INT2:
+      case ARG_INT4:
       {
-        const size_t sz = arg->kind == ARG_FLOAT4 ? 16 : arg->kind == ARG_INT2 ? 8 : 4;
+        const size_t sz = arg->kind == ARG_FLOAT4 || arg->kind == ARG_INT4 ? 16 : arg->kind == ARG_INT2 ? 8 : 4;
         const void *src = arg->kind == ARG_INT ? (const void *)&arg->i
                         : arg->kind == ARG_FLOAT ? (const void *)&arg->f
-                        : arg->kind == ARG_INT2 ? (const void *)arg->iv : (const void *)arg->v;
+                        : arg->kind == ARG_INT2 || arg->kind == ARG_INT4 ? (const void *)arg->iv
+                        : (const void *)arg->v;
         if(p->offset < 0 || p->offset + sz > sizeof(push)) die("%s: bad offset for %s", t->kernel, arg->name);
         memcpy(push + p->offset, src, sz);
         if(p->offset + (int)sz > push_size) push_size = p->offset + sz;
