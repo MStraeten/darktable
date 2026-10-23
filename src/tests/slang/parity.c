@@ -51,6 +51,7 @@ typedef enum arg_kind_t
   ARG_INT2,
   ARG_INT4,
   ARG_STRUCT,     // passed by value, from data and size
+  ARG_FLOAT2,
   ARG_BUFFER,
   ARG_BUFFER_OUT, // read and written by the kernel, and compared
   ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
@@ -204,6 +205,7 @@ static void make_inputs(void)
 #define INT2(n, a, b) { .kind = ARG_INT2, .name = n, .iv = { a, b } }
 #define INT4(n, a, b, c, d) { .kind = ARG_INT4, .name = n, .iv = { a, b, c, d } }
 #define STRUCT(n, ptr) { .kind = ARG_STRUCT, .name = n, .data = &(ptr), .size = sizeof(ptr) }
+#define FLOAT2(n, a, b) { .kind = ARG_FLOAT2, .name = n, .v = { a, b } }
 #define BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz }
 
 static const float levels[9] = { 0.05f, 0.45f, 0.9f, 0.0f, 0.5f, 1.0f, 0.1f, 0.4f, 0.95f };
@@ -1130,6 +1132,52 @@ static int make_tests(test_t *t)
          INT("height", H), FLOAT("sharpen", 0.5f), FLOAT("thrs", 0.5f), INT("rad", SH_RAD));
   }
 
+  // the recursive gaussian on 2 and 4 channel buffers, as the guided filters
+  // of color equalizer run it, with the coefficients of the 1 channel case
+  // above, and the bilinear resampling of their working buffers
+  {
+    const float alpha = 1.695f / 6.0f;
+    const float ema = expf(-alpha), ema2 = expf(-2.0f * alpha);
+    const float b1 = -2.0f * ema, b2 = ema2;
+    const float k = (1.0f - ema) * (1.0f - ema) / (1.0f + (2.0f * alpha * ema) - ema2);
+    const float a0 = k, a1 = k * (alpha - 1.0f) * ema, a2 = k * (alpha + 1.0f) * ema, a3 = -k * ema2;
+    const float coefp = (a0 + a1) / (1.0f + b1 + b2), coefn = (a2 + a3) / (1.0f + b1 + b2);
+    const size_t plane2 = 2 * sizeof(float) * W * H, plane4 = 4 * sizeof(float) * W * H;
+    TEST_GRID("gaussian_column_2c", "gaussian", "gaussian_column_2c", 1e-6, W, 1,
+              BUFFER("in", image_in, plane2), BUFFER_OUT("out", NULL, plane2), INT("width", W), INT("height", H),
+              FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
+              FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT2("Labmax", 1.0f, 1.0f),
+              FLOAT2("Labmin", 0.0f, 0.0f));
+    TEST_GRID("gaussian_column_4c", "gaussian", "gaussian_column_4c", 1e-6, W, 1,
+              BUFFER("in", image_in, plane4), BUFFER_OUT("out", NULL, plane4), INT("width", W), INT("height", H),
+              FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
+              FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT4("Labmax", 1.0f, 1.0f, 1.0f, 1.0f),
+              FLOAT4("Labmin", 0.0f, 0.0f, 0.0f, 0.0f));
+    TEST("gaussian_transpose_2c", "gaussian", "gaussian_transpose_2c",
+         BUFFER("in", image_in, plane2), BUFFER_OUT("out", NULL, plane2), INT("width", W), INT("height", H),
+         INT("blocksize", 16), LOCAL("buffer", 2 * sizeof(float) * 16 * 17));
+    TEST("gaussian_transpose_4c", "gaussian", "gaussian_transpose_4c",
+         BUFFER("in", image_in, plane4), BUFFER_OUT("out", NULL, plane4), INT("width", W), INT("height", H),
+         INT("blocksize", 16), LOCAL("buffer", 4 * sizeof(float) * 16 * 17));
+
+    enum { BW = W / 3, BH = H / 3 };
+    static const int bl_ch[3] = { 1, 2, 4 };
+    static const char *bl_kernels[3] = { "bilinear1", "bilinear2", "bilinear4" };
+    static char bl_labels[3][2][32];
+    for(int c = 0; c < 3; c++)
+    {
+      const size_t px = bl_ch[c] * sizeof(float);
+      snprintf(bl_labels[c][0], sizeof(bl_labels[c][0]), "%s down", bl_kernels[c]);
+      TEST_GRID(bl_labels[c][0], "bilinear", bl_kernels[c], 1e-6, BW, BH,
+                BUFFER("in", image_in, px * W * H), INT("width_in", W), INT("height_in", H),
+                BUFFER_OUT("out", NULL, px * BW * BH), INT("width_out", BW), INT("height_out", BH));
+      snprintf(bl_labels[c][1], sizeof(bl_labels[c][1]), "%s up", bl_kernels[c]);
+      TEST_GRID(bl_labels[c][1], "bilinear", bl_kernels[c], 1e-6, W, H,
+                BUFFER("in", image_in, px * BW * BH), INT("width_in", BW), INT("height_in", BH),
+                BUFFER_OUT("out", NULL, px * W * H), INT("width_out", W), INT("height_out", H));
+    }
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
@@ -1287,6 +1335,9 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
         break;
       case ARG_STRUCT:
         CK(clSetKernelArg(k, a, arg->size, arg->data));
+        break;
+      case ARG_FLOAT2:
+        CK(clSetKernelArg(k, a, 2 * sizeof(float), arg->v));
         break;
     }
   }
@@ -1670,9 +1721,11 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
       case ARG_INT2:
       case ARG_INT4:
       case ARG_STRUCT:
+      case ARG_FLOAT2:
       {
         const size_t sz = arg->kind == ARG_STRUCT ? arg->size
-                        : arg->kind == ARG_FLOAT4 || arg->kind == ARG_INT4 ? 16 : arg->kind == ARG_INT2 ? 8 : 4;
+                        : arg->kind == ARG_FLOAT4 || arg->kind == ARG_INT4 ? 16
+                        : arg->kind == ARG_INT2 || arg->kind == ARG_FLOAT2 ? 8 : 4;
         const void *src = arg->kind == ARG_STRUCT ? arg->data
                         : arg->kind == ARG_INT ? (const void *)&arg->i
                         : arg->kind == ARG_FLOAT ? (const void *)&arg->f
