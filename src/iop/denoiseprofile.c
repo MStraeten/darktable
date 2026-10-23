@@ -24,6 +24,7 @@
 #include "common/nlmeans_core.h"
 #include "common/noiseprofiles.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
@@ -1606,7 +1607,7 @@ static void process_wavelets(dt_iop_module_t *self,
 #undef MAX_MAX_SCALE
 }
 
-#if defined(HAVE_OPENCL) && !USE_NEW_IMPL_CL
+#if (defined(HAVE_OPENCL) && !USE_NEW_IMPL_CL) || defined(HAVE_SLANG_GPU)
 static int sign(int a)
 {
   return (a > 0) - (a < 0);
@@ -1703,8 +1704,8 @@ static float nlmeans_precondition(const dt_iop_denoiseprofile_data_t *const d,
   return compensate_p;
 }
 
-#ifdef HAVE_OPENCL
-// called by process_nlmeans_cl
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
+// called by process_nlmeans_cl and process_nlmeans_slang
 // must keep synchronized with nlmeans_precondition above
 static float nlmeans_precondition_cl(const dt_iop_denoiseprofile_data_t *const d,
                                      const dt_dev_pixelpipe_iop_t *const piece,
@@ -1746,7 +1747,7 @@ static float nlmeans_precondition_cl(const dt_iop_denoiseprofile_data_t *const d
   }
   return compensate_p;
 }
-#endif /* HAVE_OPENCL */
+#endif /* HAVE_OPENCL || HAVE_SLANG_GPU */
 
 // called by process_nlmeans_cpu
 static void nlmeans_backtransform(const dt_iop_denoiseprofile_data_t *const d,
@@ -2613,6 +2614,425 @@ int process_cl(dt_iop_module_t *self,
   }
 }
 #endif // HAVE_OPENCL
+
+#ifdef HAVE_SLANG_GPU
+static int _copy_slang(dt_slang_gpu_image_t *src,
+                       dt_slang_gpu_image_t *dst,
+                       const int width,
+                       const int height)
+{
+  const int zero = 0;
+  return dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                  SLIMG_DEV(src), SLIMG_DEV(dst), SLARG(width), SLARG(height),
+                                  SLARG(width), SLARG(height), SLARG(zero), SLARG(zero));
+}
+
+static int process_nlmeans_slang(dt_iop_module_t *self,
+                                 dt_dev_pixelpipe_iop_t *piece,
+                                 dt_slang_gpu_image_t *dev_in,
+                                 dt_slang_gpu_image_t *dev_out,
+                                 const dt_iop_roi_t *const roi_in,
+                                 const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_denoiseprofile_data_t *d = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t npixels = (size_t)width * height;
+
+  const float scale = fminf(fminf(roi_in->scale, 2.0f) / fmaxf(piece->iscale, 1.0f), 1.0f);
+  const int P = ceilf(d->radius * scale); // pixel filter size
+  int K = d->nbhood; // nbhood
+  const float scattering = nlmeans_scattering(&K, d, piece, scale);
+  const float norm = nlmeans_norm(P, d);
+  const float central_pixel_weight = d->central_pixel_weight * scale;
+
+  dt_aligned_pixel_t wb;
+  dt_aligned_pixel_t p;
+  dt_aligned_pixel_t aa;
+  dt_aligned_pixel_t bb;
+
+  nlmeans_precondition_cl(d, piece, wb, scale, aa, bb, p);
+
+  const dt_aligned_pixel_t sigma2 = { (bb[0] / aa[0]) * (bb[0] / aa[0]),
+                                      (bb[1] / aa[1]) * (bb[1] / aa[1]),
+                                      (bb[2] / aa[2]) * (bb[2] / aa[2]),
+                                      0.0f };
+
+  int err = 1;
+  // the patch distances, their horizontal and then vertical box sums
+  dt_slang_gpu_buffer_t *dev_U4 = NULL, *dev_U4_t = NULL, *dev_U4_tt = NULL;
+  // dt_slang_gpu_buffer_new() zeroes the accumulator
+  dt_slang_gpu_buffer_t *dev_U2 = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npixels, NULL);
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  if(!dev_U2 || !dev_tmp) goto error;
+  dev_U4 = dt_slang_gpu_buffer_new(sizeof(float) * npixels, NULL);
+  dev_U4_t = dt_slang_gpu_buffer_new(sizeof(float) * npixels, NULL);
+  dev_U4_tt = dt_slang_gpu_buffer_new(sizeof(float) * npixels, NULL);
+  if(!dev_U4 || !dev_U4_t || !dev_U4_tt) goto error;
+
+  if(!d->use_new_vst)
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_precondition", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height),
+                                   SLARG(aa), SLARG(sigma2));
+  else
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_precondition_v2", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height),
+                                   SLARG(aa), SLARG(p), SLARG(bb), SLARG(wb));
+  if(err) goto error;
+
+  for(int kj_index = -K; kj_index <= 0 && !err; kj_index++)
+  {
+    for(int ki_index = -K; ki_index <= K && !err; ki_index++)
+    {
+      // see process_nlmeans_cl() for the choice of offsets
+      const int abs_kj = abs(kj_index);
+      const int abs_ki = abs(ki_index);
+      const int j = scale * ((abs_kj * abs_kj * abs_kj
+                              + 7.0 * abs_kj * sqrt(abs_ki)) * sign(kj_index)
+                             * scattering / 6.0 + kj_index);
+      const int i = scale * ((abs_ki * abs_ki * abs_ki
+                              + 7.0 * abs_ki * sqrt(abs_kj)) * sign(ki_index)
+                             * scattering / 6.0 + ki_index);
+      const int q[2] = { i, j };
+
+      err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_dist", width, height,
+                                     SLIMG_DEV(dev_tmp), SLBUF_DEV(dev_U4), SLARG(width), SLARG(height), SLARG(q));
+      if(!err)
+        err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_horiz", width, height,
+                                       SLBUF_DEV(dev_U4), SLBUF_DEV(dev_U4_t), SLARG(width), SLARG(height),
+                                       SLARG(q), SLARG(P));
+      if(!err)
+        err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_vert", width, height,
+                                       SLBUF_DEV(dev_U4_t), SLBUF_DEV(dev_U4_tt), SLARG(width), SLARG(height),
+                                       SLARG(q), SLARG(P), SLARG(norm), SLARG(central_pixel_weight),
+                                       SLBUF_DEV(dev_U4));
+      if(!err)
+        err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_accu", width, height,
+                                       SLIMG_DEV(dev_tmp), SLBUF_DEV(dev_U2), SLBUF_DEV(dev_U4_tt),
+                                       SLARG(width), SLARG(height), SLARG(q));
+    }
+  }
+  if(err) goto error;
+
+  if(!d->use_new_vst)
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_finish", width, height,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(dev_U2), SLIMG_DEV(dev_out),
+                                   SLARG(width), SLARG(height), SLARG(aa), SLARG(sigma2));
+  else
+  {
+    const float bias = d->bias - 0.5 * logf(scale);
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_finish_v2", width, height,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(dev_U2), SLIMG_DEV(dev_out),
+                                   SLARG(width), SLARG(height), SLARG(aa), SLARG(p), SLARG(bb),
+                                   SLARG(bias), SLARG(wb));
+  }
+
+error:
+  dt_slang_gpu_buffer_free(dev_U4);
+  dt_slang_gpu_buffer_free(dev_U4_t);
+  dt_slang_gpu_buffer_free(dev_U4_tt);
+  dt_slang_gpu_buffer_free(dev_U2);
+  dt_slang_gpu_image_free(dev_tmp);
+  return err;
+}
+
+static int process_wavelets_slang(dt_iop_module_t *self,
+                                  dt_dev_pixelpipe_iop_t *piece,
+                                  dt_slang_gpu_image_t *dev_in,
+                                  dt_slang_gpu_image_t *dev_out,
+                                  const dt_iop_roi_t *const roi_in,
+                                  const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_denoiseprofile_data_t *d = piece->data;
+
+  const int max_max_scale = DT_IOP_DENOISE_PROFILE_BANDS; // hard limit
+  int max_scale = 0;
+  const float scale = fminf(roi_in->scale / piece->iscale, 1.0f);
+  // largest desired filter on input buffer (20% of input dim)
+  const float supp0
+      = MIN(2 * (2u << (max_max_scale - 1)) + 1,
+            MAX(piece->buf_in.height * piece->iscale,
+                piece->buf_in.width * piece->iscale) * 0.2f);
+  const float i0 = dt_log2f((supp0 - 1.0f) * .5f);
+  for(; max_scale < max_max_scale; max_scale++)
+  {
+    // actual filter support on scaled buffer
+    const float supp = 2 * (2u << max_scale) + 1;
+    // approximates this filter size on unscaled input image:
+    const float supp_in = supp * (1.0f / scale);
+    const float i_in = dt_log2f((supp_in - 1) * .5f) - 1.0f;
+    // i_in = max_scale .. .. .. 0
+    const float t = 1.0f - (i_in + .5f) / i0;
+    if(t < 0.0f) break;
+  }
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t npixels = (size_t)width * height;
+
+  // corner case of extremely small image, which would divide by
+  // (n-1) below
+  if(npixels < 2) return _copy_slang(dev_in, dev_out, width, height);
+
+  // denoiseprofile_reduce_first sums 16x16 blocks, which the host adds up
+  const int nbx = (width + 15) / 16;
+  const int nby = (height + 15) / 16;
+  const size_t bufsize = (size_t)nbx * nby;
+
+  int err = 1;
+  dt_slang_gpu_image_t *dev_detail[DT_IOP_DENOISE_PROFILE_BANDS] = { NULL };
+  dt_slang_gpu_buffer_t *dev_m = dt_slang_gpu_buffer_new(sizeof(float) * 4 * bufsize, NULL);
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  float *sumsum = dt_alloc_align_float((size_t)4 * bufsize);
+  if(!dev_m || !dev_tmp || !sumsum) goto error;
+
+  const float m[] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f }; // 1/16, 4/16, 6/16, 4/16, 1/16
+  float mm[5][5];
+  for(int j = 0; j < 5; j++)
+    for(int i = 0; i < 5; i++) mm[j][i] = m[i] * m[j];
+
+  for(int k = 0; k < max_scale; k++)
+  {
+    dev_detail[k] = dt_slang_gpu_image_new(width, height, 4, NULL);
+    if(dev_detail[k] == NULL) goto error;
+  }
+
+  dt_aligned_pixel_t wb;  // the "unused" fourth element enables vectorization
+  const dt_aligned_pixel_t wb_weights = { 2.0f, 1.0f, 2.0f, 0.0f };
+  compute_wb_factors(wb, d, piece, wb_weights);
+  wb[3] = 0.0f;
+
+  // adaptive p depending on white balance
+  const dt_aligned_pixel_t p = { MAX(d->shadows + 0.1 * logf(scale / wb[0]), 0.0f),
+                                 MAX(d->shadows + 0.1 * logf(scale / wb[1]), 0.0f),
+                                 MAX(d->shadows + 0.1 * logf(scale / wb[2]), 0.0f),
+                                 1.0f};
+
+  // conversion to Y0U0V0 space as defined in Secrets of image denoising cuisine
+  dt_colormatrix_t toY0U0V0_tmp = { { 1.0f/3.0f, 1.0f/3.0f, 1.0f/3.0f },
+                                    { 0.5f,      0.0f,      -0.5f },
+                                    { 0.25f,     -0.5f,     0.25f } };
+  dt_colormatrix_t toRGB_tmp = { { 0.0f, 0.0f, 0.0f },
+                                 { 0.0f, 0.0f, 0.0f },
+                                 { 0.0f, 0.0f, 0.0f } };
+  set_up_conversion_matrices(toY0U0V0_tmp, toRGB_tmp, wb);
+
+  // more strength in Y0U0V0 in order to get a similar smoothing as in other modes
+  const float compensate_strength = (d->wavelet_color_mode == MODE_RGB) ? 1.0f : 2.5f;
+
+  // update the coeffs with strength and scale
+  float toY0U0V0[9];
+  float toRGB[9];
+  for(size_t k = 0; k < 3; k++)
+    for(size_t c = 0; c < 3; c++)
+    {
+      toRGB[3*k+c] = toRGB_tmp[k][c] * d->strength * compensate_strength * scale;
+      toY0U0V0[3*k+c] = toY0U0V0_tmp[k][c] / (d->strength * compensate_strength * scale);
+    }
+
+  for_each_channel(i) wb[i] *= d->strength * compensate_strength * scale;
+
+  dt_aligned_pixel_t aa = { d->a[1] * wb[0], d->a[1] * wb[1], d->a[1] * wb[2], 1.0f };
+  dt_aligned_pixel_t bb = { d->b[1] * wb[0], d->b[1] * wb[1], d->b[1] * wb[2], 1.0f };
+
+  const dt_aligned_pixel_t sigma2 = { (bb[0] / aa[0]) * (bb[0] / aa[0]),
+                                      (bb[1] / aa[1]) * (bb[1] / aa[1]),
+                                      (bb[2] / aa[2]) * (bb[2] / aa[2]),
+                                      0.0f };
+
+  const float compensate_p =
+    DT_IOP_DENOISE_PROFILE_P_FULCRUM / powf(DT_IOP_DENOISE_PROFILE_P_FULCRUM, d->shadows);
+  if(d->use_new_vst)
+  {
+    for_each_channel(c)
+    {
+      aa[c] = d->a[1] * compensate_p;
+      bb[c] = d->b[1];
+    }
+  }
+
+  if(!d->use_new_vst)
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_precondition", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(aa), SLARG(sigma2));
+  else if(d->wavelet_color_mode == MODE_RGB)
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_precondition_v2", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(aa), SLARG(p), SLARG(bb), SLARG(wb));
+  else
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_precondition_Y0U0V0", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(aa), SLARG(p), SLARG(bb), SLBUF(toY0U0V0, sizeof(toY0U0V0)));
+  if(err) goto error;
+
+  dt_slang_gpu_image_t *dev_buf1 = dev_out;
+  dt_slang_gpu_image_t *dev_buf2 = dev_tmp;
+
+  /* decompose image into detail scales and coarse */
+  for(int s = 0; s < max_scale; s++)
+  {
+    const float sigma = 1.0f;
+    const float varf = sqrtf(2.0f + 2.0f * 4.0f * 4.0f + 6.0f * 6.0f) / 16.0f; // about 0.5
+    const float sigma_band = powf(varf, s) * sigma;
+    const float inv_sigma2 = 1.0f / (sigma_band * sigma_band);
+
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_decompose", width, height,
+                                   SLIMG_DEV(dev_buf1), SLIMG_DEV(dev_buf2), SLIMG_DEV(dev_detail[s]),
+                                   SLARG(width), SLARG(height), SLARG(s), SLARG(inv_sigma2),
+                                   SLBUF(mm, sizeof(mm)));
+    if(err) goto error;
+
+    dt_slang_gpu_image_t *dev_buf3 = dev_buf2;
+    dev_buf2 = dev_buf1;
+    dev_buf1 = dev_buf3;
+  }
+
+  /* now synthesize again */
+  for(int s = max_scale - 1; s >= 0; s--)
+  {
+    // variance stabilizing transform maps sigma to unity.
+    const float sigma = 1.0f;
+    // it is then transformed by wavelet scales via the 5 tap a-trous filter:
+    const float varf = sqrtf(2.0f + 2.0f * 4.0f * 4.0f + 6.0f * 6.0f) / 16.0f; // about 0.5
+    const float sigma_band = powf(varf, s) * sigma;
+
+    // determine thrs as bayesshrink
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_reduce_first", nbx, nby,
+                                   SLIMG_DEV(dev_detail[s]), SLARG(width), SLARG(height), SLBUF_DEV(dev_m));
+    if(!err) err = dt_slang_gpu_buffer_read(dev_m, sumsum, sizeof(float) * 4 * bufsize);
+    if(err) goto error;
+
+    // the OpenCL path adds up 64 partial sums in float; the many block sums
+    // here keep their precision in double
+    double sum[4] = { 0.0 };
+    for(size_t k = 0; k < bufsize; k++)
+      for_four_channels(c) sum[c] += sumsum[4 * k + c];
+    const dt_aligned_pixel_t sum_y2 = { sum[0], sum[1], sum[2], sum[3] };
+
+    const float sb2 = sigma_band * sigma_band;
+    const dt_aligned_pixel_t var_y = { sum_y2[0] / (npixels - 1.0f),
+                                       sum_y2[1] / (npixels - 1.0f),
+                                       sum_y2[2] / (npixels - 1.0f),
+                                       0.0f };
+
+    const dt_aligned_pixel_t std_x = { sqrtf(MAX(1e-6f, var_y[0] - sb2)),
+                                       sqrtf(MAX(1e-6f, var_y[1] - sb2)),
+                                       sqrtf(MAX(1e-6f, var_y[2] - sb2)),
+                                       1.0f };
+    // add 8.0 here because it seemed a little weak
+    dt_aligned_pixel_t adjt = { 8.0f, 8.0f, 8.0f, 0.0f };
+
+    const int offset_scale = DT_IOP_DENOISE_PROFILE_BANDS - max_scale;
+    const int band_index = DT_IOP_DENOISE_PROFILE_BANDS - (s + offset_scale + 1);
+
+    if(d->wavelet_color_mode == MODE_RGB)
+    {
+      // see process_wavelets_cl() for the band index
+      float band_force_exp_2 = d->force[DT_DENOISE_PROFILE_ALL][band_index];
+      band_force_exp_2 *= band_force_exp_2;
+      band_force_exp_2 *= 4;
+      for_each_channel(ch)
+      {
+        adjt[ch] *= band_force_exp_2;
+      }
+      band_force_exp_2 = d->force[DT_DENOISE_PROFILE_R][band_index];
+      band_force_exp_2 *= band_force_exp_2;
+      band_force_exp_2 *= 4;
+      adjt[0] *= band_force_exp_2;
+      band_force_exp_2 = d->force[DT_DENOISE_PROFILE_G][band_index];
+      band_force_exp_2 *= band_force_exp_2;
+      band_force_exp_2 *= 4;
+      adjt[1] *= band_force_exp_2;
+      band_force_exp_2 = d->force[DT_DENOISE_PROFILE_B][band_index];
+      band_force_exp_2 *= band_force_exp_2;
+      band_force_exp_2 *= 4;
+      adjt[2] *= band_force_exp_2;
+    }
+    else
+    {
+      float band_force_exp_2 = d->force[DT_DENOISE_PROFILE_Y0][band_index];
+      band_force_exp_2 *= band_force_exp_2;
+      band_force_exp_2 *= 4;
+      adjt[0] *= band_force_exp_2;
+      band_force_exp_2 = d->force[DT_DENOISE_PROFILE_U0V0][band_index];
+      band_force_exp_2 *= band_force_exp_2;
+      band_force_exp_2 *= 4;
+      adjt[1] *= band_force_exp_2;
+      adjt[2] *= band_force_exp_2;
+    }
+
+    const dt_aligned_pixel_t thrs = { adjt[0] * sb2 / std_x[0],
+                                      adjt[1] * sb2 / std_x[1],
+                                      adjt[2] * sb2 / std_x[2],
+                                      0.0f };
+
+    const dt_aligned_pixel_t boost = { 1.0f, 1.0f, 1.0f, 1.0f };
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_synthesize", width, height,
+                                   SLIMG_DEV(dev_buf1), SLIMG_DEV(dev_detail[s]), SLIMG_DEV(dev_buf2),
+                                   SLARG(width), SLARG(height), SLARG(thrs), SLARG(boost));
+    if(err) goto error;
+
+    dt_slang_gpu_image_t *dev_buf3 = dev_buf2;
+    dev_buf2 = dev_buf1;
+    dev_buf1 = dev_buf3;
+  }
+
+  // the backtransform reads dev_tmp and writes dev_out, so the last
+  // synthesis has to end up in dev_tmp
+  if(dev_buf1 != dev_tmp)
+  {
+    err = _copy_slang(dev_buf1, dev_tmp, width, height);
+    if(err) goto error;
+  }
+
+  if(!d->use_new_vst)
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_backtransform", width, height,
+                                   SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(aa), SLARG(sigma2));
+  else if(d->wavelet_color_mode == MODE_RGB)
+  {
+    const float bias = d->bias - 0.5 * logf(scale);
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_backtransform_v2", width, height,
+                                   SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(aa), SLARG(p), SLARG(bb), SLARG(bias), SLARG(wb));
+  }
+  else
+  {
+    const float bias = d->bias - 0.5 * logf(scale);
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_backtransform_Y0U0V0", width, height,
+                                   SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(aa), SLARG(p), SLARG(bb), SLARG(bias), SLARG(wb),
+                                   SLBUF(toRGB, sizeof(toRGB)));
+  }
+
+error:
+  dt_slang_gpu_buffer_free(dev_m);
+  dt_slang_gpu_image_free(dev_tmp);
+  for(int k = 0; k < max_scale; k++)
+    dt_slang_gpu_image_free(dev_detail[k]);
+  dt_free_align(sumsum);
+  return err;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_denoiseprofile_data_t *d = piece->data;
+
+  if(d->mode == MODE_NLMEANS || d->mode == MODE_NLMEANS_AUTO)
+    return !process_nlmeans_slang(self, piece, dev_in, dev_out, roi_in, roi_out);
+  else if(d->mode == MODE_WAVELETS || d->mode == MODE_WAVELETS_AUTO)
+    return !process_wavelets_slang(self, piece, dev_in, dev_out, roi_in, roi_out);
+
+  // the variance computation only runs on the CPU
+  return FALSE;
+}
+#endif
 
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
