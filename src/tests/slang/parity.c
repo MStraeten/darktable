@@ -1294,6 +1294,117 @@ static int make_tests(test_t *t)
 #undef CE_BUF
   }
 
+  // tone equalizer, on positive luminances spread over the [-9; 0] EV range
+  // the module works in, and on guided filter terms derived from them
+  {
+    enum { TE_DW = W / 4, TE_DH = H / 4 };
+    static float te_lum[W * H], te_mask[W * H], te_packed[4 * W * H], te_ab[2 * W * H];
+    static float te_av4[4 * TE_DW * TE_DH], te_av2[2 * TE_DW * TE_DH];
+    for(int k = 0; k < W * H; k++)
+    {
+      const float *p = image_in + 4 * k;
+      te_lum[k] = exp2f(-9.0f * fminf(fmaxf(p[0], 0.0f), 1.0f));
+      te_mask[k] = exp2f(-9.0f * fminf(fmaxf(p[1], 0.0f), 1.0f));
+      const float g = te_lum[k], m = te_mask[k];
+      te_packed[4 * k] = g;
+      te_packed[4 * k + 1] = m;
+      te_packed[4 * k + 2] = g * g * (1.0f + 0.5f * fabsf(p[2]));
+      te_packed[4 * k + 3] = g * m * (1.0f + 0.2f * (p[3] - 0.5f));
+      te_ab[2 * k] = 0.5f + p[2];
+      te_ab[2 * k + 1] = 0.1f * (p[3] - 0.5f);
+    }
+    for(int k = 0; k < TE_DW * TE_DH; k++)
+    {
+      const float g = te_lum[k], m = te_mask[k];
+      te_av4[4 * k] = g;
+      te_av4[4 * k + 1] = 0.1f * g * g * fabsf(image_in[4 * k + 2]);
+      te_av4[4 * k + 2] = m;
+      te_av4[4 * k + 3] = 0.05f * g * m * (image_in[4 * k + 3] - 0.5f);
+      te_av2[2 * k] = g;
+      te_av2[2 * k + 1] = 0.1f * g * g * fabsf(image_in[4 * k + 2]);
+    }
+    const size_t s1 = sizeof(float) * W * H, s2 = 2 * s1, s4 = 4 * s1;
+    const size_t ds2 = 2 * sizeof(float) * TE_DW * TE_DH, ds4 = 2 * ds2;
+
+    static const char *te_methods[7] = { "luminance_mask mean", "luminance_mask lightness", "luminance_mask value",
+                                         "luminance_mask norm1", "luminance_mask norm2",
+                                         "luminance_mask norm power", "luminance_mask geomean" };
+    for(int m = 0; m < 7; m++)
+      TEST(te_methods[m], "toneequal", "toneequal_luminance_mask",
+           IMG_IN("in", image_in), BUFFER_OUT("luminance", NULL, s1), INT("width", W), INT("height", H),
+           INT("method", m), FLOAT("exposure_boost", 1.3f), FLOAT("fulcrum", m & 1 ? 0.1845f : 0.0f),
+           FLOAT("contrast_boost", m & 1 ? 1.4f : 1.0f));
+    TEST_GRID("toneequal_apply", "toneequal", "toneequal_apply", 0.0, W - 8, H - 6,
+              IMG_IN("in", image_in), BUFFER("luminance", te_lum, s1), IMG_OUT("out"), INT("width", W - 8),
+              INT("height", H - 6), INT("in_width", W), INT("offset_x", 3), INT("offset_y", 2),
+              FLOAT4("factors_low", 1.2f, 0.9f, 1.5f, 0.7f), FLOAT4("factors_high", 1.1f, 1.0f, 0.8f, 1.9f),
+              FLOAT("gauss_denom", 0.5f));
+    TEST_GRID("toneequal_display_mask", "toneequal", "toneequal_display_mask", 0.0, W - 8, H - 6,
+              IMG_IN("in", image_in), BUFFER("luminance", te_lum, s1), IMG_OUT("out"), INT("width", W - 8),
+              INT("height", H - 6), INT("in_width", W), INT("offset_x", 3), INT("offset_y", 2));
+    static const float te_sampling[3] = { 0.0f, 1.0f, 0.5f };
+    static const char *te_quantize[3] = { "toneequal_quantize off", "toneequal_quantize 1 EV",
+                                          "toneequal_quantize 0.5 EV" };
+    for(int q = 0; q < 3; q++)
+      TEST(te_quantize[q], "toneequal", "toneequal_quantize",
+           BUFFER("in", te_lum, s1), BUFFER_OUT("out", NULL, s1), INT("width", W), INT("height", H),
+           FLOAT("sampling", te_sampling[q]), FLOAT("clip_min", exp2f(-14.0f)), FLOAT("clip_max", 4.0f));
+
+    // a small radius, and one wider than half the image to reach the branch
+    // that can neither add nor remove values
+    static const int te_radius[2] = { 5, 300 };
+    static char te_box[2][4][48];
+    static const char *te_box_kernels[4] = { "toneequal_box_mean_x_2c", "toneequal_box_mean_y_2c",
+                                             "toneequal_box_mean_x_4c", "toneequal_box_mean_y_4c" };
+    for(int r = 0; r < 2; r++)
+      for(int b = 0; b < 4; b++)
+      {
+        snprintf(te_box[r][b], sizeof(te_box[r][b]), "%s r%d", te_box_kernels[b], te_radius[r]);
+        const int is_y = b & 1;
+        const size_t sz = b < 2 ? s2 : s4;
+        TEST_GRID(te_box[r][b], "toneequal", te_box_kernels[b], 1e-5, is_y ? W : H, 1,
+                  BUFFER("input", b < 2 ? te_ab : te_packed, sz), BUFFER_OUT("output", NULL, sz),
+                  INT("width", W), INT("height", H), INT("radius", te_radius[r]));
+      }
+
+    TEST("toneequal_gf_pack", "toneequal", "toneequal_gf_pack",
+         BUFFER("guide", te_lum, s1), BUFFER("mask", te_mask, s1), BUFFER_OUT("packed", NULL, s4),
+         INT("width", W), INT("height", H));
+    TEST("toneequal_gf_ab", "toneequal", "toneequal_gf_ab",
+         BUFFER("packed", te_packed, s4), BUFFER_OUT("ab", NULL, s2), INT("width", W), INT("height", H),
+         FLOAT("feathering", 0.05f));
+    for(int f = 0; f < 2; f++)
+    {
+      TEST(f ? "toneequal_gf_blend geomean" : "toneequal_gf_blend", "toneequal", "toneequal_gf_blend",
+           BUFFER_OUT("image", te_lum, s1), BUFFER("ab", te_ab, s2), INT("width", W), INT("height", H),
+           INT("filter", f));
+      TEST(f ? "toneequal_gf_blend_upsample geomean" : "toneequal_gf_blend_upsample", "toneequal",
+           "toneequal_gf_blend_upsample",
+           BUFFER_OUT("image", te_lum, s1), INT("width", W), INT("height", H), BUFFER("ds_ab", te_ab, ds2),
+           INT("ds_width", TE_DW), INT("ds_height", TE_DH), INT("filter", f));
+    }
+    TEST("toneequal_eigf_pack_4c", "toneequal", "toneequal_eigf_pack_4c",
+         BUFFER("guide", te_lum, s1), BUFFER("mask", te_mask, s1), BUFFER_OUT("packed", NULL, s4),
+         INT("width", W), INT("height", H));
+    TEST("toneequal_eigf_finish_4c", "toneequal", "toneequal_eigf_finish_4c",
+         BUFFER_OUT("av", te_packed, s4), INT("width", W), INT("height", H));
+    TEST("toneequal_eigf_pack_2c", "toneequal", "toneequal_eigf_pack_2c",
+         BUFFER("guide", te_lum, s1), BUFFER_OUT("packed", NULL, s2), INT("width", W), INT("height", H));
+    TEST("toneequal_eigf_finish_2c", "toneequal", "toneequal_eigf_finish_2c",
+         BUFFER_OUT("av", te_packed, s2), INT("width", W), INT("height", H));
+    for(int f = 0; f < 2; f++)
+    {
+      TEST_TOL(f ? "toneequal_eigf_blend geomean" : "toneequal_eigf_blend", "toneequal", "toneequal_eigf_blend",
+               1e-4, BUFFER_OUT("image", te_lum, s1), BUFFER("mask", te_mask, s1), INT("width", W),
+               INT("height", H), BUFFER("ds_av", te_av4, ds4), INT("ds_width", TE_DW), INT("ds_height", TE_DH),
+               INT("filter", f), FLOAT("feathering", 0.05f));
+      TEST_TOL(f ? "toneequal_eigf_blend_no_mask geomean" : "toneequal_eigf_blend_no_mask", "toneequal",
+               "toneequal_eigf_blend_no_mask", 1e-4,
+               BUFFER_OUT("image", te_lum, s1), INT("width", W), INT("height", H), BUFFER("ds_av", te_av2, ds2),
+               INT("ds_width", TE_DW), INT("ds_height", TE_DH), INT("filter", f), FLOAT("feathering", 0.05f));
+    }
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
