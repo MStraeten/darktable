@@ -756,3 +756,422 @@ void u16_to_float(uint3 gid : SV_DispatchThreadID,
   const uint v = (k & 1) != 0 ? pair >> 16 : pair & 0xffff;
   out.write(int2(x, y), float4(float(v)));
 }
+
+// ---------------------------------------------------------------------------
+// lens correction
+
+float interpolation_func_bicubic(float t)
+{
+  t = abs(t);
+  return (t >= 2.0f) ? 0.0f : ((t > 1.0f) ? (0.5f * (t * (-t * t + 5.0f * t - 8.0f) + 4.0f)) : (0.5f * (t * (3.0f * t * t - 5.0f * t) + 2.0f)));
+}
+
+static const float DT_LANCZOS_EPSILON = 1e-9f;
+
+// keep in sync with the copy in src/common/math.h
+float sinf_fast(float t)
+{
+  const float a = 4.0f / (M_PI_F * M_PI_F);
+  const float p = 0.225f;
+
+  t = a * t * (M_PI_F - abs(t));
+
+  return p * (t * abs(t) - t) + t;
+}
+
+float interpolation_func_lanczos(float width, float t)
+{
+  // a value for sinf(pi.t) in [-pi pi] for which the value will be correct
+  const int a = int(t);
+  const float r = t - float(a);
+
+  // the correct sign for sinf(pi.r)
+  const float sign = asfloat(uint((a & 1) << 31) | 0x3f800000u);
+
+  return (DT_LANCZOS_EPSILON + width * sign * sinf_fast(M_PI_F * r) * sinf_fast(M_PI_F * t / width))
+         / (DT_LANCZOS_EPSILON + M_PI_F * M_PI_F * t * t);
+}
+
+// the taps of the warp interpolators, see compute_upsampling_taps() in ../basic.cl.
+// Each is computed four at a time, so 3 wide filters fill all eight.
+static const int MAX_KERNEL_REQ = 8;
+
+float maketaps_bilinear(out float taps[MAX_KERNEL_REQ], const int num_taps, const float first_tap, const float interval)
+{
+  taps = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+  float4 vt = first_tap + float4(0.0f, 1.0f, 2.0f, 3.0f) * interval;
+  const int runs = (num_taps + 3) / 4;
+  for(int i = 0; i < runs; i++)
+  {
+    for(int c = 0; c < 4; c++)
+      taps[4 * i + c] = 1.0f - (vt[c] < 0.0f ? -vt[c] : vt[c]);
+    vt += 4.0f * interval;
+  }
+  return 1.0f; // the kernel norm is 1 by construction
+}
+
+float maketaps_bicubic(out float taps[MAX_KERNEL_REQ], const int num_taps, const float first_tap, const float interval)
+{
+  taps = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+  float4 vt = first_tap + float4(0.0f, 1.0f, 2.0f, 3.0f) * interval;
+  const int runs = (num_taps + 3) / 4;
+  for(int i = 0; i < runs; i++)
+  {
+    for(int c = 0; c < 4; c++)
+    {
+      const float vt_abs = vt[c] < 0.0f ? -vt[c] : vt[c];
+      const float t2 = vt[c] * vt[c];
+      const float t5 = 5.0f * vt_abs;
+      const float r12 = (vt_abs * (t5 - 8.0f - t2) + 4.0f) * 0.5f; // the value for 1 < t < 2
+      const float r01 = ((3.0f * t2 - t5) * vt_abs + 2.0f) * 0.5f;
+      taps[4 * i + c] = vt_abs <= 1.0f ? r01 : r12;
+    }
+    vt += 4.0f * interval;
+  }
+  return 1.0f; // the kernel norm is 1 by construction
+}
+
+float vector_sin(const float arg)
+{
+  const float a = 4.0f / (M_PI_F * M_PI_F);
+  const float abs_arg = (arg < 0.0f) ? -arg : arg;
+  const float scaled = a * arg * (M_PI_F - abs_arg);
+  const float abs_scaled = (scaled < 0.0f) ? -scaled : scaled;
+  return scaled * (0.225f * (abs_scaled - 1.0f) + 1.0f);
+}
+
+float maketaps_lanczos(out float taps[MAX_KERNEL_REQ], const int num_taps, const float width, const float first_tap, const float interval)
+{
+  taps = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+  float4 vt = first_tap + float4(0.0f, 1.0f, 2.0f, 3.0f) * interval;
+  const int runs = (num_taps + 3) / 4;
+  for(int i = 0; i < runs; i++)
+  {
+    for(int c = 0; c < 4; c++)
+    {
+      const int a = int(vt[c]);
+      const float r = vt[c] - float(a);
+      const float sign = (a & 1) != 0 ? -1.0f : 1.0f;
+      const float sine1 = vector_sin(M_PI_F * r);
+      const float sine2 = vector_sin(M_PI_F * vt[c] / width);
+      const float num = (width * sign * sine1 * sine2) + 1e-9f;
+      const float denom = (M_PI_F * M_PI_F * vt[c] * vt[c]) + 1e-9f;
+      taps[4 * i + c] = num / denom;
+    }
+    vt += 4.0f * interval;
+  }
+  float norm = 0.0f;
+  for(int i = 0; i < num_taps; i++)
+    norm += taps[i];
+  return norm;
+}
+
+float compute_upsampling_taps(const int itor_mode, const int itor_width, out float taps[MAX_KERNEL_REQ], const float tt)
+{
+  const int f = int(floor(tt)) - itor_width + 1;
+  const float t = tt - float(f);
+
+  if(itor_mode == 1)
+    return maketaps_bicubic(taps, 2 * itor_width, t, -1.0f);
+  else if(itor_mode == 2)
+    return maketaps_lanczos(taps, 2 * itor_width, float(itor_width), t, -1.0f);
+  else
+    return maketaps_bilinear(taps, 2 * itor_width, t, -1.0f);
+}
+
+float interpolation_compute_single(ImageIn in, const int itor_mode, const int itor_width,
+                                   const float x, const float y, const int width, const int height,
+                                   const int channel)
+{
+  float kernelh[MAX_KERNEL_REQ];
+  float kernelv[MAX_KERNEL_REQ];
+
+  int ix = int(x);
+  int iy = int(y);
+
+  float s = 0.0f;
+  if(ix >= 0 && iy >= 0 && ix < width && iy < height)
+  {
+    const float normh = compute_upsampling_taps(itor_mode, itor_width, kernelh, x);
+    const float normv = compute_upsampling_taps(itor_mode, itor_width, kernelv, y);
+
+    iy -= itor_width - 1;
+    ix -= itor_width - 1;
+
+    for(int i = 0; i < 2 * itor_width; i++)
+    {
+      float h = 0.0f;
+      for(int j = 0; j < 2 * itor_width; j++)
+        h += kernelh[j] * in.Areadpixel(clip_mirror(ix + j, width - 1), clip_mirror(iy + i, height - 1))[channel];
+      s += kernelv[i] * h;
+    }
+    s = s / (normh * normv);
+  }
+  return s;
+}
+
+// the OpenCL kernels check the coordinates of all three channels for NaN, and
+// let a pixel through only when all of its colors are finite
+bool _lens_coords_valid(StructuredBuffer<float> pi, const int k)
+{
+  bool valid = true;
+  for(int i = 0; i < 6; i++) valid = valid && isfinite(pi[k + i]);
+  return valid;
+}
+
+float4 _lens_bilinear(ImageIn in, const float rx, const float ry, const int iwidth, const int iheight)
+{
+  float4 px = float4(0.0f);
+  if(rx >= -1.0f && ry >= -1.0f && rx < float(iwidth) && ry < float(iheight))
+  {
+    const float fx = floor(rx);
+    const float fy = floor(ry);
+    const float dx = rx - fx;
+    const float dy = ry - fy;
+
+    const int x0 = clip_mirror(int(fx), iwidth - 1);
+    const int x1 = clip_mirror(int(fx) + 1, iwidth - 1);
+    const int y0 = clip_mirror(int(fy), iheight - 1);
+    const int y1 = clip_mirror(int(fy) + 1, iheight - 1);
+
+    px = (1.0f - dy) * ((1.0f - dx) * in.Areadpixel(x0, y0) + dx * in.Areadpixel(x1, y0))
+         + dy * ((1.0f - dx) * in.Areadpixel(x0, y1) + dx * in.Areadpixel(x1, y1));
+  }
+  return px;
+}
+
+// the weighted sum of the kwidth wide filter around (rx, ry), in all channels.
+// lanczos is 0 for bicubic. For the blue channel the bicubic OpenCL kernel
+// clamps the tap positions before it weighs them, which clamp_taps follows.
+float4 _lens_filter(ImageIn in, const float rx, const float ry, const int kwidth, const int lanczos,
+                    const bool clamp_taps, const int iwidth, const int iheight)
+{
+  const int tx = int(floor(rx));
+  const int ty = int(floor(ry));
+
+  float4 sum = float4(0.0f);
+  float weight = 0.0f;
+  for(int jj = 1 - kwidth; jj <= kwidth; jj++)
+    for(int ii = 1 - kwidth; ii <= kwidth; ii++)
+    {
+      int i = tx + ii;
+      int j = ty + jj;
+      if(clamp_taps)
+      {
+        i = clamp(i, 0, iwidth - 1);
+        j = clamp(j, 0, iheight - 1);
+      }
+
+      const float wx = lanczos != 0 ? interpolation_func_lanczos(float(lanczos), float(i) - rx)
+                                    : interpolation_func_bicubic(float(i) - rx);
+      const float wy = lanczos != 0 ? interpolation_func_lanczos(float(lanczos), float(j) - ry)
+                                    : interpolation_func_bicubic(float(j) - ry);
+      const float w = wx * wy;
+
+      sum += in.Areadpixel(clip_mirror(i, iwidth - 1), clip_mirror(j, iheight - 1)) * w;
+      weight += w;
+    }
+  return sum / weight;
+}
+
+// lens_distort_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl:
+// mode 0 is bilinear, otherwise kwidth and lanczos select the filter
+void _lens_distort(const uint3 gid, ImageIn in, ImageOut out, const int width, const int height,
+                   const int iwidth, const int iheight, const int roi_in_x, const int roi_in_y,
+                   StructuredBuffer<float> pi, const int do_nan_checks,
+                   const int bilinear, const int kwidth, const int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int k = y * 2 * 3 * width + 2 * 3 * x;
+
+  if(do_nan_checks != 0 && !_lens_coords_valid(pi, k))
+  {
+    out.write(int2(x, y), float4(0.0f));
+    return;
+  }
+
+  float4 pixel = float4(0.0f);
+  for(int c = 0; c < 3; c++)
+  {
+    const float rx = pi[k + 2 * c] - float(roi_in_x);
+    const float ry = pi[k + 2 * c + 1] - float(roi_in_y);
+    const float4 px = bilinear != 0 ? _lens_bilinear(in, rx, ry, iwidth, iheight)
+                                    : _lens_filter(in, rx, ry, kwidth, lanczos, c == 2 && lanczos == 0, iwidth, iheight);
+    // green carries the mask along
+    if(c == 0) pixel.x = px.x;
+    else if(c == 1) pixel.yw = px.yw;
+    else pixel.z = px.z;
+  }
+
+  pixel = all(isfinite(pixel.xyz)) ? pixel : float4(0.0f);
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_distort_bilinear(uint3 gid : SV_DispatchThreadID,
+                           uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                           uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                           uniform StructuredBuffer<float> pi, uniform int do_nan_checks)
+{
+  _lens_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks, 1, 1, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_distort_bicubic(uint3 gid : SV_DispatchThreadID,
+                          uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                          uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                          uniform StructuredBuffer<float> pi, uniform int do_nan_checks)
+{
+  _lens_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks, 0, 2, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_distort_lanczos2(uint3 gid : SV_DispatchThreadID,
+                           uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                           uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                           uniform StructuredBuffer<float> pi, uniform int do_nan_checks)
+{
+  _lens_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks, 0, 2, 2);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_distort_lanczos3(uint3 gid : SV_DispatchThreadID,
+                           uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                           uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                           uniform StructuredBuffer<float> pi, uniform int do_nan_checks)
+{
+  _lens_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks, 0, 3, 3);
+}
+
+float _calc_vignette_spline(const float radius, StructuredBuffer<float> spline, const int splinesize)
+{
+  if(radius >= 1.0f) return spline[splinesize - 1];
+
+  const float r = radius * float(splinesize - 1 - 1);
+  const int i = int(r);
+  const float frac = r - float(i);
+
+  const float p0 = spline[i];
+  return p0 + (spline[i + 1] - p0) * frac;
+}
+
+// yi starts at yoff, for the rows of md_lens_correction's cor_rgb
+float _interpolate_linear_spline(StructuredBuffer<float> xi, StructuredBuffer<float> yi, const int yoff,
+                                 const int ni, const float x)
+{
+  if(x < xi[0]) return yi[yoff];
+  for(int i = 1; i < ni; i++)
+  {
+    if(x >= xi[i - 1] && x <= xi[i])
+    {
+      const float dydx = (yi[yoff + i] - yi[yoff + i - 1]) / (xi[i] - xi[i - 1]);
+      return yi[yoff + i - 1] + (x - xi[i - 1]) * dydx;
+    }
+  }
+  return yi[yoff + ni - 1];
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void md_vignette(uint3 gid : SV_DispatchThreadID,
+                 uniform ImageIn in, uniform ImageOut out,
+                 uniform StructuredBuffer<float> knots_vig, uniform StructuredBuffer<float> vig,
+                 uniform int width, uniform int height, uniform float w2, uniform float h2, uniform float r,
+                 uniform int roix, uniform int roiy, uniform int knots)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float cx = (float(roix + x) - w2);
+  const float cy = (float(roiy + y) - h2);
+  const float spline = _interpolate_linear_spline(knots_vig, vig, 0, knots, r * dt_fast_hypot(cx, cy));
+
+  float4 pixel = in.Areadpixel(x, y);
+  const float mask = pixel.w;
+  pixel /= max(1e-4f, spline);
+  pixel.w = mask;
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_man_vignette(uint3 gid : SV_DispatchThreadID,
+                       uniform ImageIn in, uniform ImageOut out, uniform StructuredBuffer<float> spline,
+                       uniform int width, uniform int height, uniform float w2, uniform float h2,
+                       uniform int roix, uniform int roiy, uniform float inv_maxr, uniform float intensity,
+                       uniform int splinesize, uniform int vigmask)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float dx = (float(roix + x) - w2);
+  const float dy = (float(roiy + y) - h2);
+  const float radius = dt_fast_hypot(dx, dy) * inv_maxr;
+  const float val = max(0.0f, intensity * _calc_vignette_spline(radius, spline, splinesize));
+
+  float4 pixel = in.Areadpixel(x, y);
+  const float mask = pixel.w;
+  pixel *= (1.0f + val);
+  pixel.w = vigmask != 0 ? val : mask;
+  out.write(int2(x, y), pixel);
+}
+
+// pi holds four floats per pixel
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_vignette(uint3 gid : SV_DispatchThreadID,
+                   uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                   uniform StructuredBuffer<float> pi)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  const int k = 4 * (y * width + x);
+  const float3 scale = 2.0f * float3(pi[k], pi[k + 1], pi[k + 2]);
+  pixel.xyz *= scale;
+  out.write(int2(x, y), pixel);
+}
+
+static const int MAXKNOTS = 16;
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void md_lens_correction(uint3 gid : SV_DispatchThreadID,
+                        uniform ImageIn in, uniform ImageOut out,
+                        uniform StructuredBuffer<float> knots_dist, uniform StructuredBuffer<float> cor_rgb,
+                        uniform int owidth, uniform int oheight, uniform int iwidth, uniform int iheight,
+                        uniform float w2, uniform float h2, uniform float r, uniform float scale,
+                        uniform int roix, uniform int roiy, uniform int roox, uniform int rooy,
+                        uniform int knots, uniform int itor_mode, uniform int itor_width, uniform int pass_mode)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= owidth || y >= oheight) return;
+
+  const float cx = (float(roox + x) - w2) / scale;
+  const float cy = (float(rooy + y) - h2) / scale;
+  const float radius = r * dt_fast_hypot(cx, cy);
+  const float limw = float(iwidth) - 1.0f;
+  const float limh = float(iheight) - 1.0f;
+  float4 pixel;
+  for(int c = 0; c < 4; c++)
+  {
+    const int plane = (c == 3 || pass_mode != 0) ? 1 : c;
+    const float dr = _interpolate_linear_spline(knots_dist, cor_rgb, plane * MAXKNOTS, knots, radius);
+    const float xs = clamp(dr * cx + w2 - roix, 0.0f, limw);
+    const float ys = clamp(dr * cy + h2 - roiy, 0.0f, limh);
+    pixel[c] = interpolation_compute_single(in, itor_mode, itor_width, xs, ys, iwidth, iheight, c);
+  }
+  out.write(int2(x, y), pixel);
+}

@@ -1405,6 +1405,91 @@ static int make_tests(test_t *t)
     }
   }
 
+  // lens correction. The lensfun kernels sample at coordinates that lensfun
+  // computes on the host, one pair per color: a mild barrel distortion with
+  // some lateral chromatic aberration, which runs off the image at the edges,
+  // and with the nan checks a few invalid coordinates
+  {
+    static float ln_pi[2][2 * 3 * W * H];
+    for(int v = 0; v < 2; v++)
+      for(int y = 0; y < H; y++)
+        for(int x = 0; x < W; x++)
+        {
+          const float cx = x - 0.5f * W, cy = y - 0.5f * H;
+          const float r2 = (cx * cx + cy * cy) / (0.25f * W * W);
+          for(int c = 0; c < 3; c++)
+          {
+            const float k = 0.97f + 0.04f * r2 + 0.003f * (c - 1);
+            float *p = ln_pi[v] + 6 * (y * W + x) + 2 * c;
+            p[0] = 0.5f * W + k * cx + 7.0f;
+            p[1] = 0.5f * H + k * cy - 3.0f;
+            if(v == 1 && (x * 7 + y * 13) % 101 == 0) p[c & 1] = NAN;
+          }
+        }
+    static const char *ln_kernels[4] = { "lens_distort_bilinear", "lens_distort_bicubic",
+                                         "lens_distort_lanczos2", "lens_distort_lanczos3" };
+    static const char *ln_labels[2][4] = {
+      { "lens_distort_bilinear", "lens_distort_bicubic", "lens_distort_lanczos2", "lens_distort_lanczos3" },
+      { "lens_distort_bilinear nan", "lens_distort_bicubic nan", "lens_distort_lanczos2 nan", "lens_distort_lanczos3 nan" } };
+    // for blue the bicubic kernel weighs clamped taps, whose weights can
+    // nearly cancel: one pixel here lands 2.4e-5 away on lavapipe
+    for(int v = 0; v < 2; v++)
+      for(int d = 0; d < 4; d++)
+        TEST_TOL(ln_labels[v][d], "basic", ln_kernels[d], 1e-4,
+                 IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+                 INT("iwidth", W), INT("iheight", H), INT("roi_in_x", 7), INT("roi_in_y", -3),
+                 BUFFER("pi", ln_pi[v], sizeof(ln_pi[v])), INT("do_nan_checks", v));
+
+    // lensfun's vignetting correction factors, halved, four to a pixel
+    static float ln_vig[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++) ln_vig[k] = 0.5f + 0.3f * image_in[(k + 4 * 11) % (4 * W * H)];
+    TEST("lens_vignette", "basic", "lens_vignette",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         BUFFER("pi", ln_vig, sizeof(ln_vig)));
+
+    // the manual vignette spline, as _init_vignette_spline() makes it
+    static float ln_spline[512];
+    for(int i = 0; i < 512; i++) ln_spline[i] = 0.1f + 0.4f * tanhf(3.0f * (i / 511.0f - 0.5f));
+    for(int m = 0; m < 2; m++)
+      TEST(m ? "lens_man_vignette mask" : "lens_man_vignette", "basic", "lens_man_vignette",
+           IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("spline", ln_spline, sizeof(ln_spline)),
+           INT("width", W), INT("height", H), FLOAT("w2", 0.5f * W + 20.0f), FLOAT("h2", 0.5f * H + 10.0f),
+           INT("roix", 20), INT("roiy", 10), FLOAT("inv_maxr", 1.0f / hypotf(0.5f * W + 20.0f, 0.5f * H + 10.0f)),
+           FLOAT("intensity", 0.6f), INT("splinesize", 512), INT("vigmask", m));
+
+    // embedded metadata corrections: 9 knots of vignetting and distortion
+    static float md_knots[16], md_vig[16], md_cor[3 * 16];
+    for(int i = 0; i < 9; i++)
+    {
+      md_knots[i] = (i + 0.5f) / 8.0f;
+      md_vig[i] = 1.0f - 0.04f * i;
+      for(int c = 0; c < 3; c++) md_cor[16 * c + i] = 1.0f + 0.006f * i + 0.001f * (c - 1) * i;
+    }
+    const float md_w2 = 0.5f * W + 4.0f, md_h2 = 0.5f * H + 2.0f;
+    const float md_r = 1.0f / hypotf(md_w2, md_h2);
+    TEST("md_vignette", "basic", "md_vignette",
+         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("knots_vig", md_knots, sizeof(md_knots)),
+         BUFFER("vig", md_vig, sizeof(md_vig)), INT("width", W), INT("height", H),
+         FLOAT("w2", md_w2), FLOAT("h2", md_h2), FLOAT("r", md_r), INT("roix", 4), INT("roiy", 2), INT("knots", 9));
+    // the interpolator ids and widths of bilinear, bicubic, lanczos2 and lanczos3
+    static const int md_itor[4][2] = { { 0, 1 }, { 1, 2 }, { 2, 2 }, { 3, 3 } };
+    static const char *md_labels[4] = { "md_lens_correction bilinear", "md_lens_correction bicubic",
+                                        "md_lens_correction lanczos2", "md_lens_correction lanczos3 pass" };
+    // the sample positions come from hypot() and a division, which may each
+    // be an ulp off: at 260 pixels from the center that moves a sample by
+    // 3e-5 pixels, and on this noise image moves the result by up to 8e-5.
+    // OpenCL computes taps for lanczos3 with the bilinear formula, which at
+    // that width has negative taps and a small norm, so it amplifies more.
+    for(int d = 0; d < 4; d++)
+      TEST_TOL(md_labels[d], "basic", "md_lens_correction", 1e-3,
+               IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("knots_dist", md_knots, sizeof(md_knots)),
+               BUFFER("cor_rgb", md_cor, sizeof(md_cor)), INT("owidth", W), INT("oheight", H),
+               INT("iwidth", W), INT("iheight", H), FLOAT("w2", md_w2), FLOAT("h2", md_h2), FLOAT("r", md_r),
+               FLOAT("scale", 1.02f), INT("roix", 4), INT("roiy", 2), INT("roox", 6), INT("rooy", 3),
+               INT("knots", 9), INT("itor_mode", md_itor[d][0]), INT("itor_width", md_itor[d][1]),
+               INT("pass_mode", d == 3));
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
