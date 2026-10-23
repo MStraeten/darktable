@@ -66,6 +66,21 @@ cl_int dt_interpolate_bilinear_image_cl(const int devid,
                                         const int height_out);
 #endif
 
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+
+/** Like dt_interpolate_bilinear_cl(), for device buffers of the Slang
+ *  kernels. Returns 0 on success.
+ */
+int dt_interpolate_bilinear_slang(dt_slang_gpu_buffer_t *in,
+                                  const int width_in,
+                                  const int height_in,
+                                  dt_slang_gpu_buffer_t *out,
+                                  const int width_out,
+                                  const int height_out,
+                                  const int ch);
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

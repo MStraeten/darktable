@@ -1722,6 +1722,313 @@ error:
 
 #endif // OpenCL
 
+#ifdef HAVE_SLANG_GPU
+// the Slang counterparts of _prefilter_chromaticity_cl() and
+// _guide_with_chromaticity_cl(), on device buffers. They return 0 on success.
+static dt_slang_gpu_buffer_t *_init_covariance_slang(dt_slang_gpu_buffer_t *UV,
+                                                     const int width,
+                                                     const int height)
+{
+  dt_slang_gpu_buffer_t *covariance = dt_slang_gpu_buffer_new(4 * sizeof(float) * width * height, NULL);
+  if(covariance
+     && dt_slang_gpu_run_2d_args("colorequal", "init_covariance", width, height,
+                                 SLBUF_DEV(covariance), SLBUF_DEV(UV), SLARG(width), SLARG(height)))
+  {
+    dt_slang_gpu_buffer_free(covariance);
+    covariance = NULL;
+  }
+  return covariance;
+}
+
+static int _prefilter_chromaticity_slang(dt_slang_gpu_buffer_t *UV,
+                                         dt_slang_gpu_buffer_t *saturation,
+                                         const int width,
+                                         const int height,
+                                         const float sigma,
+                                         const float eps,
+                                         const float sat_shift)
+{
+  const float scaling = _get_scaling(sigma);
+  const float gsigma = MAX(0.2f, sigma / scaling);
+  const int ds_height = height / scaling;
+  const int ds_width = width / scaling;
+  const gboolean resized = width != ds_width || height != ds_height;
+
+  const size_t bsize = (size_t) width * height * sizeof(float);
+  const size_t ds_bsize = (size_t) ds_width * ds_height * sizeof(float);
+
+  dt_slang_gpu_buffer_t *ds_UV = resized ? dt_slang_gpu_buffer_new(2 * ds_bsize, NULL) : UV;
+  dt_slang_gpu_buffer_t *covariance = NULL;
+  dt_slang_gpu_buffer_t *ds_a = NULL;
+  dt_slang_gpu_buffer_t *ds_b = NULL;
+  dt_slang_gpu_buffer_t *a = NULL;
+  dt_slang_gpu_buffer_t *b = NULL;
+
+  int err = !ds_UV
+    || (resized && dt_interpolate_bilinear_slang(UV, width, height, ds_UV, ds_width, ds_height, 2));
+  if(!err)
+  {
+    covariance = _init_covariance_slang(ds_UV, ds_width, ds_height);
+    err = !covariance;
+  }
+  if(!err)
+    err = dt_gaussian_mean_blur_slang(ds_UV, ds_width, ds_height, 2, gsigma)
+       || dt_gaussian_mean_blur_slang(covariance, ds_width, ds_height, 4, gsigma)
+       || dt_slang_gpu_run_2d_args("colorequal", "finish_covariance", ds_width, ds_height,
+                                   SLBUF_DEV(covariance), SLBUF_DEV(ds_UV), SLARG(ds_width), SLARG(ds_height));
+  if(!err)
+  {
+    ds_a = dt_slang_gpu_buffer_new(4 * ds_bsize, NULL);
+    ds_b = dt_slang_gpu_buffer_new(2 * ds_bsize, NULL);
+    err = !ds_a || !ds_b
+       || dt_slang_gpu_run_2d_args("colorequal", "prepare_prefilter", ds_width, ds_height,
+                                   SLBUF_DEV(ds_UV), SLBUF_DEV(covariance), SLBUF_DEV(ds_a), SLBUF_DEV(ds_b),
+                                   SLARG(eps), SLARG(ds_width), SLARG(ds_height))
+       || dt_gaussian_mean_blur_slang(ds_a, ds_width, ds_height, 4, gsigma)
+       || dt_gaussian_mean_blur_slang(ds_b, ds_width, ds_height, 2, gsigma);
+  }
+  a = ds_a;
+  b = ds_b;
+  if(!err && resized)
+  {
+    a = dt_slang_gpu_buffer_new(4 * bsize, NULL);
+    b = dt_slang_gpu_buffer_new(2 * bsize, NULL);
+    err = !a || !b
+       || dt_interpolate_bilinear_slang(ds_a, ds_width, ds_height, a, width, height, 4)
+       || dt_interpolate_bilinear_slang(ds_b, ds_width, ds_height, b, width, height, 2);
+  }
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("colorequal", "apply_prefilter", width, height,
+                                   SLBUF_DEV(UV), SLBUF_DEV(saturation), SLBUF_DEV(a), SLBUF_DEV(b),
+                                   SLBUF(satweights, sizeof(satweights)), SLARG(sat_shift),
+                                   SLARG(width), SLARG(height));
+
+  if(resized)
+  {
+    dt_slang_gpu_buffer_free(ds_UV);
+    dt_slang_gpu_buffer_free(a);
+    dt_slang_gpu_buffer_free(b);
+  }
+  dt_slang_gpu_buffer_free(covariance);
+  dt_slang_gpu_buffer_free(ds_a);
+  dt_slang_gpu_buffer_free(ds_b);
+  return err;
+}
+
+static int _guide_with_chromaticity_slang(dt_slang_gpu_buffer_t *UV,
+                                          dt_slang_gpu_buffer_t *corrections,
+                                          dt_slang_gpu_buffer_t *saturation,
+                                          dt_slang_gpu_buffer_t *b_corrections,
+                                          dt_slang_gpu_buffer_t *scharr,
+                                          const int width,
+                                          const int height,
+                                          const float sigma,
+                                          const float eps,
+                                          const float bright_shift,
+                                          const float sat_shift)
+{
+  const float scaling = _get_scaling(sigma);
+  const float gsigma = MAX(0.2f, sigma / scaling);
+  const int ds_height = height / scaling;
+  const int ds_width = width / scaling;
+  const gboolean resized = width != ds_width || height != ds_height;
+
+  const size_t bsize = (size_t) width * height * sizeof(float);
+  const size_t ds_bsize = (size_t) ds_width * ds_height * sizeof(float);
+
+  dt_slang_gpu_buffer_t *ds_UV = UV;
+  dt_slang_gpu_buffer_t *ds_corrections = corrections;
+  dt_slang_gpu_buffer_t *ds_b_corrections = b_corrections;
+  dt_slang_gpu_buffer_t *covariance = NULL;
+  dt_slang_gpu_buffer_t *correlations = NULL;
+  dt_slang_gpu_buffer_t *ds_a = NULL;
+  dt_slang_gpu_buffer_t *ds_b = NULL;
+  dt_slang_gpu_buffer_t *a = NULL;
+  dt_slang_gpu_buffer_t *b = NULL;
+
+  int err = 0;
+  if(resized)
+  {
+    ds_UV = dt_slang_gpu_buffer_new(2 * ds_bsize, NULL);
+    ds_corrections = dt_slang_gpu_buffer_new(2 * ds_bsize, NULL);
+    ds_b_corrections = dt_slang_gpu_buffer_new(ds_bsize, NULL);
+    err = !ds_UV || !ds_corrections || !ds_b_corrections
+       || dt_interpolate_bilinear_slang(UV, width, height, ds_UV, ds_width, ds_height, 2)
+       || dt_interpolate_bilinear_slang(corrections, width, height, ds_corrections, ds_width, ds_height, 2)
+       || dt_interpolate_bilinear_slang(b_corrections, width, height, ds_b_corrections, ds_width, ds_height, 1);
+  }
+  if(!err)
+  {
+    covariance = _init_covariance_slang(ds_UV, ds_width, ds_height);
+    correlations = dt_slang_gpu_buffer_new(4 * ds_bsize, NULL);
+    err = !covariance || !correlations;
+  }
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("colorequal", "prepare_correlations", ds_width, ds_height,
+                                   SLBUF_DEV(ds_corrections), SLBUF_DEV(ds_b_corrections), SLBUF_DEV(ds_UV),
+                                   SLBUF_DEV(correlations), SLARG(ds_width), SLARG(ds_height))
+       || dt_gaussian_mean_blur_slang(ds_UV, ds_width, ds_height, 2, gsigma)
+       || dt_gaussian_mean_blur_slang(covariance, ds_width, ds_height, 4, gsigma)
+       || dt_gaussian_mean_blur_slang(ds_corrections, ds_width, ds_height, 2, gsigma)
+       || dt_gaussian_mean_blur_slang(ds_b_corrections, ds_width, ds_height, 1, 0.1f * gsigma)
+       || dt_gaussian_mean_blur_slang(correlations, ds_width, ds_height, 4, gsigma);
+  if(!err)
+  {
+    ds_a = dt_slang_gpu_buffer_new(4 * ds_bsize, NULL);
+    ds_b = dt_slang_gpu_buffer_new(2 * ds_bsize, NULL);
+    err = !ds_a || !ds_b
+       || dt_slang_gpu_run_2d_args("colorequal", "finish_correlations", ds_width, ds_height,
+                                   SLBUF_DEV(ds_corrections), SLBUF_DEV(ds_b_corrections), SLBUF_DEV(ds_UV),
+                                   SLBUF_DEV(correlations), SLBUF_DEV(covariance),
+                                   SLARG(ds_width), SLARG(ds_height))
+       || dt_slang_gpu_run_2d_args("colorequal", "final_guide", ds_width, ds_height,
+                                   SLBUF_DEV(covariance), SLBUF_DEV(correlations), SLBUF_DEV(ds_corrections),
+                                   SLBUF_DEV(ds_b_corrections), SLBUF_DEV(ds_UV), SLBUF_DEV(ds_a),
+                                   SLBUF_DEV(ds_b), SLARG(eps), SLARG(ds_width), SLARG(ds_height))
+       || dt_gaussian_mean_blur_slang(ds_a, ds_width, ds_height, 4, gsigma)
+       || dt_gaussian_mean_blur_slang(ds_b, ds_width, ds_height, 2, gsigma);
+  }
+  a = ds_a;
+  b = ds_b;
+  if(!err && resized)
+  {
+    a = dt_slang_gpu_buffer_new(4 * bsize, NULL);
+    b = dt_slang_gpu_buffer_new(2 * bsize, NULL);
+    err = !a || !b
+       || dt_interpolate_bilinear_slang(ds_a, ds_width, ds_height, a, width, height, 4)
+       || dt_interpolate_bilinear_slang(ds_b, ds_width, ds_height, b, width, height, 2);
+  }
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("colorequal", "apply_guided", width, height,
+                                   SLBUF_DEV(UV), SLBUF_DEV(saturation), SLBUF_DEV(scharr), SLBUF_DEV(a),
+                                   SLBUF_DEV(b), SLBUF_DEV(corrections), SLBUF_DEV(b_corrections),
+                                   SLBUF(satweights, sizeof(satweights)), SLARG(sat_shift), SLARG(bright_shift),
+                                   SLARG(width), SLARG(height));
+
+  if(resized)
+  {
+    dt_slang_gpu_buffer_free(ds_UV);
+    dt_slang_gpu_buffer_free(ds_corrections);
+    dt_slang_gpu_buffer_free(ds_b_corrections);
+    dt_slang_gpu_buffer_free(a);
+    dt_slang_gpu_buffer_free(b);
+  }
+  dt_slang_gpu_buffer_free(covariance);
+  dt_slang_gpu_buffer_free(correlations);
+  dt_slang_gpu_buffer_free(ds_a);
+  dt_slang_gpu_buffer_free(ds_b);
+  return err;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorequal_data_t *d = (dt_iop_colorequal_data_t *)piece->data;
+  const struct dt_iop_order_iccprofile_info_t *const work_profile
+      = dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  if(piece->colors != 4 || work_profile == NULL) return FALSE;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const size_t bsize = (size_t) width * height * sizeof(float);
+
+  const dt_iop_colorequal_gui_data_t *g = (dt_iop_colorequal_gui_data_t *)self->gui_data;
+  int mask_mode = 0;
+  if(self->dev->gui_attached && g && dt_pipe_is_full(piece->pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    mask_mode = g->mask_mode;
+    dt_iop_gui_leave_critical_section(self);
+  }
+  const int guiding = d->use_filter;
+  const gboolean run_fast = dt_pipe_is_fast(piece->pipe);
+
+  float white, sat_shift, max_brightness_shift, corr_max_brightness_shift, bright_shift, gradient_amp,
+        hue_sigma, par_sigma, sat_sigma, scharr_sigma;
+  _prepare_process(roi_in->scale / piece->iscale, d,
+    &white, &sat_shift, &max_brightness_shift, &corr_max_brightness_shift, &bright_shift, &gradient_amp,
+    &hue_sigma, &par_sigma, &sat_sigma, &scharr_sigma);
+
+  dt_colormatrix_t input_matrix;
+  dt_colormatrix_t output_matrix;
+  dt_colormatrix_mul(input_matrix, XYZ_D50_to_D65_CAT16, work_profile->matrix_in);
+  dt_colormatrix_mul(output_matrix, work_profile->matrix_out, XYZ_D65_to_D50_CAT16);
+
+  dt_slang_gpu_buffer_t *pixout = dt_slang_gpu_buffer_new(4 * bsize, NULL);
+  dt_slang_gpu_buffer_t *UV = dt_slang_gpu_buffer_new(2 * bsize, NULL);
+  dt_slang_gpu_buffer_t *corrections = dt_slang_gpu_buffer_new(2 * bsize, NULL);
+  dt_slang_gpu_buffer_t *b_corrections = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *Lscharr = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *saturation = dt_slang_gpu_buffer_new(bsize, NULL);
+
+  int err = !pixout || !UV || !corrections || !b_corrections || !Lscharr || !saturation
+    || dt_slang_gpu_run_2d_args("colorequal", "sample_input", width, height,
+         SLIMG_DEV(dev_in), SLBUF_DEV(saturation), SLBUF_DEV(Lscharr), SLBUF_DEV(UV), SLBUF_DEV(pixout),
+         SLBUF(input_matrix, 12 * sizeof(float)), SLARG(width), SLARG(height))
+    || dt_gaussian_mean_blur_slang(saturation, width, height, 1, sat_sigma);
+
+  // smoothen UV to avoid discontinuities in hue
+  if(!err && guiding && !run_fast)
+    err = _prefilter_chromaticity_slang(UV, saturation, width, height, hue_sigma, d->chroma_feathering,
+                                        sat_shift);
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("colorequal", "process_data", width, height,
+            SLBUF_DEV(UV), SLBUF_DEV(Lscharr), SLBUF_DEV(saturation), SLBUF_DEV(corrections),
+            SLBUF_DEV(b_corrections), SLBUF_DEV(pixout),
+            SLBUF(d->LUT_saturation, LUT_ELEM * sizeof(float)), SLBUF(d->LUT_hue, LUT_ELEM * sizeof(float)),
+            SLBUF(d->LUT_brightness, LUT_ELEM * sizeof(float)), SLARG(white), SLARG(gradient_amp),
+            SLARG(guiding), SLARG(width), SLARG(height));
+
+  // the preview pipe hands the uncorrected HSB of the input to the GUI, as
+  // process_cl() does
+  if(!err && self->gui_data && (piece->pipe->type & DT_DEV_PIXELPIPE_PREVIEW))
+  {
+    dt_iop_colorequal_gui_data_t *gui = (dt_iop_colorequal_gui_data_t *)self->gui_data;
+    float *host_pixout = dt_alloc_align_float(4 * (size_t)width * height);
+    if(host_pixout && !dt_slang_gpu_buffer_read(pixout, host_pixout, 4 * bsize))
+      dt_preview_data_store(&gui->pd, width, height, piece, _copy_HSB_cb, (void *)host_pixout);
+    dt_free_align(host_pixout);
+  }
+
+  if(!err && guiding && !run_fast)
+    err = dt_gaussian_mean_blur_slang(Lscharr, width, height, 1, scharr_sigma)
+       || _guide_with_chromaticity_slang(UV, corrections, saturation, b_corrections, Lscharr, width, height,
+                                         par_sigma, d->param_feathering, bright_shift, sat_shift);
+
+  if(!err && !mask_mode)
+    err = dt_slang_gpu_run_2d_args("colorequal", "write_output", width, height,
+            SLIMG_DEV(dev_out), SLBUF_DEV(pixout), SLBUF_DEV(corrections), SLBUF_DEV(b_corrections),
+            SLBUF(output_matrix, 12 * sizeof(float)), SLBUF(d->gamut_LUT, LUT_ELEM * sizeof(float)),
+            SLARG(white), SLARG(width), SLARG(height));
+  else if(!err)
+  {
+    piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+    const int mode = mask_mode - 1;
+    err = dt_slang_gpu_run_2d_args("colorequal", "write_visual", width, height,
+            SLIMG_DEV(dev_out), SLBUF_DEV(pixout), SLBUF_DEV(corrections), SLBUF_DEV(b_corrections),
+            SLBUF_DEV(saturation), SLBUF_DEV(Lscharr), SLBUF(satweights, sizeof(satweights)),
+            SLARG(bright_shift), SLARG(sat_shift), SLARG(white), SLARG(mode), SLARG(width), SLARG(height));
+    if(!err && (mode == BRIGHTNESS_GRAD || mode == SATURATION_GRAD))
+      err = dt_slang_gpu_run_2d_args("colorequal", "draw_weight", width, 1,
+              SLIMG_DEV(dev_out), SLBUF(satweights, sizeof(satweights)), SLARG(bright_shift), SLARG(sat_shift),
+              SLARG(mode), SLARG(width), SLARG(height));
+  }
+
+  dt_slang_gpu_buffer_free(pixout);
+  dt_slang_gpu_buffer_free(UV);
+  dt_slang_gpu_buffer_free(corrections);
+  dt_slang_gpu_buffer_free(b_corrections);
+  dt_slang_gpu_buffer_free(Lscharr);
+  dt_slang_gpu_buffer_free(saturation);
+  return !err;
+}
+#endif
+
 static inline float _get_hue_node(const int k, const float hue_shift)
 {
   // Get the angular coordinate of the k-th hue node, including hue shift

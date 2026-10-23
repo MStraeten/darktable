@@ -99,6 +99,24 @@ cl_int dt_interpolate_bilinear_image_cl(const int devid,
 
 #endif // HAVE_OPENCL
 
+#ifdef HAVE_SLANG_GPU
+int dt_interpolate_bilinear_slang(dt_slang_gpu_buffer_t *in,
+                                  const int width_in,
+                                  const int height_in,
+                                  dt_slang_gpu_buffer_t *out,
+                                  const int width_out,
+                                  const int height_out,
+                                  const int ch)
+{
+  const char *kernel = ch == 1 ? "bilinear1" : ch == 2 ? "bilinear2" : ch == 4 ? "bilinear4" : NULL;
+  if(!kernel) return 1;
+
+  return dt_slang_gpu_run_2d_args("bilinear", kernel, width_out, height_out,
+                                  SLBUF_DEV(in), SLARG(width_in), SLARG(height_in),
+                                  SLBUF_DEV(out), SLARG(width_out), SLARG(height_out));
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
