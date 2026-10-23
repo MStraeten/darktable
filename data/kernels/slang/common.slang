@@ -95,7 +95,9 @@ public float dt_fast_hypot(float x, float y) { return dt_hypot(x, y); }
 
 // a + b and a - b that the driver may not rearrange. slangc ignores precise
 // on the SPIR-V target, and without the NoContraction decoration lavapipe
-// simplifies the compensation term of Kahan_sum, (t2 - m) - t1, to 0
+// simplifies the compensation term of Kahan_sum, (t2 - m) - t1, to 0. Metal
+// keeps plain operations exact only because the libraries are built without
+// fast math, see CMakeLists.txt
 float _exact_add(float a, float b)
 {
   __target_switch

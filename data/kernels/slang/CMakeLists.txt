@@ -63,9 +63,12 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
     foreach(ENTRY IN ITEMS ${ENTRIES})
       string(REGEX REPLACE "^\\[\\[kernel\\]\\] void ([A-Za-z0-9_]+)\\(.*" "\\1" ENTRY "${ENTRY}")
       set(METALLIB "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.${ENTRY}.metallib")
+      # Metal compiles with fast math unless told otherwise, which lets it
+      # rearrange the exact additions of Kahan_sum() in common.slang and
+      # loosens results that the OpenCL kernels compute without it
       add_custom_command(
         OUTPUT  ${METALLIB}
-        COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -entry ${ENTRY} -stage compute -target metallib ${DT_SLANG_FLAGS} -o ${METALLIB}
+        COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -entry ${ENTRY} -stage compute -target metallib ${DT_SLANG_FLAGS} -Xmetal -fno-fast-math -o ${METALLIB}
         DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES}
         COMMENT "Compiling Slang kernel ${KERNAME}:${ENTRY} to a Metal library"
       )
