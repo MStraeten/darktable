@@ -17,6 +17,12 @@ CLI=$SRC/build/bin/darktable-cli
 [ -x "$CLI" ] || CLI=$(ls -d $SRC/build/bin/darktable-cli* 2>/dev/null | head -1)
 IMG=$SRC/src/tests/integration/images/mire1.cr2
 DE=$SRC/src/tests/integration/deltae
+# deltae is normally built by the integration test runner; build it here
+# the same way when nobody has run those tests yet
+if [ ! -x "$DE" ] && [ -f "$SRC/src/tests/integration/src/deltae.c" ]; then
+  libs=$(pkg-config --cflags --libs libpng 2>/dev/null)
+  ${CC:-cc} -O2 -std=c99 -o "$DE" "$SRC/src/tests/integration/src/deltae.c" $libs -lm 2>/dev/null
+fi
 OUT=$PWD/fullpipe-results
 rm -rf "$OUT"; mkdir -p "$OUT/in"
 for i in $(seq 1 $N); do ln -s "$IMG" "$OUT/in/img$i.cr2"; done
@@ -65,7 +71,9 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
   echo; echo "slang per-module time, last export (ms; GPU work is async, so trust the pipe total):"; echo
   awk '/pixel pipeline processing took/{last=buf; buf=""; next} /processed .* on /{buf=buf $0 "\n"} END{printf "%s", last}' "$OUT/slang.log" | sed -E 's/.*took ([0-9.]+) secs.*processed .([a-z0-9_]+). on ([A-Z]+).*/- \2 (\3): \1/' | awk '{printf "- %s %s %.0f\n", $2, $3, $4*1000}'
   echo; echo "max / avg dE on the first export:"; echo
+  [ -x "$DE" ] || echo "- not available: building src/tests/integration/src/deltae.c needs a C compiler and libpng"
   for pair in "cpu opencl" "cpu slang" "opencl slang"; do
+    [ -x "$DE" ] || break
     set -- $pair
     r=$("$DE" "$OUT/$1/img1.png" "$OUT/$2/img1.png" 2>&1 | grep -E 'Max dE|Avg dE' | awk '{print $NF}' | tr '\n' ' ')
     echo "- $1 vs $2: $r"
