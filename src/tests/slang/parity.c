@@ -1178,6 +1178,122 @@ static int make_tests(test_t *t)
     }
   }
 
+  // color equalizer, on plausible working data: chromaticities, saturations,
+  // positive definite covariances with a few singular ones, smooth LUTs over
+  // hue, and the HSB pixels write_output() maps back to RGB
+  {
+    enum { CE_SAT = 4096, CE_LUT = 512 };
+    static float ce_uv[2 * W * H], ce_sat[W * H], ce_lum[W * H], ce_cov[4 * W * H], ce_corr4[4 * W * H];
+    static float ce_a[4 * W * H], ce_b[2 * W * H], ce_corrections[2 * W * H], ce_bcorr[W * H];
+    static float ce_hsb[4 * W * H], ce_weights[2 * CE_SAT + 1];
+    static float ce_gamut[CE_LUT], ce_lut_hue[CE_LUT], ce_lut_sat[CE_LUT], ce_lut_bright[CE_LUT];
+    for(int k = 0; k < W * H; k++)
+    {
+      const float *p = image_in + 4 * k;
+      ce_uv[2 * k] = 0.6f * (p[0] - 0.5f);
+      ce_uv[2 * k + 1] = 0.6f * (p[1] - 0.5f);
+      ce_sat[k] = fminf(fmaxf(p[2], 0.0f), 1.0f);
+      ce_lum[k] = 0.05f + 0.9f * fminf(fmaxf(p[3], 0.0f), 1.0f);
+      const int singular = k % 97 == 0;
+      ce_cov[4 * k] = singular ? 0.0f : 0.02f + 0.1f * fabsf(p[0]);
+      ce_cov[4 * k + 1] = ce_cov[4 * k + 2] = singular ? 0.0f : 0.01f * (p[1] - 0.5f);
+      ce_cov[4 * k + 3] = singular ? 0.0f : 0.02f + 0.1f * fabsf(p[2]);
+      for(int c = 0; c < 4; c++)
+      {
+        ce_corr4[4 * k + c] = 0.02f * (p[(c + 1) % 4] - 0.5f);
+        ce_a[4 * k + c] = 0.5f * (p[(c + 2) % 4] - 0.5f);
+      }
+      ce_b[2 * k] = 0.1f * (p[3] - 0.5f);
+      ce_b[2 * k + 1] = 0.05f * (p[0] - 0.5f);
+      ce_corrections[2 * k] = 0.1f * (p[1] - 0.5f);
+      ce_corrections[2 * k + 1] = 1.0f + 0.4f * (p[2] - 0.5f);
+      ce_bcorr[k] = 0.1f * (p[3] - 0.5f);
+      ce_hsb[4 * k] = 6.2f * (p[0] - 0.5f);
+      ce_hsb[4 * k + 1] = 0.3f * fminf(fmaxf(p[1], 0.0f), 1.0f);
+      ce_hsb[4 * k + 2] = 0.1f + 0.7f * fminf(fmaxf(p[2], 0.0f), 1.0f);
+      ce_hsb[4 * k + 3] = p[3];
+    }
+    for(int i = 0; i <= 2 * CE_SAT; i++)
+    {
+      const float x = (float)i / (2 * CE_SAT);
+      ce_weights[i] = x * x * (3.0f - 2.0f * x);
+    }
+    for(int i = 0; i < CE_LUT; i++)
+    {
+      const float h = 6.2831853f * i / CE_LUT;
+      ce_gamut[i] = 0.25f + 0.1f * sinf(h);
+      ce_lut_hue[i] = 0.08f * sinf(2.0f * h);
+      ce_lut_sat[i] = 1.0f + 0.2f * cosf(h);
+      ce_lut_bright[i] = 1.0f + 0.1f * sinf(3.0f * h);
+    }
+    // linear Rec.709 to XYZ D65 and back, as rows of float4
+    static const float ce_to_xyz[12] = { 0.4124f, 0.3576f, 0.1805f, 0.0f, 0.2126f, 0.7152f, 0.0722f, 0.0f,
+                                         0.0193f, 0.1192f, 0.9505f, 0.0f };
+    static const float ce_from_xyz[12] = { 3.2406f, -1.5372f, -0.4986f, 0.0f, -0.9689f, 1.8758f, 0.0415f, 0.0f,
+                                           0.0557f, -0.2040f, 1.0570f, 0.0f };
+    const size_t s1 = sizeof(float) * W * H, s2 = 2 * s1, s4 = 4 * s1;
+#define CE_BUF(n, p, sz) BUFFER(n, p, sz)
+    TEST("init_covariance", "colorequal", "init_covariance",
+         BUFFER_OUT("covariance", NULL, s4), CE_BUF("uv", ce_uv, s2), INT("width", W), INT("height", H));
+    TEST("finish_covariance", "colorequal", "finish_covariance",
+         BUFFER_OUT("covariance", ce_cov, s4), CE_BUF("uv", ce_uv, s2), INT("width", W), INT("height", H));
+    TEST("prepare_prefilter", "colorequal", "prepare_prefilter",
+         CE_BUF("uv", ce_uv, s2), CE_BUF("covariance", ce_cov, s4), BUFFER_OUT("a", NULL, s4),
+         BUFFER_OUT("b", NULL, s2), FLOAT("eps", 0.01f), INT("width", W), INT("height", H));
+    TEST("apply_prefilter", "colorequal", "apply_prefilter",
+         BUFFER_OUT("uv", ce_uv, s2), CE_BUF("saturation", ce_sat, s1), CE_BUF("a", ce_a, s4),
+         CE_BUF("b", ce_b, s2), CE_BUF("weights", ce_weights, sizeof(ce_weights)), FLOAT("sat_shift", 0.1f),
+         INT("width", W), INT("height", H));
+    TEST("prepare_correlations", "colorequal", "prepare_correlations",
+         CE_BUF("corrections", ce_corrections, s2), CE_BUF("b_corrections", ce_bcorr, s1), CE_BUF("uv", ce_uv, s2),
+         BUFFER_OUT("correlations", NULL, s4), INT("width", W), INT("height", H));
+    TEST("finish_correlations", "colorequal", "finish_correlations",
+         CE_BUF("corrections", ce_corrections, s2), CE_BUF("b_corrections", ce_bcorr, s1), CE_BUF("uv", ce_uv, s2),
+         BUFFER_OUT("correlations", ce_corr4, s4), BUFFER_OUT("covariance", ce_cov, s4),
+         INT("width", W), INT("height", H));
+    TEST("final_guide", "colorequal", "final_guide",
+         CE_BUF("covariance", ce_cov, s4), CE_BUF("correlations", ce_corr4, s4),
+         CE_BUF("corrections", ce_corrections, s2), CE_BUF("b_corrections", ce_bcorr, s1), CE_BUF("uv", ce_uv, s2),
+         BUFFER_OUT("a", NULL, s4), BUFFER_OUT("b", NULL, s2), FLOAT("eps", 0.01f), INT("width", W), INT("height", H));
+    TEST("apply_guided", "colorequal", "apply_guided",
+         CE_BUF("uv", ce_uv, s2), CE_BUF("saturation", ce_sat, s1), CE_BUF("scharr", ce_lum, s1),
+         CE_BUF("a", ce_a, s4), CE_BUF("b", ce_b, s2), BUFFER_OUT("corrections", ce_corrections, s2),
+         BUFFER_OUT("b_corrections", ce_bcorr, s1), CE_BUF("weights", ce_weights, sizeof(ce_weights)),
+         FLOAT("sat_shift", 0.1f), FLOAT("bright_shift", -0.1f), INT("width", W), INT("height", H));
+    TEST("sample_input", "colorequal", "sample_input",
+         IMG_IN("dev_in", image_in), BUFFER_OUT("saturation", NULL, s1), BUFFER_OUT("lum", NULL, s1),
+         BUFFER_OUT("uv", NULL, s2), BUFFER_OUT("pix_out", NULL, s4), CE_BUF("mat", ce_to_xyz, sizeof(ce_to_xyz)),
+         INT("width", W), INT("height", H));
+    // the gamut mapping and the conversion back go through pow() and atan2()
+    TEST_TOL("write_output", "colorequal", "write_output", 1e-3,
+             IMG_OUT("dev_out"), BUFFER_OUT("pix_out", ce_hsb, s4), CE_BUF("corrections", ce_corrections, s2),
+             CE_BUF("b_corrections", ce_bcorr, s1), CE_BUF("mat", ce_from_xyz, sizeof(ce_from_xyz)),
+             CE_BUF("gamut_LUT", ce_gamut, sizeof(ce_gamut)), FLOAT("white", 1.2f), INT("width", W),
+             INT("height", H));
+    static const char *ce_visual[5] = { "write_visual hue", "write_visual saturation", "write_visual brightness",
+                                        "write_visual saturation grad", "write_visual brightness grad" };
+    static const int ce_modes[5] = { 0, 1, 2, 5, 6 };
+    for(int m = 0; m < 5; m++)
+      TEST(ce_visual[m], "colorequal", "write_visual",
+           IMG_OUT("dev_out"), CE_BUF("pixout", ce_hsb, s4), CE_BUF("corrections", ce_corrections, s2),
+           CE_BUF("b_corrections", ce_bcorr, s1), CE_BUF("saturation", ce_sat, s1), CE_BUF("scharr", ce_lum, s1),
+           CE_BUF("weights", ce_weights, sizeof(ce_weights)), FLOAT("bright_shift", -0.1f),
+           FLOAT("sat_shift", 0.1f), FLOAT("white", 1.2f), INT("mode", ce_modes[m]), INT("width", W),
+           INT("height", H));
+    TEST_GRID("draw_weight", "colorequal", "draw_weight", 0.0, W, 1,
+              IMG_OUT("dev_out"), CE_BUF("weights", ce_weights, sizeof(ce_weights)), FLOAT("bright_shift", -0.1f),
+              FLOAT("sat_shift", 0.1f), INT("mode", 6), INT("width", W), INT("height", H));
+    for(int guiding = 0; guiding < 2; guiding++)
+      TEST_TOL(guiding ? "process_data guided" : "process_data", "colorequal", "process_data", 1e-3,
+               CE_BUF("uv", ce_uv, s2), BUFFER_OUT("Lscharr", ce_lum, s1), CE_BUF("saturation", ce_sat, s1),
+               BUFFER_OUT("corrections", NULL, s2), BUFFER_OUT("b_corrections", NULL, s1),
+               BUFFER_OUT("pixout", NULL, s4), CE_BUF("LUT_saturation", ce_lut_sat, sizeof(ce_lut_sat)),
+               CE_BUF("LUT_hue", ce_lut_hue, sizeof(ce_lut_hue)),
+               CE_BUF("LUT_brightness", ce_lut_bright, sizeof(ce_lut_bright)), FLOAT("white", 1.2f),
+               FLOAT("gradient_amp", 4.0f), INT("guiding", guiding), INT("width", W), INT("height", H));
+#undef CE_BUF
+  }
+
 #undef TEST
 #undef TEST_TOL
 #undef TEST_GRID
