@@ -23,6 +23,7 @@
 #include "common/iop_profile.h"
 #include "common/math.h"
 #include "common/matrices.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -3070,6 +3071,57 @@ cleanup:
   return err;
 }
 #endif // HAVE_OPENCL
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_agx_data_t *d = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const dt_iop_order_iccprofile_info_t *const pipe_work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  const dt_iop_order_iccprofile_info_t *const base_profile =
+    _agx_get_base_profile(self->dev, pipe_work_profile, d->primaries_params.base_primaries);
+  if(!base_profile) return FALSE;
+
+  dt_colormatrix_t pipe_to_base, base_to_rendering, rendering_to_pipe, rendering_to_xyz;
+  dt_colormatrix_t pipe_to_base_transposed, base_to_rendering_transposed,
+    rendering_to_pipe_transposed, rendering_to_xyz_transposed;
+  _create_matrices(&d->primaries_params,
+                   pipe_work_profile,
+                   base_profile,
+                   rendering_to_xyz_transposed,
+                   pipe_to_base_transposed,
+                   base_to_rendering_transposed,
+                   rendering_to_pipe_transposed);
+  dt_colormatrix_transpose(pipe_to_base, pipe_to_base_transposed);
+  dt_colormatrix_transpose(base_to_rendering, base_to_rendering_transposed);
+  dt_colormatrix_transpose(rendering_to_pipe, rendering_to_pipe_transposed);
+  dt_colormatrix_transpose(rendering_to_xyz, rendering_to_xyz_transposed);
+
+  const int base_working_same_profile = pipe_work_profile == base_profile;
+  const tone_mapping_params_t tone_mapping_params = d->params.target_white_from_output
+    ? _pipe_tone_mapping_params(&d->params, piece->pipe->output_headroom)
+    : d->tone_mapping_params;
+
+  const int err = dt_slang_gpu_run_2d_args("agx", "kernel_agx", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+      SLARG(tone_mapping_params),
+      SLBUF(pipe_to_base, sizeof(pipe_to_base)),
+      SLBUF(base_to_rendering, sizeof(base_to_rendering)),
+      SLBUF(rendering_to_pipe, sizeof(rendering_to_pipe)),
+      SLBUF(rendering_to_xyz, sizeof(rendering_to_xyz)),
+      SLARG(base_working_same_profile));
+  return !err;
+}
+#endif
 
 
 // clang-format off
