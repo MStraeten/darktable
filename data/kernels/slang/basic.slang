@@ -1175,3 +1175,168 @@ void md_lens_correction(uint3 gid : SV_DispatchThreadID,
   }
   out.write(int2(x, y), pixel);
 }
+
+// the darkroom's clipping indicators
+
+static const int DT_CLIPPING_PREVIEW_GAMUT = 0;
+static const int DT_CLIPPING_PREVIEW_ANYRGB = 1;
+static const int DT_CLIPPING_PREVIEW_LUMINANCE = 2;
+static const int DT_CLIPPING_PREVIEW_SATURATION = 3;
+
+bool _overexposed_saturated(float4 pixel_tmp, float luminance, float upper)
+{
+  const float4 diff = pixel_tmp - float4(luminance);
+  const float4 saturation = sqrt(diff * diff / (float4(luminance * luminance) + pixel_tmp * pixel_tmp));
+  return saturation.x > upper || saturation.y > upper || saturation.z > upper
+      || pixel_tmp.x >= upper || pixel_tmp.y >= upper || pixel_tmp.z >= upper;
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void overexposed(uint3 gid : SV_DispatchThreadID,
+                 uniform ImageIn in, uniform ImageOut out, uniform ImageIn tmp,
+                 uniform int width, uniform int height, uniform float lower, uniform float upper,
+                 uniform float lower_color[4], uniform float upper_color[4],
+                 uniform StructuredBuffer<ProfileInfo> profile_info, uniform ImageIn lut,
+                 uniform int use_work_profile, uniform int mode)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.readpixel(x, y);
+  const float4 pixel_tmp = tmp.readpixel(x, y);
+  const float3 upper_rgb = float3(upper_color[0], upper_color[1], upper_color[2]);
+  const float3 lower_rgb = float3(lower_color[0], lower_color[1], lower_color[2]);
+
+  if(mode == DT_CLIPPING_PREVIEW_ANYRGB)
+  {
+    if(pixel_tmp.x >= upper || pixel_tmp.y >= upper || pixel_tmp.z >= upper)
+      pixel.xyz = upper_rgb;
+    else if(pixel_tmp.x <= lower && pixel_tmp.y <= lower && pixel_tmp.z <= lower)
+      pixel.xyz = lower_rgb;
+  }
+  else if(use_work_profile != 0
+          && (mode == DT_CLIPPING_PREVIEW_GAMUT || mode == DT_CLIPPING_PREVIEW_LUMINANCE
+              || mode == DT_CLIPPING_PREVIEW_SATURATION))
+  {
+    const ProfileInfo info = profile_info[0];
+    const float luminance = get_rgb_matrix_luminance(pixel, info, info.matrix_in, lut);
+
+    if(mode == DT_CLIPPING_PREVIEW_GAMUT)
+    {
+      if(luminance >= upper)
+        pixel.xyz = upper_rgb;
+      else if(luminance <= lower)
+        pixel.xyz = lower_rgb;
+      else if(_overexposed_saturated(pixel_tmp, luminance, upper))
+        pixel.xyz = upper_rgb;
+      else if(pixel_tmp.x <= lower && pixel_tmp.y <= lower && pixel_tmp.z <= lower)
+        pixel.xyz = lower_rgb;
+    }
+    else if(mode == DT_CLIPPING_PREVIEW_LUMINANCE)
+    {
+      if(luminance >= upper)
+        pixel.xyz = upper_rgb;
+      else if(luminance <= lower)
+        pixel.xyz = lower_rgb;
+    }
+    else if(luminance < upper && luminance > lower)
+    {
+      if(_overexposed_saturated(pixel_tmp, luminance, upper))
+        pixel.xyz = upper_rgb;
+      else if(pixel_tmp.x <= lower && pixel_tmp.y <= lower && pixel_tmp.z <= lower)
+        pixel.xyz = lower_rgb;
+    }
+  }
+
+  out.write(int2(x, y), pixel);
+}
+
+// the raw overexposed kernels only write the pixels they mark, over a copy
+// of the input. The raw data is uploaded as a buffer of uint16 pairs.
+uint _raw_u16(StructuredBuffer<uint> raw, int i)
+{
+  return (raw[i >> 1] >> uint((i & 1) * 16)) & 0xffffu;
+}
+
+// the raw pixel behind output pixel (x, y), and its CFA color, or -1 when the
+// pixel is outside the raw or below the threshold
+int _rawoverexposed_color(int x, int y, int width, StructuredBuffer<float> pi,
+                          StructuredBuffer<uint> raw, int raw_width, int raw_height,
+                          uint filters, StructuredBuffer<uint> xtrans, StructuredBuffer<uint> threshold)
+{
+  const int ppi = y * 2 * width + 2 * x;
+  const int raw_x = int(pi[ppi]);
+  const int raw_y = int(pi[ppi + 1]);
+  if(raw_x < 0 || raw_y < 0 || raw_x >= raw_width || raw_y >= raw_height) return -1;
+
+  const uint raw_pixel = _raw_u16(raw, raw_y * raw_width + raw_x);
+  const int c = fcol(raw_y, raw_x, filters, xtrans);
+  return raw_pixel < threshold[c] ? -1 : c;
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void rawoverexposed_mark_cfa(uint3 gid : SV_DispatchThreadID,
+                             uniform ImageIn in, uniform ImageOut out, uniform StructuredBuffer<float> pi,
+                             uniform int width, uniform int height,
+                             uniform StructuredBuffer<uint> raw, uniform int raw_width, uniform int raw_height,
+                             uniform uint filters, uniform StructuredBuffer<uint> xtrans,
+                             uniform StructuredBuffer<uint> threshold, uniform StructuredBuffer<float4> colors)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int c = _rawoverexposed_color(x, y, width, pi, raw, raw_width, raw_height, filters, xtrans, threshold);
+  if(c < 0) return;
+
+  float4 pixel = max(0.0f, in.Areadpixel(x, y));
+  pixel.xyz = colors[c & 3].xyz;
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void rawoverexposed_mark_solid(uint3 gid : SV_DispatchThreadID,
+                               uniform ImageIn in, uniform ImageOut out, uniform StructuredBuffer<float> pi,
+                               uniform int width, uniform int height,
+                               uniform StructuredBuffer<uint> raw, uniform int raw_width, uniform int raw_height,
+                               uniform uint filters, uniform StructuredBuffer<uint> xtrans,
+                               uniform StructuredBuffer<uint> threshold, uniform float solid_color[4])
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int c = _rawoverexposed_color(x, y, width, pi, raw, raw_width, raw_height, filters, xtrans, threshold);
+  if(c < 0) return;
+
+  float4 pixel = max(0.0f, in.Areadpixel(x, y));
+  pixel.xyz = float3(solid_color[0], solid_color[1], solid_color[2]);
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void rawoverexposed_falsecolor(uint3 gid : SV_DispatchThreadID,
+                               uniform ImageIn in, uniform ImageOut out, uniform StructuredBuffer<float> pi,
+                               uniform int width, uniform int height,
+                               uniform StructuredBuffer<uint> raw, uniform int raw_width, uniform int raw_height,
+                               uniform uint filters, uniform StructuredBuffer<uint> xtrans,
+                               uniform StructuredBuffer<uint> threshold)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int c = _rawoverexposed_color(x, y, width, pi, raw, raw_width, raw_height, filters, xtrans, threshold);
+  if(c < 0) return;
+
+  float4 pixel = max(0.0f, in.Areadpixel(x, y));
+  if(c == 2)      pixel.z = 0.0f;
+  else if(c == 1) pixel.y = 0.0f;
+  else if(c == 0) pixel.x = 0.0f;
+  out.write(int2(x, y), pixel);
+}

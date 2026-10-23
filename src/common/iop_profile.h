@@ -359,6 +359,18 @@ gboolean dt_ioppr_transform_image_colorspace_slang
    const dt_iop_colorspace_type_t cst_from,
    const dt_iop_colorspace_type_t cst_to,
    const dt_iop_order_iccprofile_info_t *const profile_info);
+
+/** converts between two RGB matrix profiles on the device, like
+ *  dt_ioppr_transform_image_colorspace_rgb_cl() does. Returns FALSE, having
+ *  done nothing, when either profile has no matrix. */
+gboolean dt_ioppr_transform_image_colorspace_rgb_slang
+  (struct dt_slang_gpu_image_t *dev_img_in,
+   struct dt_slang_gpu_image_t *dev_img_out,
+   const int width,
+   const int height,
+   const dt_iop_order_iccprofile_info_t *const profile_info_from,
+   const dt_iop_order_iccprofile_info_t *const profile_info_to,
+   const char *message);
 #endif
 
 /** the following must have the matrix_in and matrix_out generated */

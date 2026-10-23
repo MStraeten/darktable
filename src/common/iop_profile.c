@@ -1929,6 +1929,49 @@ gboolean dt_ioppr_transform_image_colorspace_slang(dt_iop_module_t *self,
              dt_get_lap_time(&start_time.clock), self->op, dt_iop_get_instance_id(self));
   return !err;
 }
+
+gboolean dt_ioppr_transform_image_colorspace_rgb_slang(dt_slang_gpu_image_t *dev_img_in,
+                                                       dt_slang_gpu_image_t *dev_img_out,
+                                                       const int width,
+                                                       const int height,
+                                                       const dt_iop_order_iccprofile_info_t *const profile_info_from,
+                                                       const dt_iop_order_iccprofile_info_t *const profile_info_to,
+                                                       const char *message)
+{
+  if(!profile_info_from || !profile_info_to
+     || !dt_is_valid_colormatrix(profile_info_from->matrix_in[0][0])
+     || !dt_is_valid_colormatrix(profile_info_from->matrix_out[0][0])
+     || !dt_is_valid_colormatrix(profile_info_to->matrix_in[0][0])
+     || !dt_is_valid_colormatrix(profile_info_to->matrix_out[0][0]))
+    return FALSE;
+
+  dt_times_t start_time = { 0 };
+  dt_get_perf_times(&start_time);
+
+  dt_colorspaces_iccprofile_info_slang_t info_from, info_to;
+  int lut_from_w = 0, lut_from_h = 0, lut_to_w = 0, lut_to_h = 0;
+  float *lut_from = dt_ioppr_build_iccprofile_params_slang(profile_info_from, &info_from, &lut_from_w, &lut_from_h);
+  float *lut_to = dt_ioppr_build_iccprofile_params_slang(profile_info_to, &info_to, &lut_to_w, &lut_to_h);
+
+  dt_colormatrix_t matrix;
+  dt_colormatrix_mul(matrix, profile_info_to->matrix_out, profile_info_from->matrix_in);
+  float matrix3x3[9];
+  pack_3xSSE_to_3x3(matrix, matrix3x3);
+
+  const int err = !lut_from || !lut_to
+    || dt_slang_gpu_run_2d_args("colorspaces", "colorspaces_transform_rgb_matrix_to_rgb", width, height,
+                                SLIMG_DEV(dev_img_in), SLIMG_DEV(dev_img_out), SLARG(width), SLARG(height),
+                                SLBUF(&info_from, sizeof(info_from)), SLIMG_IN(lut_from, lut_from_w, lut_from_h, 1),
+                                SLBUF(&info_to, sizeof(info_to)), SLIMG_IN(lut_to, lut_to_w, lut_to_h, 1),
+                                SLBUF(matrix3x3, sizeof(matrix3x3)));
+  free(lut_from);
+  free(lut_to);
+  if(!err)
+    dt_print(DT_DEBUG_PERF,
+             "[dt_ioppr_transform_image_colorspace_rgb_slang] RGB-->RGB took %.3f secs (%s)",
+             dt_get_lap_time(&start_time.clock), message ? message : "");
+  return !err;
+}
 #endif
 
 #undef DT_IOP_ORDER_PROFILE
