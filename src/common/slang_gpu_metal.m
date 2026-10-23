@@ -786,12 +786,26 @@ dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *ho
     if(buf)
     {
       // the buffer may still be in use by a pending kernel. A new one starts
-      // zeroed, a pooled one has to be cleared.
-      _finish();
-      if(host)
-        memcpy(buf->buffer.contents, host, size);
+      // zeroed, a pooled one has to be cleared. Clearing it on the queue
+      // orders the fill after those kernels without waiting for them: blurs
+      // take and return temporaries per pass, and a wait here stalled every one
+      id<MTLCommandBuffer> cb = host ? nil : [_mtl.queue commandBuffer];
+      id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+      if(blit)
+      {
+        [blit fillBuffer:buf->buffer range:NSMakeRange(0, size) value:0];
+        [blit endEncoding];
+        [cb commit];
+        _mtl.pending = cb;
+      }
       else
-        memset(buf->buffer.contents, 0, size);
+      {
+        _finish();
+        if(host)
+          memcpy(buf->buffer.contents, host, size);
+        else
+          memset(buf->buffer.contents, 0, size);
+      }
     }
     else if(!buf && size <= _mtl.dev.maxBufferLength)
     {
