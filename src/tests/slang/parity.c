@@ -73,6 +73,7 @@ typedef struct arg_t
   const void *data; // buffers, and the initial contents of ARG_BUFFER_OUT (zeros if NULL)
   size_t size;
   int bytes;        // ARG_BUFFER_OUT holds bytes, compared exactly
+  int ints;         // ARG_BUFFER_OUT holds int counts, compared as numbers
   int slang_only;   // a Slang parameter the OpenCL kernel does not have
 } arg_t;
 
@@ -352,6 +353,7 @@ static void markesteijn_hex(const uint8_t (*const xtrans)[6], signed char allhex
 #define RAW_OUT(n) { .kind = ARG_IMAGE_OUT, .name = n, .w = W, .h = H, .channels = 1 }
 #define BUFFER_OUT(n, ptr, sz) { .kind = ARG_BUFFER_OUT, .name = n, .data = ptr, .size = sz }
 #define BYTES_OUT(n, sz) { .kind = ARG_BUFFER_OUT, .name = n, .size = sz, .bytes = 1 }
+#define INTS_OUT(n, sz) { .kind = ARG_BUFFER_OUT, .name = n, .size = sz, .ints = 1 }
 #define LOCAL(n, sz) { .kind = ARG_LOCAL, .name = n, .size = sz }
 #define INT(n, val) { .kind = ARG_INT, .name = n, .i = val }
 #define FLOAT(n, val) { .kind = ARG_FLOAT, .name = n, .f = val }
@@ -1794,6 +1796,85 @@ static int make_tests(test_t *t)
 #undef CE_BUF
   }
 
+  // saturation curve, with both formulas, and with and without the guided filter masks
+  {
+    static const float sc_matrix_in[12] = { 0.31f, 0.58f, 0.11f, 0.0f, 0.18f, 0.71f, 0.11f, 0.0f,
+                                            0.04f, 0.16f, 0.80f, 0.0f };
+    static const float sc_matrix_out[12] = { 1.71f, -0.36f, -0.25f, 0.0f, -0.67f, 1.62f, 0.04f, 0.0f,
+                                             0.02f, -0.04f, 0.91f, 0.0f };
+    static float sc_gamut_lut[512], sc_sat_lut[256], sc_bri_lut[256];
+    for(int k = 0; k < 512; k++) sc_gamut_lut[k] = 0.6f + 0.3f * sinf(k * 0.0491f) + 0.05f * cosf(k * 0.31f);
+    for(int k = 0; k < 256; k++)
+    {
+      sc_sat_lut[k] = 0.5f + 0.35f * sinf(k * 0.021f);
+      sc_bri_lut[k] = 0.5f - 0.2f * sinf(k * 0.017f);
+    }
+    // masks in [0, 1], a filtered mask near the raw one, a noise confidence
+    // and a perceptual guide
+    static float *sc_mask, *sc_filtered, *sc_conf, *sc_guide;
+    sc_mask = malloc(sizeof(float) * W * H);
+    sc_filtered = malloc(sizeof(float) * W * H);
+    sc_conf = malloc(sizeof(float) * W * H);
+    sc_guide = malloc(sizeof(float) * 4 * W * H);
+    for(size_t k = 0; k < (size_t)W * H; k++)
+    {
+      sc_mask[k] = fminf(fmaxf(image_raw[k], 0.0f), 1.0f);
+      sc_filtered[k] = fminf(fmaxf(sc_mask[k] + 0.1f * (frand() - 0.5f), 0.0f), 1.0f);
+      sc_conf[k] = frand();
+    }
+    for(size_t k = 0; k < (size_t)4 * W * H; k++) sc_guide[k] = 0.5f * image_in[k] + 0.02f * frand();
+
+    // the JzAzBz error of pow() on Vulkan, as for color balance rgb above
+    static const double sc_tol[2] = { 1e-2, 5e-4 };
+    static const char *sc_names[2][6] = {
+      { "satcurvergb jzazbz", "satcurvergb jzazbz masks", "satcurve_histogram jzazbz", "satcurve_mask jzazbz",
+        "satcurve_prepare_scalar_mask jzazbz" },
+      { "satcurvergb dtucs", "satcurvergb dtucs masks", "satcurve_histogram dtucs", "satcurve_mask dtucs",
+        "satcurve_prepare_scalar_mask dtucs" }
+    };
+    for(int formula = 0; formula < 2; formula++)
+    {
+      for(int use_mask = 0; use_mask < 2; use_mask++)
+        TEST_TOL(sc_names[formula][use_mask], "satcurve", "satcurvergb", sc_tol[formula],
+             IMG_IN("in", image_in), IMG_OUT("out"), RAW_IN("sat_mask_in", sc_mask),
+             RAW_IN("bri_mask_in", sc_filtered), RAW_IN("noise_confidence", sc_conf), INT("use_mask", use_mask),
+             INT("width", W), INT("height", H), BUFFER("matrix_in", sc_matrix_in, sizeof(sc_matrix_in)),
+             BUFFER("matrix_out", sc_matrix_out, sizeof(sc_matrix_out)),
+             BUFFER("sat_lut", sc_sat_lut, sizeof(sc_sat_lut)), BUFFER("bri_lut", sc_bri_lut, sizeof(sc_bri_lut)),
+             BUFFER("gamut_lut", sc_gamut_lut, sizeof(sc_gamut_lut)), INT("formula", formula),
+             FLOAT("L_white", 1.07f), FLOAT("noise_protection", 0.6f));
+      // float noise moves a few pixels into the next of the 256 bins, each
+      // holding about 530 of them. With JzAzBz that is up to 2 of the 30 in
+      // the sparse bins near zero saturation
+      TEST_TOL(sc_names[formula][2], "satcurve", "satcurve_histogram", formula == 0 ? 0.1 : 2e-2,
+           IMG_IN("in", image_in), INT("width", W), INT("height", H),
+           BUFFER("matrix_in", sc_matrix_in, sizeof(sc_matrix_in)),
+           BUFFER("gamut_lut", sc_gamut_lut, sizeof(sc_gamut_lut)), INT("formula", formula),
+           FLOAT("L_white", 1.07f), INTS_OUT("hist_bins", 256 * sizeof(int32_t)));
+      TEST_TOL(sc_names[formula][3], "satcurve", "satcurve_mask", sc_tol[formula],
+           IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+           BUFFER("matrix_in", sc_matrix_in, sizeof(sc_matrix_in)),
+           BUFFER("gamut_lut", sc_gamut_lut, sizeof(sc_gamut_lut)), INT("formula", formula),
+           FLOAT("L_white", 1.07f));
+      TEST_TOL(sc_names[formula][4], "satcurve", "satcurve_prepare_scalar_mask", sc_tol[formula],
+           IMG_IN("in", image_in), RAW_OUT("out"), INT("width", W), INT("height", H),
+           BUFFER("matrix_in", sc_matrix_in, sizeof(sc_matrix_in)),
+           BUFFER("gamut_lut", sc_gamut_lut, sizeof(sc_gamut_lut)), INT("formula", formula),
+           FLOAT("L_white", 1.07f));
+    }
+    TEST_TOL("satcurve_prepare_perceptual_guide", "satcurve", "satcurve_prepare_perceptual_guide", 5e-4,
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         BUFFER("matrix_in", sc_matrix_in, sizeof(sc_matrix_in)), FLOAT("L_white", 1.07f));
+    TEST("satcurve_prepare_filter_confidence", "satcurve", "satcurve_prepare_filter_confidence",
+         RAW_IN("raw", sc_mask), RAW_IN("filtered", sc_filtered), IMG_IN("guide", sc_guide), RAW_OUT("control"),
+         RAW_OUT("confidence"), INT("width", W), INT("height", H), FLOAT("protect_from", 0.05f),
+         FLOAT("protect_to", 0.3f));
+    TEST("satcurve_mask_from_control", "satcurve", "satcurve_mask_from_control",
+         RAW_IN("raw", sc_mask), RAW_IN("filtered", sc_filtered), RAW_IN("confidence", sc_conf),
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), FLOAT("protect_from", 0.05f),
+         FLOAT("protect_to", 0.3f), FLOAT("noise_protection", 0.6f));
+  }
+
   // tone equalizer, on positive luminances spread over the [-9; 0] EV range
   // the module works in, and on guided filter terms derived from them
   {
@@ -2862,7 +2943,7 @@ int main(int argc, char **argv)
   if(sizeof(profile_info_t) != 160) die("profile_info_t is %zu bytes, the kernels expect 160", sizeof(profile_info_t));
 
   make_inputs();
-  static test_t tests[512];
+  static test_t tests[1024];
   const int ntests = make_tests(tests);
 
   cl_env_t cl;
@@ -2903,6 +2984,20 @@ int main(int argc, char **argv)
       const float *fc = out_cl[a], *fv = out_vk[a];
       for(size_t i = 0; i < out_size(arg) / sizeof(float); i++)
       {
+        if(arg->ints)
+        {
+          const double c = ((int32_t *)out_cl[a])[i], v = ((int32_t *)out_vk[a])[i];
+          const double err = fabs(c - v) / fmax(1.0, fabs(c));
+          if(err > max_err || worst_arg < 0)
+          {
+            max_err = fmax(err, max_err);
+            worst = i;
+            worst_arg = a;
+          }
+          max_abs = fmax(max_abs, fabs(c - v));
+          if(err > tolerance) over++;
+          continue;
+        }
         if(t->skip_alpha && arg->channels == 4 && i % 4 == 3) continue;
         if(isnan(fc[i]) || isnan(fv[i]))
         {
@@ -2927,7 +3022,10 @@ int main(int argc, char **argv)
            max_abs, nan_mismatch);
     if(over) printf("  %zu past the tolerance", over);
     if(byte_mismatch) printf("  byte mismatches %zu", byte_mismatch);
-    if(!ok && worst_arg >= 0)
+    if(!ok && worst_arg >= 0 && t->args[worst_arg].ints)
+      printf("  (%s element %zu: opencl %d, vulkan %d)", t->args[worst_arg].name, worst,
+             ((int32_t *)out_cl[worst_arg])[worst], ((int32_t *)out_vk[worst_arg])[worst]);
+    else if(!ok && worst_arg >= 0)
     {
       const arg_t *arg = &t->args[worst_arg];
       const int ch = arg->kind == ARG_IMAGE_OUT ? arg->channels : 1;
