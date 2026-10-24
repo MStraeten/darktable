@@ -615,6 +615,88 @@ static gboolean process_ppg_slang(dt_slang_gpu_image_t *dev_in,
   dt_slang_gpu_image_free(dev_tmp);
   return ok;
 }
+
+// color_smoothing_cl() on the Slang kernels, in place. Returns TRUE on success.
+static gboolean color_smoothing_slang(dt_slang_gpu_image_t *dev_out,
+                                      const int width,
+                                      const int height,
+                                      const int passes)
+{
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  gboolean ok = dev_tmp != NULL;
+  dt_slang_gpu_image_t *t1 = dev_out;
+  dt_slang_gpu_image_t *t2 = dev_tmp;
+  for(int pass = 0; pass < passes && ok; pass++)
+  {
+    ok = !dt_slang_gpu_run_2d_args("demosaic_ppg", "color_smoothing", width, height,
+                                   SLIMG_DEV(t1), SLIMG_DEV(t2), SLARG(width), SLARG(height));
+    dt_slang_gpu_image_t *t = t1;
+    t1 = t2;
+    t2 = t;
+  }
+  // an odd number of passes ends in dev_tmp
+  if(ok && t1 == dev_tmp)
+  {
+    const int dx = 0, dy = 0;
+    ok = !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height, SLIMG_DEV(dev_tmp),
+                                   SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width),
+                                   SLARG(height), SLARG(dx), SLARG(dy));
+  }
+  dt_slang_gpu_image_free(dev_tmp);
+  return ok;
+}
+
+// green_equilibration_cl() on the Slang kernels, from dev_in to the 1-channel
+// dev_out. The full average stays on the device instead of the host summing
+// the partial sums. Returns TRUE on success.
+static gboolean green_equilibration_slang(const dt_iop_module_t *self,
+                                          const dt_dev_pixelpipe_iop_t *piece,
+                                          dt_slang_gpu_image_t *dev_in,
+                                          dt_slang_gpu_image_t *dev_out,
+                                          const int width,
+                                          const int height,
+                                          const uint32_t filters)
+{
+  const dt_iop_demosaic_data_t *d = piece->data;
+  const gboolean full = d->green_eq == DT_IOP_GREEN_EQ_FULL || d->green_eq == DT_IOP_GREEN_EQ_BOTH;
+  const gboolean local = d->green_eq == DT_IOP_GREEN_EQ_LOCAL || d->green_eq == DT_IOP_GREEN_EQ_BOTH;
+
+  dt_slang_gpu_image_t *dev_tmp = full && local ? dt_slang_gpu_image_new(width, height, 1, NULL) : NULL;
+  gboolean ok = !(full && local) || dev_tmp;
+
+  if(full && ok)
+  {
+    dt_slang_gpu_image_t *favg_out = local ? dev_tmp : dev_out;
+    // one partial sum per 16x16 work group
+    const int length = ((width + 15) / 16) * ((height + 15) / 16);
+    dt_slang_gpu_buffer_t *dev_m = dt_slang_gpu_buffer_new(sizeof(float) * 2 * length, NULL);
+    dt_slang_gpu_buffer_t *dev_r = dt_slang_gpu_buffer_new(sizeof(float) * 2, NULL);
+    ok = dev_m && dev_r
+      && !dt_slang_gpu_run_2d_args("demosaic_ppg", "green_equilibration_favg_reduce_first", width, height,
+                                   SLIMG_DEV(dev_in), SLARG(width), SLARG(height), SLBUF_DEV(dev_m),
+                                   SLARG(filters))
+      && !dt_slang_gpu_run_2d_args("demosaic_ppg", "green_equilibration_favg_reduce_second", 16, 16,
+                                   SLBUF_DEV(dev_m), SLBUF_DEV(dev_r), SLARG(length))
+      && !dt_slang_gpu_run_2d_args("demosaic_ppg", "green_equilibration_favg_apply", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(favg_out), SLARG(width), SLARG(height),
+                                   SLARG(filters), SLBUF_DEV(dev_r));
+    dt_slang_gpu_buffer_free(dev_m);
+    dt_slang_gpu_buffer_free(dev_r);
+  }
+
+  if(local && ok)
+  {
+    const dt_image_t *img = &self->dev->image_storage;
+    const float thr = 0.0001f * img->exif_iso;
+    dt_slang_gpu_image_t *lavg_in = full ? dev_tmp : dev_in;
+    ok = !dt_slang_gpu_run_2d_args("demosaic_ppg", "green_equilibration_lavg", width, height,
+                                   SLIMG_DEV(lavg_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(filters), SLARG(thr));
+  }
+
+  dt_slang_gpu_image_free(dev_tmp);
+  return ok;
+}
 #endif
 
 // clang-format off

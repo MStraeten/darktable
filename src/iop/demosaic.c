@@ -1535,9 +1535,9 @@ finish:
 
 #ifdef HAVE_SLANG_GPU
 // RCD, PPG and VNG4 on full scale Bayer data and VNG and Markesteijn on
-// X-Trans, without the options that need more kernels: dual demosaic,
-// capture sharpening, green equilibration, color smoothing, the masks and
-// details and the scaled darkroom views
+// X-Trans, with green equilibration and color smoothing, but without the
+// options that need more kernels: dual demosaic, capture sharpening, the
+// masks and details and the scaled darkroom views
 gboolean process_slang(dt_iop_module_t *self,
                        dt_dev_pixelpipe_iop_t *piece,
                        dt_slang_gpu_image_t *dev_in,
@@ -1571,9 +1571,7 @@ gboolean process_slang(dt_iop_module_t *self,
     && iwidth >= 16 && iheight >= 16
     && dt_pipe_no_mask_display(pipe)
     && !pipe->want_detail_mask
-    && (run_fast || !d->cs_enabled)
-    && (run_fast || d->green_eq == DT_IOP_GREEN_EQ_NO)
-    && (run_fast || d->color_smoothing == DT_DEMOSAIC_SMOOTH_OFF);
+    && (run_fast || !d->cs_enabled);
   if(!supported) return FALSE;
 
   dt_iop_demosaic_gui_data_t *g = self->gui_data;
@@ -1587,18 +1585,34 @@ gboolean process_slang(dt_iop_module_t *self,
 
   dt_dev_clear_scharr_mask(pipe);
 
-  switch(method)
-  {
-    case DT_IOP_DEMOSAIC_RCD:
-      return process_rcd_slang(piece, dev_in, dev_out, iwidth, iheight, filters);
-    case DT_IOP_DEMOSAIC_PPG:
-      return process_ppg_slang(dev_in, dev_out, iwidth, iheight, filters);
-    case DT_IOP_DEMOSAIC_VNG4:
-    case DT_IOP_DEMOSAIC_VNG:
-      return process_vng_slang(dev_in, dev_out, piece->xtrans, iwidth, iheight, filters, 0, FALSE);
-    default:
-      return process_markesteijn_slang(piece, dev_in, dev_out, piece->xtrans, iwidth, iheight);
-  }
+  // the masks are not displayed, which process_cl() calls no_masking
+  const gboolean greens = is_bayer && d->green_eq != DT_IOP_GREEN_EQ_NO && !run_fast;
+  dt_slang_gpu_image_t *in_image = greens ? dt_slang_gpu_image_new(iwidth, iheight, 1, NULL) : dev_in;
+  gboolean ok = in_image
+    && (!greens || green_equilibration_slang(self, piece, dev_in, in_image, iwidth, iheight, filters));
+
+  if(ok)
+    switch(method)
+    {
+      case DT_IOP_DEMOSAIC_RCD:
+        ok = process_rcd_slang(piece, in_image, dev_out, iwidth, iheight, filters);
+        break;
+      case DT_IOP_DEMOSAIC_PPG:
+        ok = process_ppg_slang(in_image, dev_out, iwidth, iheight, filters);
+        break;
+      case DT_IOP_DEMOSAIC_VNG4:
+      case DT_IOP_DEMOSAIC_VNG:
+        ok = process_vng_slang(in_image, dev_out, piece->xtrans, iwidth, iheight, filters, 0, FALSE);
+        break;
+      default:
+        ok = process_markesteijn_slang(piece, in_image, dev_out, piece->xtrans, iwidth, iheight);
+    }
+
+  if(greens) dt_slang_gpu_image_free(in_image);
+
+  if(ok && d->color_smoothing != DT_DEMOSAIC_SMOOTH_OFF && !run_fast)
+    ok = color_smoothing_slang(dev_out, iwidth, iheight, d->color_smoothing);
+  return ok;
 }
 #endif
 #undef MIN_TILE_ROWS

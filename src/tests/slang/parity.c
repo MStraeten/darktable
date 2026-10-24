@@ -723,6 +723,27 @@ static int make_tests(test_t *t)
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
        LOCAL("buffer", 4 * sizeof(float) * (16 + 2) * (16 + 2)), INT("border", 16));
 
+  // green equilibration and color smoothing. The full average reduces to one
+  // partial sum per 16x16 work group first; the Slang apply step takes the two
+  // sums, from which the OpenCL host computes the ratio
+  {
+    static const float ge_sums[2] = { 1.0f, 1.07f };
+    const int ngroups = ((W + 15) / 16) * ((H + 15) / 16);
+    TEST("green_equilibration_lavg", "demosaic_ppg", "green_equilibration_lavg",
+         RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
+         FLOAT("thr", 0.05f), LOCAL("buffer", sizeof(float) * (16 + 4) * (16 + 4)));
+    TEST_TOL("green_equilibration_favg_reduce_first", "demosaic_ppg", "green_equilibration_favg_reduce_first",
+             1e-6, RAW_IN("in", image_raw), INT("width", W), INT("height", H),
+             BUFFER_OUT("accu", NULL, sizeof(float) * 2 * ngroups), INT("filters", bayer[0]),
+             LOCAL("buffer", sizeof(float) * 2 * 16 * 16));
+    TEST("green_equilibration_favg_apply", "demosaic_ppg", "green_equilibration_favg_apply",
+         RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
+         FLOAT("gr_ratio", ge_sums[1] / ge_sums[0]), SLANG_BUFFER("sums", ge_sums, sizeof(ge_sums)));
+    TEST("color_smoothing", "demosaic_ppg", "color_smoothing",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         LOCAL("buffer", 4 * sizeof(float) * (16 + 2) * (16 + 2)));
+  }
+
   // the RCD steps, on plausible intermediate data rather than the output of
   // the step before, so that each step is compared on its own
   const size_t plane = sizeof(float) * W * H;
