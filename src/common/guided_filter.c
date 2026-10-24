@@ -727,24 +727,17 @@ static int _slang_box_mean(const int width,
                            dt_slang_gpu_image_t *out,
                            dt_slang_gpu_image_t *temp)
 {
-  // the kernels staging a tile in group shared memory take windows up to
-  // 2 * 32 + 1 wide, see guided_filter.slang
-  if(w <= 32)
-  {
-    const int err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_x_tile", width, height,
-                                             SLARG(width), SLARG(height), SLIMG_DEV(in), SLIMG_DEV(temp),
-                                             SLARG(w));
-    if(err) return err;
-    return dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_y_tile", width, height,
-                                    SLARG(width), SLARG(height), SLIMG_DEV(temp), SLIMG_DEV(out), SLARG(w));
-  }
-
-  // each work item restarts the running sum over a window, so a chunk
-  // longer than the window keeps that cheap per value
+  // the kernel staging a tile in group shared memory takes windows up to
+  // 2 * 32 + 1 wide, see guided_filter.slang. Each work item of the line
+  // kernels restarts the running sum over a window, so a chunk longer than
+  // the window keeps that cheap per value
   const int chunk = CLAMP(2 * w + 1, 16, 64);
-  const int err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_x",
-                                           (width + chunk - 1) / chunk, height, SLARG(width), SLARG(height),
-                                           SLIMG_DEV(in), SLIMG_DEV(temp), SLARG(w), SLARG(chunk));
+  const int err = w <= 32
+    ? dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_x_tile", width, height,
+                               SLARG(width), SLARG(height), SLIMG_DEV(in), SLIMG_DEV(temp), SLARG(w))
+    : dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_x", (width + chunk - 1) / chunk, height,
+                               SLARG(width), SLARG(height), SLIMG_DEV(in), SLIMG_DEV(temp), SLARG(w),
+                               SLARG(chunk));
   if(err) return err;
   return dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_box_mean_y", width,
                                   (height + chunk - 1) / chunk, SLARG(width), SLARG(height), SLIMG_DEV(temp),
