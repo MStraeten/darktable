@@ -975,6 +975,24 @@ static int make_tests(test_t *t)
                BUFFER("homograph", as_homo, sizeof(as_homo)));
   }
 
+  // contrast equalizer: the edge-aware wavelet steps at a fine and a coarse scale
+  {
+    static float eaw_filter[25];
+    static const float m[5] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f };
+    for(int j = 0; j < 5; j++)
+      for(int i = 0; i < 5; i++) eaw_filter[j * 5 + i] = m[i] * m[j];
+    for(int s = 0; s < 4; s += 3)
+    {
+      static const char *eaw_labels[4] = { "eaw_decompose scale 0", 0, 0, "eaw_decompose scale 3" };
+      TEST_TOL(eaw_labels[s], "atrous", "eaw_decompose", 1e-5,
+               IMG_IN("in", image_in), IMG_OUT("coarse"), IMG_OUT("detail"), INT("width", W), INT("height", H),
+               INT("scale", s), FLOAT("sharpen", 2.5f), BUFFER("filter", eaw_filter, sizeof(eaw_filter)));
+    }
+    TEST("eaw_synthesize", "atrous", "eaw_synthesize",
+         IMG_OUT("out"), IMG_IN("coarse", image_in), IMG_IN("detail", image_lab), INT("width", W),
+         INT("height", H), FLOAT4("threshold", 10.0f, 5.0f, 6.0f, 0.0f), FLOAT4("boost", 1.2f, 0.8f, 1.5f, 1.0f));
+  }
+
   // resampling, with plans like _prepare_resampling_plan() makes them: per
   // output pixel a length index, a kernel offset and an index offset, here
   // with 2 to 6 taps

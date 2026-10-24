@@ -21,6 +21,7 @@
 #include "common/eaw.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/imageop.h"
@@ -590,6 +591,80 @@ error:
 #endif // USE_NEW_CL
 
 #endif // HAVE_OPENCL
+
+#ifdef HAVE_SLANG_GPU
+// the process_cl() in use, the one without USE_NEW_CL
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_atrous_data_t *d = piece->data;
+
+  dt_aligned_pixel_t thrs[MAX_NUM_SCALES];
+  dt_aligned_pixel_t boost[MAX_NUM_SCALES];
+  float sharp[MAX_NUM_SCALES];
+  const int max_scale = get_scales(thrs, boost, sharp, d, roi_in, piece);
+
+  if(self->dev->gui_attached && dt_pipe_is_full(piece->pipe))
+  {
+    dt_iop_atrous_gui_data_t *g = self->gui_data;
+    dt_iop_gui_enter_critical_section(self);
+    g->num_samples = get_samples(g->sample, d, roi_in, piece);
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  const float m[5] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f }; // 1/16, 4/16, 6/16, 4/16, 1/16
+  float mm[5][5];
+  for(int j = 0; j < 5; j++)
+    for(int i = 0; i < 5; i++)
+      mm[j][i] = m[i] * m[j];
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *dev_detail[MAX_NUM_SCALES] = { NULL };
+  gboolean ok = dev_tmp != NULL;
+  for(int k = 0; k < max_scale && ok; k++)
+  {
+    dev_detail[k] = dt_slang_gpu_image_new(width, height, 4, NULL);
+    ok = dev_detail[k] != NULL;
+  }
+
+  // copy original input from dev_in -> dev_out as starting point
+  const int zero = 0;
+  ok = ok && !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                       SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                       SLARG(width), SLARG(height), SLARG(zero), SLARG(zero));
+
+  // decompose image into detail scales and coarse, ping-ponging between
+  // dev_out and dev_tmp
+  for(int s = 0; s < max_scale && ok; s++)
+  {
+    const int scale = s;
+    ok = !dt_slang_gpu_run_2d_args("atrous", "eaw_decompose", width, height,
+                                   SLIMG_DEV((s & 1) ? dev_tmp : dev_out), SLIMG_DEV((s & 1) ? dev_out : dev_tmp),
+                                   SLIMG_DEV(dev_detail[s]), SLARG(width), SLARG(height),
+                                   SLARG(scale), SLARG(sharp[s]), SLBUF(mm, sizeof(mm)));
+  }
+
+  // now synthesize again
+  for(int scale = max_scale - 1; scale >= 0 && ok; scale--)
+    ok = !dt_slang_gpu_run_2d_args("atrous", "eaw_synthesize", width, height,
+                                   SLIMG_DEV((scale & 1) ? dev_tmp : dev_out),
+                                   SLIMG_DEV((scale & 1) ? dev_out : dev_tmp),
+                                   SLIMG_DEV(dev_detail[scale]), SLARG(width), SLARG(height),
+                                   SLARG(thrs[scale]), SLARG(boost[scale]));
+
+  dt_slang_gpu_image_free(dev_tmp);
+  for(int k = 0; k < max_scale; k++)
+    dt_slang_gpu_image_free(dev_detail[k]);
+  return ok;
+}
+#endif
 
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
