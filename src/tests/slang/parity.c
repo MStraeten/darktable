@@ -924,6 +924,30 @@ static int make_tests(test_t *t)
 #undef MK_XT
   }
 
+  // tone curve on Lab: the a and b curves bounded and unbounded, a and b
+  // scaled with L, the curve on XYZ, and on ProPhoto RGB with and without a norm
+  {
+    static const float tc_coeffs_ab[12] = { 1.25f, 1.0f, 1.4f, 1.3f, 1.0f, 1.2f,
+                                            1.2f, 1.0f, 1.3f, 1.35f, 1.0f, 1.5f };
+    static const char *tc_labels[6] = { "tonecurve ab", "tonecurve ab unbounded", "tonecurve scaled ab",
+                                        "tonecurve xyz", "tonecurve rgb", "tonecurve rgb luminance" };
+    static const int tc_autoscale[6] = { 0, 0, 1, 2, 3, 3 };
+    // past the a and b curves the L curve is looked up, without
+    // interpolation, at a value converted from Lab: float noise can move that
+    // to the next LUT entry, and the conversion back from far out of gamut
+    // pixels of the noise image amplifies it, up to about 5e-3
+    for(int k = 0; k < 6; k++)
+      TEST_TOL(tc_labels[k], "basic", "tonecurve", k >= 3 ? 1e-2 : 0.0,
+               IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+               LUT("table_L", lut_curve, 256, 256), LUT("table_a", lut_curve, 256, 256),
+               LUT("table_b", lut_curve, 256, 256), INT("autoscale_ab", tc_autoscale[k]),
+               INT("unbound_ab", k == 1), BUFFER("coeffs_L", coeffs_linear, sizeof(coeffs_linear)),
+               BUFFER("coeffs_ab", tc_coeffs_ab, sizeof(tc_coeffs_ab)), FLOAT("low_approximation", 0.7f),
+               INT("preserve_colors", k == 5 ? 1 : 0),
+               BUFFER("profile_info", &profile_linear, sizeof(profile_info_t)),
+               LUT("lut", lut_profile, 256, 256 * 6));
+  }
+
   // resampling, with plans like _prepare_resampling_plan() makes them: per
   // output pixel a length index, a kernel offset and an index offset, here
   // with 2 to 6 taps

@@ -20,6 +20,7 @@
 // pipe runs. The others follow with their modules.
 
 import color_conversion;
+import rgb_norms;
 
 // Metal drops buffers and images a kernel does not read, which would shift
 // every later binding (see src/common/slang_gpu_metal.m). A kernel that ignores
@@ -1338,5 +1339,124 @@ void rawoverexposed_falsecolor(uint3 gid : SV_DispatchThreadID,
   if(c == 2)      pixel.z = 0.0f;
   else if(c == 1) pixel.y = 0.0f;
   else if(c == 0) pixel.x = 0.0f;
+  out.write(int2(x, y), pixel);
+}
+
+float _lookup_unbounded_buf(ImageIn lut, float x, StructuredBuffer<float> coeffs)
+{
+  const float a[3] = { coeffs[0], coeffs[1], coeffs[2] };
+  return lookup_unbounded(lut, x, a);
+}
+
+// the curve of an a or b channel with extrapolation on both sides: a[0..2]
+// for the right one, a[3..5] for the left one with an inverted x axis
+float _lookup_unbounded_twosided(ImageIn lut, float x, StructuredBuffer<float> coeffs, int o)
+{
+  // in case the tone curve is marked as linear, return the fast
+  // path to linear unbounded (does not clip x at 1)
+  if(coeffs[o] >= 0.0f)
+  {
+    const float ar = 1.0f / coeffs[o];
+    const float al = 1.0f - 1.0f / coeffs[o + 3];
+    if(x < ar && x >= al)
+    {
+      const int xi = clamp(int(x * 65536.0f), 0, 0xffff);
+      return lut.read(int2(xi & 0xff, xi >> 8)).x;
+    }
+    else
+    {
+      const float xx = (x >= ar) ? x : 1.0f - x;
+      const int s = (x >= ar) ? o : o + 3;
+      return coeffs[s + 1] * dtcl_pow(xx * coeffs[s], coeffs[s + 2]);
+    }
+  }
+  else return x;
+}
+
+/* kernel for the tonecurve plugin. */
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void tonecurve(uint3 gid : SV_DispatchThreadID,
+               uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+               uniform ImageIn table_L, uniform ImageIn table_a, uniform ImageIn table_b,
+               uniform int autoscale_ab, uniform int unbound_ab, uniform StructuredBuffer<float> coeffs_L,
+               uniform StructuredBuffer<float> coeffs_ab, uniform float low_approximation,
+               uniform int preserve_colors, uniform StructuredBuffer<ProfileInfo> profile_info,
+               uniform ImageIn lut)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.read(int2(x, y));
+  const float L_in = pixel.x / 100.0f;
+  // use lut or extrapolation:
+  const float L = _lookup_unbounded_buf(table_L, L_in, coeffs_L);
+
+  if(autoscale_ab == 0)
+  {
+    const float a_in = (pixel.y + 128.0f) / 256.0f;
+    const float b_in = (pixel.z + 128.0f) / 256.0f;
+
+    if(unbound_ab == 0)
+    {
+      pixel.y = lookup(table_a, a_in);
+      pixel.z = lookup(table_b, b_in);
+    }
+    else
+    {
+      // use lut or two-sided extrapolation
+      pixel.y = _lookup_unbounded_twosided(table_a, a_in, coeffs_ab, 0);
+      pixel.z = _lookup_unbounded_twosided(table_b, b_in, coeffs_ab, 6);
+    }
+    pixel.x = L;
+  }
+  else if(autoscale_ab == 1)
+  {
+    if(L_in > 0.01f)
+    {
+      pixel.y *= L / pixel.x;
+      pixel.z *= L / pixel.x;
+    }
+    else
+    {
+      pixel.y *= low_approximation;
+      pixel.z *= low_approximation;
+    }
+    pixel.x = L;
+  }
+  else if(autoscale_ab == 2)
+  {
+    float4 xyz = Lab_to_XYZ(pixel);
+    xyz.x = _lookup_unbounded_buf(table_L, xyz.x, coeffs_L);
+    xyz.y = _lookup_unbounded_buf(table_L, xyz.y, coeffs_L);
+    xyz.z = _lookup_unbounded_buf(table_L, xyz.z, coeffs_L);
+    pixel.xyz = XYZ_to_Lab(xyz).xyz;
+  }
+  else if(autoscale_ab == 3)
+  {
+    float4 rgb = Lab_to_prophotorgb(pixel);
+
+    if(preserve_colors == DT_RGB_NORM_NONE)
+    {
+      rgb.x = _lookup_unbounded_buf(table_L, rgb.x, coeffs_L);
+      rgb.y = _lookup_unbounded_buf(table_L, rgb.y, coeffs_L);
+      rgb.z = _lookup_unbounded_buf(table_L, rgb.z, coeffs_L);
+    }
+    else
+    {
+      float ratio = 1.f;
+      const float lum = dt_rgb_norm(rgb, preserve_colors, 1, profile_info[0], lut);
+      if(lum > 0.f)
+      {
+        const float curve_lum = _lookup_unbounded_buf(table_L, lum, coeffs_L);
+        ratio = curve_lum / lum;
+      }
+      rgb.xyz *= ratio;
+    }
+    pixel.xyz = prophotorgb_to_Lab(rgb).xyz;
+  }
+
   out.write(int2(x, y), pixel);
 }
