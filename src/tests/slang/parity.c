@@ -993,6 +993,22 @@ static int make_tests(test_t *t)
          INT("height", H), FLOAT4("threshold", 10.0f, 5.0f, 6.0f, 0.0f), FLOAT4("boost", 1.2f, 0.8f, 1.5f, 1.0f));
   }
 
+  // haze removal: the box filters along rows and columns, the transition map
+  // and the dehazing
+  {
+    static const char *hz_kernels[4] = { "hazeremoval_box_min_x", "hazeremoval_box_min_y",
+                                         "hazeremoval_box_max_x", "hazeremoval_box_max_y" };
+    for(int k = 0; k < 4; k++)
+      TEST_LINE(hz_kernels[k], "hazeremoval", hz_kernels[k], 0.0, (k & 1) ? W : H,
+                INT("width", W), INT("height", H), RAW_IN("in", image_raw), RAW_OUT("out"), INT("w", 6));
+    TEST("hazeremoval_transision_map", "hazeremoval", "hazeremoval_transision_map",
+         INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_OUT("out"), FLOAT("strength", 0.6f),
+         FLOAT("A0_r", 0.9f), FLOAT("A0_g", 0.95f), FLOAT("A0_b", 1.05f));
+    TEST("hazeremoval_dehaze", "hazeremoval", "hazeremoval_dehaze",
+         INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_IN("trans_map", rcd_dir),
+         IMG_OUT("out"), FLOAT("t_min", 0.1f), FLOAT4("A0", 0.9f, 0.95f, 1.05f, 0.0f));
+  }
+
   // resampling, with plans like _prepare_resampling_plan() makes them: per
   // output pixel a length index, a kernel offset and an index offset, here
   // with 2 to 6 taps
