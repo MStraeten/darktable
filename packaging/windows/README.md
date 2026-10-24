@@ -58,6 +58,13 @@ The steps to build the darktable Windows executable and make the installer are a
     git submodule update
     ```
 
+* Optional, for the experimental Slang GPU kernels (currently x64 only): install the Vulkan headers and loader, and the Slang compiler, which MSYS2 does not package. The script prints the path of `slangc.exe`:
+    ```bash
+    pacman -S --needed mingw-w64-ucrt-x86_64-{vulkan-headers,vulkan-loader} unzip
+    SLANGC=$(cygpath -m "$(.ci/install-slangc.sh ~/slang)")
+    ```
+    Then add `--enable-slang -- -DSLANGC_EXECUTABLE=$SLANGC` to the `build.sh` command below, or `-DUSE_SLANG=ON -DSLANGC_EXECUTABLE=$SLANGC` to the `cmake` configure command.
+
 * Finally build and install darktable, either the easy way by using the provided script:
     ```bash
     ./build.sh --prefix /opt/darktable --build-type Release --build-generator Ninja --install

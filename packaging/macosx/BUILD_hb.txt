@@ -25,17 +25,31 @@ How to make disk image with darktable application bundle from source (using Home
      export HOMEBREW_NO_INSTALL_FROM_API=1
      brew reinstall --build-from-source --force graphicsmagick
 
-3). Build and install darktable using either option A or B:
+3). Optional step for the experimental Slang GPU kernels:
+     They need the Slang compiler, which Homebrew does not package, and Xcode's Metal compiler
+     (the Command Line Tools alone are not enough). Install Xcode, then:
+
+     $ xcodebuild -downloadComponent MetalToolchain   # Xcode 26 and later
+     $ ../../.ci/install-slangc.sh ~/slang
+
+     The script prints the path of slangc. Build with option B below, adding these cmake options:
+
+        -DUSE_SLANG=ON -DSLANGC_EXECUTABLE=<the printed path>
+
+     The Metal libraries end up in share/darktable/kernels/slang and are copied into the
+     application bundle with the rest of share/darktable.
+
+4). Build and install darktable using either option A or B:
      - Option A: Build using the default build.sh, which should work for most use cases 
      $ 2_build_hb_darktable_default.sh
      - Option B: Build using custom cmake options, edit according to your specific needs/environment
      $ 2_build_hb_darktable_custom.sh
 
-4). Create application bundle from build files. To properly sign the app bundle you can optionally provide your developer certificate email/id by defining CODECERT:
+5). Create application bundle from build files. To properly sign the app bundle you can optionally provide your developer certificate email/id by defining CODECERT:
      $ export CODECERT="your.developer@apple.id" # optional, not required
      $ 3_make_hb_darktable_package.sh
 
-5). Generate DMG image from application bundle:
+6). Generate DMG image from application bundle:
      $ 4_make_hb_darktable_dmg.sh
 
 The final result is a DMG file: darktable-<current version>+<latest commit>-{arm64|x86_64}.dmg
