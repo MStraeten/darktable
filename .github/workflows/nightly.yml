@@ -101,7 +101,9 @@ jobs:
             python3-jsonschema \
             xsltproc \
             zlib1g-dev \
-            appstream
+            appstream \
+            curl \
+            libvulkan-dev
       - name: Add PPA for newer multimedia libs (x86_64 only)
         if: runner.arch != 'ARM64'
         run: |
@@ -182,10 +184,14 @@ jobs:
           # for release builds, for nightly builds the build script does the
           # right thing even if this environment variable is not present.
           echo "DARKTABLE_APPIMAGE_UPDATE=release" >> $GITHUB_ENV
+      - name: Install the Slang compiler
+        run: |
+          slangc=$(./src/.ci/install-slangc.sh "${{ github.workspace }}/slang")
+          dirname "${slangc}" >> "$GITHUB_PATH"
       - name: Build AppImage
         run: |
           cd src
-          bash tools/appimage-build-script.sh
+          bash tools/appimage-build-script.sh --enable-slang
       - name: Package upload
         uses: actions/upload-artifact@v7
         with:
@@ -274,6 +280,8 @@ jobs:
             pugixml:p
             SDL2:p
             sqlite3:p
+            vulkan-headers:p
+            vulkan-loader:p
             webp-pixbuf-loader:p
             zlib:p
           update: true
@@ -310,6 +318,12 @@ jobs:
       - name: Update Lensfun data
         run: |
           lensfun-update-data
+      - name: Install the Slang compiler
+        # Slang publishes no Windows on Arm build
+        if: matrix.msystem == 'UCRT64'
+        run: |
+          slangc=$($(cygpath ${SRC_DIR})/.ci/install-slangc.sh "$(cygpath '${{ github.workspace }}')/slang")
+          echo "ECO=${ECO} -DUSE_SLANG=ON -DSLANGC_EXECUTABLE=$(cygpath -m "${slangc}")" >> "$GITHUB_ENV"
       - name: Build and Install
         run: |
           cmake -E make_directory "${BUILD_DIR}"
@@ -401,6 +415,12 @@ jobs:
       - name: Cancel workflow if job fails
         if: ${{ failure() }}
         uses: andymckay/cancel-action@0.5
+      - name: Install the Slang compiler and the Metal toolchain
+        run: |
+          # Xcode 26 ships the metal compiler as a separate component
+          xcodebuild -downloadComponent MetalToolchain
+          slangc=$(./src/.ci/install-slangc.sh "${{ github.workspace }}/slang")
+          echo "ECO=${ECO} -DUSE_SLANG=ON -DSLANGC_EXECUTABLE=${slangc}" >> "$GITHUB_ENV"
       - name: Build and Install
         run: |
           cmake -E make_directory "${BUILD_DIR}";
