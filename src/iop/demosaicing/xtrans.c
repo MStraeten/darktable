@@ -2060,6 +2060,202 @@ error:
 
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// Markesteijn as in process_markesteijn_cl(), on full X-Trans data. Returns
+// TRUE on success
+static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
+                                          dt_slang_gpu_image_t *dev_in,
+                                          dt_slang_gpu_image_t *dev_out,
+                                          const uint8_t (*const xtrans)[6],
+                                          const int width,
+                                          const int height)
+{
+  const dt_iop_demosaic_data_t *data = piece->data;
+  const char *prg = "demosaic_markesteijn";
+
+  const int passes = ((data->demosaicing_method & ~DT_DEMOSAIC_DUAL) == DT_IOP_DEMOSAIC_MARKESTEIJN_3) ? 3 : 1;
+  const int ndir = passes > 1 ? 8 : 4;
+  const int pad_tile = (passes == 1) ? 12 : 17;
+  if(!process_vng_slang(dev_in, dev_out, xtrans, width, height, 9u, pad_tile + 2, TRUE))
+    return FALSE;
+
+  static const short orth[12] = { 1, 0, 0, 1, -1, 0, 0, -1, 1, 0, 0, 1 },
+                     patt[2][16] = { { 0, 1, 0, -1, 2, 0, -1, 0, 1, 1, 1, -1, 0, 0, 0, 0 },
+                                     { 0, 1, 0, -2, 1, 0, -2, 0, 1, 1, -2, -2, 1, -1, -1, 1 } };
+
+  // allhex and sgreen as in process_markesteijn_cl()
+  char allhex[3][3][8][2] = { { { { 0 } } } };
+  int sgreen[2] = { 0 };
+
+  for(int row = 0; row < 3; row++)
+    for(int col = 0; col < 3; col++)
+      for(int ng = 0, d = 0; d < 10; d += 2)
+      {
+        const int g = FCNxtrans(row, col, xtrans) == 1;
+        if(FCNxtrans(row + orth[d] + 6, col + orth[d + 2] + 6, xtrans) == 1)
+          ng = 0;
+        else
+          ng++;
+        if(ng == 4)
+        {
+          sgreen[0] = col;
+          sgreen[1] = row;
+        }
+        if(ng == g + 1)
+          for(int c = 0; c < 8; c++)
+          {
+            const int v = orth[d] * patt[g][c * 2] + orth[d + 1] * patt[g][c * 2 + 1];
+            const int h = orth[d + 2] * patt[g][c * 2] + orth[d + 3] * patt[g][c * 2 + 1];
+
+            allhex[row][col][c ^ (g * 2 & d)][0] = h;
+            allhex[row][col][c ^ (g * 2 & d)][1] = v;
+          }
+      }
+
+  const size_t npix = (size_t)width * height;
+  // the byte maps are packed four to a word
+  const size_t bytemap_size = (npix + 3) / 4 * 4;
+
+  dt_slang_gpu_buffer_t *rgbv[8] = { NULL };
+  dt_slang_gpu_buffer_t *drv[8] = { NULL };
+  dt_slang_gpu_buffer_t *homo[8] = { NULL };
+  dt_slang_gpu_buffer_t *homosum[8] = { NULL };
+  dt_slang_gpu_buffer_t *gminmax = dt_slang_gpu_buffer_new(sizeof(float) * 2 * npix, NULL);
+  dt_slang_gpu_buffer_t *aux = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npix, NULL);
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+
+  gboolean ok = gminmax && aux && dev_tmp;
+  for(int n = 0; n < ndir && ok; n++)
+  {
+    rgbv[n] = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npix, NULL);
+    drv[n] = dt_slang_gpu_buffer_new(sizeof(float) * npix, NULL);
+    homo[n] = dt_slang_gpu_buffer_new(bytemap_size, NULL);
+    homosum[n] = dt_slang_gpu_buffer_new(bytemap_size, NULL);
+    ok = rgbv[n] && drv[n] && homo[n] && homosum[n];
+  }
+
+#define MRUN(kernel, ...) \
+  if(ok) ok = !dt_slang_gpu_run_2d_args(prg, kernel, width, height, __VA_ARGS__)
+
+  dt_slang_gpu_buffer_t **rgb = rgbv;
+
+  MRUN("markesteijn_initial_copy", SLIMG_DEV(dev_in), SLBUF_DEV(rgb[0]), SLARG(width), SLARG(height),
+       SLBUF(xtrans, 36));
+  for(int c = 1; c <= 3; c++)
+    MRUN("markesteijn_copy", SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[c]), SLARG(width), SLARG(height));
+
+  const int pad_g1_g3 = PAD_G1_G3;
+  MRUN("markesteijn_green_minmax", SLBUF_DEV(rgb[0]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
+       SLARG(pad_g1_g3), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+
+  // OpenCL reads the greens from a local copy taken before any are written
+  const int pad_g_interp = PAD_G_INTERP;
+  MRUN("markesteijn_copy", SLBUF_DEV(rgb[0]), SLBUF_DEV(aux), SLARG(width), SLARG(height));
+  MRUN("markesteijn_interpolate_green", SLBUF_DEV(aux), SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[1]),
+       SLBUF_DEV(rgb[2]), SLBUF_DEV(rgb[3]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
+       SLARG(pad_g_interp), SLARG(sgreen), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+
+  for(int pass = 0; pass < passes && ok; pass++)
+  {
+    if(pass == 1)
+    {
+      for(int c = 0; c < 4; c++)
+        MRUN("markesteijn_copy", SLBUF_DEV(rgb[c]), SLBUF_DEV(rgb[c + 4]), SLARG(width), SLARG(height));
+      rgb += 4;
+    }
+
+    if(pass)
+    {
+      const int pad_g_recalc = PAD_G_RECALC;
+      MRUN("markesteijn_recalculate_green", SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[1]), SLBUF_DEV(rgb[2]),
+           SLBUF_DEV(rgb[3]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height), SLARG(pad_g_recalc),
+           SLARG(sgreen), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+    }
+
+    const int pad_rb_g = (passes == 1) ? 6 : 5;
+    dt_slang_gpu_buffer_t **trgb = rgb;
+    for(int d = 0, i = 1, h = 0; d < 6; d++, i ^= 1, h ^= 2)
+    {
+      const int dir[2] = { i, i ^ 1 };
+      MRUN("markesteijn_solitary_green", SLBUF_DEV(trgb[0]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
+           SLARG(pad_rb_g), SLARG(d), SLARG(dir), SLARG(h), SLARG(sgreen), SLBUF(xtrans, 36));
+      if((d < 2) || (d & 1)) trgb++;
+    }
+
+    const int pad_rb_br = (passes == 1) ? 6 : 5;
+    for(int d = 0; d < 4; d++)
+      MRUN("markesteijn_red_and_blue", SLBUF_DEV(rgb[d]), SLARG(width), SLARG(height), SLARG(pad_rb_br),
+           SLARG(d), SLARG(sgreen), SLBUF(xtrans, 36));
+
+    const int pad_g22 = (passes == 1) ? 8 : 4;
+    for(int d = 0, n = 0; d < ndir; d += 2, n++)
+      MRUN("markesteijn_interpolate_twoxtwo", SLBUF_DEV(rgb[n]), SLARG(width), SLARG(height), SLARG(pad_g22),
+           SLARG(d), SLARG(sgreen), SLBUF(allhex, sizeof(allhex)));
+  }
+
+  // convert to perceptual colorspace and differentiate in all directions
+  const int pad_yuv = (passes == 1) ? 8 : 13;
+  for(int d = 0; d < ndir; d++)
+  {
+    MRUN("markesteijn_convert_yuv", SLBUF_DEV(rgbv[d]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
+         SLARG(pad_yuv));
+    MRUN("markesteijn_differentiate", SLBUF_DEV(aux), SLBUF_DEV(drv[d]), SLARG(width), SLARG(height),
+         SLARG(pad_yuv), SLARG(d));
+  }
+
+  // thresholds for the homogeneity maps go to aux
+  const int pad_homo = (passes == 1) ? 10 : 15;
+  for(int d = 0; d < ndir; d++)
+    MRUN("markesteijn_homo_threshold", SLBUF_DEV(drv[d]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
+         SLARG(pad_homo), SLARG(d));
+  for(int d = 0; d < ndir; d++)
+    MRUN("markesteijn_homo_set", SLBUF_DEV(drv[d]), SLBUF_DEV(aux), SLBUF_DEV(homo[d]), SLARG(width),
+         SLARG(height), SLARG(pad_homo));
+  for(int d = 0; d < ndir; d++)
+    MRUN("markesteijn_homo_sum", SLBUF_DEV(homo[d]), SLBUF_DEV(homosum[d]), SLARG(width), SLARG(height),
+         SLARG(pad_tile));
+
+  // the maximum of the homogeneity maps replaces the thresholds in aux
+  for(int d = 0; d < ndir; d++)
+    MRUN("markesteijn_homo_max", SLBUF_DEV(homosum[d]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
+         SLARG(pad_tile), SLARG(d));
+  MRUN("markesteijn_homo_max_corr", SLBUF_DEV(aux), SLARG(width), SLARG(height), SLARG(pad_tile));
+  for(int d = 0; d < ndir - 4; d++)
+    MRUN("markesteijn_homo_quench", SLBUF_DEV(homosum[d]), SLBUF_DEV(homosum[d + 4]), SLARG(width),
+         SLARG(height), SLARG(pad_tile));
+
+  // accumulate the inner part, which ends in dev_tmp as ndir is even, so
+  // the OpenCL copy before the final kernel is not needed. Both kernels
+  // leave the border from VNG in dev_out alone
+  MRUN("markesteijn_zero", SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height), SLARG(pad_tile));
+  dt_slang_gpu_image_t *t1 = dev_tmp;
+  dt_slang_gpu_image_t *t2 = dev_out;
+  for(int d = 0; d < ndir; d++)
+  {
+    MRUN("markesteijn_accu", SLIMG_DEV(t1), SLIMG_DEV(t2), SLBUF_DEV(rgbv[d]), SLBUF_DEV(homosum[d]),
+         SLBUF_DEV(aux), SLARG(width), SLARG(height), SLARG(pad_tile));
+    dt_slang_gpu_image_t *t = t2;
+    t2 = t1;
+    t1 = t;
+  }
+  MRUN("markesteijn_final", SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+       SLARG(pad_tile));
+#undef MRUN
+
+  for(int n = 0; n < 8; n++)
+  {
+    dt_slang_gpu_buffer_free(rgbv[n]);
+    dt_slang_gpu_buffer_free(drv[n]);
+    dt_slang_gpu_buffer_free(homo[n]);
+    dt_slang_gpu_buffer_free(homosum[n]);
+  }
+  dt_slang_gpu_buffer_free(gminmax);
+  dt_slang_gpu_buffer_free(aux);
+  dt_slang_gpu_image_free(dev_tmp);
+  return ok;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

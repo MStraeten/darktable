@@ -1534,9 +1534,10 @@ finish:
 #endif
 
 #ifdef HAVE_SLANG_GPU
-// RCD and PPG on full scale Bayer data, without the options that need more
-// kernels: dual demosaic, capture sharpening, green equilibration, color
-// smoothing, the masks and details and the scaled darkroom views
+// RCD, PPG and VNG4 on full scale Bayer data and VNG and Markesteijn on
+// X-Trans, without the options that need more kernels: dual demosaic,
+// capture sharpening, green equilibration, color smoothing, the masks and
+// details and the scaled darkroom views
 gboolean process_slang(dt_iop_module_t *self,
                        dt_dev_pixelpipe_iop_t *piece,
                        dt_slang_gpu_image_t *dev_in,
@@ -1555,11 +1556,16 @@ gboolean process_slang(dt_iop_module_t *self,
   const gboolean direct = roi_out->width == iwidth && roi_out->height == iheight
                           && feqf(roi_in->scale, roi_out->scale, 1e-8f);
 
-  const gboolean is_bayer = filters != 0 && filters != 9u && !(img->flags & DT_IMAGE_4BAYER)
+  const gboolean is_xtrans = filters == 9u;
+  const gboolean is_bayer = filters != 0 && !is_xtrans && !(img->flags & DT_IMAGE_4BAYER)
                             && !dt_image_is_mono_sraw(img);
   const gboolean supported =
-    is_bayer
-    && (method == DT_IOP_DEMOSAIC_RCD || (method == DT_IOP_DEMOSAIC_PPG && d->median_thrs <= 0.0f))
+    ((is_bayer
+      && (method == DT_IOP_DEMOSAIC_RCD || method == DT_IOP_DEMOSAIC_VNG4
+          || (method == DT_IOP_DEMOSAIC_PPG && d->median_thrs <= 0.0f)))
+     || (is_xtrans
+         && (method == DT_IOP_DEMOSAIC_VNG || method == DT_IOP_DEMOSAIC_MARKESTEIJN
+             || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3)))
     && _demosaic_full(pipe, img)
     && direct
     && iwidth >= 16 && iheight >= 16
@@ -1581,9 +1587,18 @@ gboolean process_slang(dt_iop_module_t *self,
 
   dt_dev_clear_scharr_mask(pipe);
 
-  return method == DT_IOP_DEMOSAIC_RCD
-    ? process_rcd_slang(piece, dev_in, dev_out, iwidth, iheight, filters)
-    : process_ppg_slang(dev_in, dev_out, iwidth, iheight, filters);
+  switch(method)
+  {
+    case DT_IOP_DEMOSAIC_RCD:
+      return process_rcd_slang(piece, dev_in, dev_out, iwidth, iheight, filters);
+    case DT_IOP_DEMOSAIC_PPG:
+      return process_ppg_slang(dev_in, dev_out, iwidth, iheight, filters);
+    case DT_IOP_DEMOSAIC_VNG4:
+    case DT_IOP_DEMOSAIC_VNG:
+      return process_vng_slang(dev_in, dev_out, piece->xtrans, iwidth, iheight, filters, 0, FALSE);
+    default:
+      return process_markesteijn_slang(piece, dev_in, dev_out, piece->xtrans, iwidth, iheight);
+  }
 }
 #endif
 #undef MIN_TILE_ROWS
