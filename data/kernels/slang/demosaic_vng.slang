@@ -26,6 +26,18 @@ import common;
 int _off_x(int offset) { return (offset << 16) >> 16; }
 int _off_y(int offset) { return offset >> 16; }
 
+// v in channel c, zero in the others
+float4 _channel(int c, float v)
+{
+  return float4(c == 0 ? v : 0.0f, c == 1 ? v : 0.0f, c == 2 ? v : 0.0f, c == 3 ? v : 0.0f);
+}
+
+// p with channel c set to v
+float4 _with_channel(float4 p, int c, float v)
+{
+  return float4(c == 0 ? v : p.x, c == 1 ? v : p.y, c == 2 ? v : p.z, c == 3 ? v : p.w);
+}
+
 // a 16x16 work group with a margin of 1 (linear) or 2 pixels
 groupshared float vng_lin_tile[18 * 18];
 groupshared float4 vng_tile[20 * 20];
@@ -99,19 +111,28 @@ void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupTh
     const int num_pixels = lookup[ip];
     ip++;
 
-    // for each adjoining pixel not of this pixel's color, sum up its weighted values
+    // for each adjoining pixel not of this pixel's color, sum up its weighted
+    // values. The sums are a vector: an array indexed by table entries would
+    // live in scratch memory on Metal, which made this kernel slow there
+    float4 sums = float4(0.0f);
     for(int i = 0; i < num_pixels; i++, ip += 3)
     {
       const int offset = lookup[ip];
       const float v = max(0.0f, vng_lin_tile[(int(lid.y) + 1 + _off_y(offset)) * 18 + int(lid.x) + 1 + _off_x(offset)]);
-      sum[lookup[ip + 2]] += v * lookup[ip + 1];
+      sums += _channel(lookup[ip + 2], v * lookup[ip + 1]);
     }
     // for each interpolated color, load it into the pixel
+    float4 out4 = float4(0.0f);
     for(int i = 0; i < colors - 1; i++, ip += 2)
     {
-      o[lookup[ip]] = sum[lookup[ip]] / lookup[ip + 1];
+      const int c = lookup[ip];
+      out4 = _with_channel(out4, c, sums[c] / lookup[ip + 1]);
     }
-    o[lookup[ip]] = max(0.0f, vng_lin_tile[(int(lid.y) + 1) * 18 + int(lid.x) + 1]);
+    out4 = _with_channel(out4, lookup[ip], max(0.0f, vng_lin_tile[(int(lid.y) + 1) * 18 + int(lid.x) + 1]));
+    o[0] = out4.x;
+    o[1] = out4.y;
+    o[2] = out4.z;
+    o[3] = out4.w;
   }
 
   if(only_linear != 0 && !is_xtrans)
@@ -163,8 +184,10 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThread
   const int prow = is_xtrans ? 6 : 8;
   const int pcol = is_xtrans ? 6 : 2;
 
-  float gval[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-  int g;
+  // the gradients 0-3 and 4-7. Arrays indexed by table entries would live in
+  // scratch memory on Metal, which made this kernel slow there
+  float4 ga = float4(0.0f);
+  float4 gb = float4(0.0f);
 
   // get byte code, code[16][16]
   int ip = code[(y % prow) * 16 + (x % pcol)];
@@ -192,21 +215,27 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThread
     const float4 p1 = PX(_off_x(offset1), _off_y(offset1));
     const float diff = abs(p0[color] - p1[color]) * weight;
 
-    gval[ips[ip + 3]] += diff;
+    // the gradients this term adds to, each once, up to a -1
+    uint mask = 1u << uint(ips[ip + 3]);
     ip += 4;
-    // the further gradients this term adds to, up to a -1
     for(int k = 0; k < 8; k++)
     {
       const int gi = ips[ip++];
       if(gi == -1) break;
-      gval[gi] += diff;
+      mask |= 1u << uint(gi);
     }
+    ga += float4((mask & 1u) != 0u ? diff : 0.0f, (mask & 2u) != 0u ? diff : 0.0f,
+                 (mask & 4u) != 0u ? diff : 0.0f, (mask & 8u) != 0u ? diff : 0.0f);
+    gb += float4((mask & 16u) != 0u ? diff : 0.0f, (mask & 32u) != 0u ? diff : 0.0f,
+                 (mask & 64u) != 0u ? diff : 0.0f, (mask & 128u) != 0u ? diff : 0.0f);
   }
+  const float gval[8] = { ga.x, ga.y, ga.z, ga.w, gb.x, gb.y, gb.z, gb.w };
 
   // chose a threshold
   float gmin = gval[0];
   float gmax = gval[0];
-  for(g = 1; g < 8; g++)
+  [ForceUnroll]
+  for(int g = 1; g < 8; g++)
   {
     if(gmin > gval[g]) gmin = gval[g];
     if(gmax < gval[g]) gmax = gval[g];
@@ -225,12 +254,13 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThread
   }
 
   const float thold = gmin + (gmax * 0.5f);
-  float sum[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+  float4 sum = float4(0.0f);
   const int color = fcol(y, x, filters, xtrans);
   int num = 0;
 
   // average the neighbors
-  for(g = 0; g < 8; g++)
+  [ForceUnroll]
+  for(int g = 0; g < 8; g++)
   {
     if(gval[g] <= thold)
     {
@@ -242,8 +272,10 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThread
       const float4 p0 = PX(_off_x(offset0), _off_y(offset0));
       const float4 p1 = PX(x1, y1);
 
-      for(int c = 0; c < colors; c++)
+      [ForceUnroll]
+      for(int c = 0; c < 4; c++)
       {
+        if(c >= colors) continue;
         // OpenCL tests the local buffer offset idx1 + c1 for zero, which
         // only the center pixel's first channel gives
         if(c == color && (x1 != 0 || y1 != 0 || c1 != 0))
@@ -256,8 +288,10 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThread
   }
 
   // save to output
-  for(int c = 0; c < colors; c++)
+  [ForceUnroll]
+  for(int c = 0; c < 4; c++)
   {
+    if(c >= colors) continue;
     float tot = center[color];
     if(c != color) tot += (sum[c] - sum[color]) / num;
     o[c] = tot;
