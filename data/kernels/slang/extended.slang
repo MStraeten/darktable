@@ -314,3 +314,78 @@ void colorbalancergb(uint3 gid : SV_DispatchThreadID,
 
   out.write(int2(x, y), RGB);
 }
+
+// TEA encryption as a cheap per pixel random number
+void _encrypt_tea(inout uint2 v)
+{
+  const uint key[4] = { 0xa341316cu, 0xc8013ea4u, 0xad90777du, 0x7e95761eu };
+  const uint delta = 0x9e3779b9u;
+  uint sum = 0u;
+  for(int i = 0; i < 8; i++)
+  {
+    sum += delta;
+    v.x += ((v.y << 4) + key[0]) ^ (v.y + sum) ^ ((v.y >> 5) + key[1]);
+    v.y += ((v.x << 4) + key[2]) ^ (v.x + sum) ^ ((v.x >> 5) + key[3]);
+  }
+}
+
+// triangular probability density function in [-1, 1]
+float _tpdf(uint urandom)
+{
+  const float frandom = float(urandom) / float(0xFFFFFFFFu);
+  return frandom < 0.5f ? (sqrt(2.0f * frandom) - 1.0f) : (1.0f - sqrt(2.0f * (1.0f - frandom)));
+}
+
+/* kernel for the vignette plugin. */
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void vignette(uint3 gid : SV_DispatchThreadID,
+              uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+              uniform float2 scale, uniform float2 roi_center_scaled, uniform float2 expt,
+              uniform float dscale, uniform float fscale, uniform float brightness, uniform float saturation,
+              uniform float dither, uniform int unbound)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  uint2 tea_state = uint2(uint(y * width + x), 0u);
+  _encrypt_tea(tea_state);
+
+  const float2 pv = abs(float2(x, y) * scale - roi_center_scaled);
+
+  const float cplen = dtcl_pow(dtcl_pow(pv.x, expt.x) + dtcl_pow(pv.y, expt.x), expt.y);
+
+  float weight = 0.0f;
+  float dith = 0.0f;
+
+  if(cplen >= dscale)
+  {
+    weight = ((cplen - dscale) / fscale);
+
+    dith = (weight <= 1.0f && weight >= 0.0f) ? dither * _tpdf(tea_state.x) : 0.0f;
+
+    weight = weight >= 1.0f ? 1.0f : (weight <= 0.0f ? 0.0f : 0.5f - dtcl_cos(M_PI_F * weight) / 2.0f);
+  }
+
+  float4 pixel = in.read(int2(x, y));
+
+  if(weight > 0.0f)
+  {
+    const float falloff = brightness < 0.0f ? 1.0f + (weight * brightness) : weight * brightness;
+
+    pixel.xyz = (brightness < 0.0f ? pixel * falloff + dith : pixel + falloff + dith).xyz;
+
+    pixel.xyz = unbound != 0 ? pixel.xyz : clamp(pixel, float4(0.0f), float4(1.0f)).xyz;
+
+    const float mv = (pixel.x + pixel.y + pixel.z) / 3.0f;
+    const float wss = weight * saturation;
+
+    pixel.xyz = (pixel - (mv - pixel) * wss).xyz;
+
+    pixel.xyz = unbound != 0 ? pixel.xyz : clamp(pixel, float4(0.0f), float4(1.0f)).xyz;
+  }
+
+  out.write(int2(x, y), pixel);
+}

@@ -948,6 +948,18 @@ static int make_tests(test_t *t)
                LUT("lut", lut_profile, 256, 256 * 6));
   }
 
+  // vignette: darkening and brightening, clipped and unbounded
+  for(int k = 0; k < 2; k++)
+  {
+    static const char *vg_labels[2] = { "vignette darken", "vignette brighten unbounded" };
+    TEST(vg_labels[k], "extended", "vignette",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         FLOAT2("scale", 2.0f / W, 2.4f / H), FLOAT2("roi_center_scaled", 1.1f, 0.9f),
+         FLOAT2("expt", 2.0f / 1.3f, 1.3f / 2.0f), FLOAT("dscale", 0.3f), FLOAT("fscale", 0.5f),
+         FLOAT("brightness", k ? 0.4f : -0.6f), FLOAT("saturation", k ? -0.3f : 0.5f),
+         FLOAT("dither", 1.0f / 256), INT("unbound", k));
+  }
+
   // resampling, with plans like _prepare_resampling_plan() makes them: per
   // output pixel a length index, a kernel offset and an index offset, here
   // with 2 to 6 taps
