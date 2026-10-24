@@ -765,7 +765,7 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *image, const void *host)
 // --------------------------------------------------------------------------------------------
 // device buffers
 
-dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *host)
+static dt_slang_gpu_buffer_t *_buffer_new(const size_t size, const void *host, const gboolean zero)
 {
   if(!dt_slang_gpu_enabled() || size == 0) return NULL;
 
@@ -783,7 +783,7 @@ dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *ho
         break;
       }
     }
-    if(buf)
+    if(buf && (host || zero))
     {
       // the buffer may still be in use by a pending kernel. A new one starts
       // zeroed, a pooled one has to be cleared. Clearing it on the queue
@@ -823,6 +823,16 @@ dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *ho
   g_mutex_unlock(&_mtl_lock);
   if(!buf) dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
   return buf ? (__bridge_retained dt_slang_gpu_buffer_t *)buf : NULL;
+}
+
+dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *host)
+{
+  return _buffer_new(size, host, TRUE);
+}
+
+dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new_uninit(const size_t size)
+{
+  return _buffer_new(size, NULL, FALSE);
 }
 
 void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buffer)

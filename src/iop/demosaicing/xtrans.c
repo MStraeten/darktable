@@ -2114,25 +2114,27 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
 
   const size_t npix = (size_t)width * height;
 
-  // the homogeneity maps hold four directions per word
+  // the homogeneity maps hold four directions per word. No buffer needs
+  // clearing: each kernel reads only what an earlier one wrote, within the
+  // borders that grow from one step to the next
   dt_slang_gpu_buffer_t *rgbv[8] = { NULL };
   dt_slang_gpu_buffer_t *drv[8] = { NULL };
   dt_slang_gpu_buffer_t *homo[2] = { NULL };
   dt_slang_gpu_buffer_t *homosum[2] = { NULL };
-  dt_slang_gpu_buffer_t *gminmax = dt_slang_gpu_buffer_new(sizeof(float) * 2 * npix, NULL);
-  dt_slang_gpu_buffer_t *aux = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npix, NULL);
+  dt_slang_gpu_buffer_t *gminmax = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 2 * npix);
+  dt_slang_gpu_buffer_t *aux = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * npix);
 
   gboolean ok = gminmax && aux;
   for(int n = 0; n < ndir && ok; n++)
   {
-    rgbv[n] = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npix, NULL);
-    drv[n] = dt_slang_gpu_buffer_new(sizeof(float) * npix, NULL);
+    rgbv[n] = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * npix);
+    drv[n] = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npix);
     ok = rgbv[n] && drv[n];
   }
   for(int n = 0; n < ndir / 4 && ok; n++)
   {
-    homo[n] = dt_slang_gpu_buffer_new(sizeof(uint32_t) * npix, NULL);
-    homosum[n] = dt_slang_gpu_buffer_new(sizeof(uint32_t) * npix, NULL);
+    homo[n] = dt_slang_gpu_buffer_new_uninit(sizeof(uint32_t) * npix);
+    homosum[n] = dt_slang_gpu_buffer_new_uninit(sizeof(uint32_t) * npix);
     ok = homo[n] && homosum[n];
   }
 

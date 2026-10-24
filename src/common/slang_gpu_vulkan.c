@@ -892,7 +892,7 @@ static void _buffer_free(dt_slang_gpu_buffer_t *buf)
   g_free(buf);
 }
 
-dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *host)
+static dt_slang_gpu_buffer_t *_buffer_new(const size_t size, const void *host, const gboolean zero)
 {
   if(!dt_slang_gpu_enabled() || size == 0) return NULL;
 
@@ -922,10 +922,20 @@ dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *ho
   // neither a pooled buffer nor fresh device memory is zeroed
   if(buf && host)
     memcpy(buf->mem.map, host, size);
-  else if(buf)
+  else if(buf && zero)
     memset(buf->mem.map, 0, size);
   g_mutex_unlock(&_vk_lock);
   return buf;
+}
+
+dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *host)
+{
+  return _buffer_new(size, host, TRUE);
+}
+
+dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new_uninit(const size_t size)
+{
+  return _buffer_new(size, NULL, FALSE);
 }
 
 void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buf)

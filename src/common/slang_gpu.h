@@ -122,6 +122,9 @@ void dt_slang_gpu_wait(void);
 // chain of kernels. It is filled from host if that is not NULL, and zeroed
 // otherwise. Returns NULL on failure.
 dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new(const size_t size, const void *host);
+// the same without the clearing, for a temporary that the kernels write in
+// full before they read it. Its contents are whatever its last user left
+dt_slang_gpu_buffer_t *dt_slang_gpu_buffer_new_uninit(const size_t size);
 void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buf);
 // copies the first size bytes to host, after the kernels writing the buffer
 // have finished. Returns 0 on success.
