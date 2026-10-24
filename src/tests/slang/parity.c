@@ -1483,6 +1483,20 @@ static int make_tests(test_t *t)
     GF_BOX("guided_filter_box_mean_y w7", "guided_filter_box_mean_y", 0, 7);
     GF_BOX("guided_filter_box_mean_y w150", "guided_filter_box_mean_y", 0, 150);
 #undef GF_BOX
+    // windows up to 2 * 32 + 1 wide, one work item per pixel in Slang
+    for(int k = 0; k < 4; k++)
+    {
+      static const char *gf_labels[4] = { "guided_filter_box_mean_x_tile w7", "guided_filter_box_mean_x_tile w32",
+                                          "guided_filter_box_mean_y_tile w7", "guided_filter_box_mean_y_tile w32" };
+      const int along_x = k < 2;
+      TEST_GRID(gf_labels[k], "guided_filter", along_x ? "guided_filter_box_mean_x" : "guided_filter_box_mean_y",
+                1e-6, W, GH, INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"),
+                INT("w", k & 1 ? 32 : 7));
+      t[n - 1].slang_kernel = along_x ? "guided_filter_box_mean_x_tile" : "guided_filter_box_mean_y_tile";
+      t[n - 1].clgw = along_x ? GH : W;
+      t[n - 1].clgh = 1;
+      t[n - 1].clly = 1;
+    }
     TEST_GRID("guided_filter_covariances", "guided_filter", "guided_filter_covariances", 0.0, W, GH,
               INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in), GF_IN("img", rcd_dir),
               GF_OUT("cov_imgg_img_r"), GF_OUT("cov_imgg_img_g"), GF_OUT("cov_imgg_img_b"),

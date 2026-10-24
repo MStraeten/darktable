@@ -70,6 +70,62 @@ void _box_mean(ImageIn in, ImageOut out, int line, int n, int i0, int i1, int w,
   }
 }
 
+// the box means for windows up to 2 * 32 + 1 wide, one pixel per work item,
+// from the rows (along x) or columns of the work group staged in group shared
+// memory. The work items of a running sum walk a chunk one after the other,
+// which leaves a GPU waiting on memory; this way they all read at once
+static const int BOX_TILE_MAX_W = 32;
+groupshared float box_tile[16 * (16 + 2 * BOX_TILE_MAX_W)];
+
+float _box_mean_tile(ImageIn in, uint3 gid, uint3 lid, int width, int height, int w, bool along_x)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  const int x0 = x - int(lid.x);
+  const int y0 = y - int(lid.y);
+  const int len = 16 + 2 * w;
+
+  // the line of each work item runs along the tile's rows (along x) or columns
+  for(int k = int(lid.y * 16 + lid.x); k < 16 * len; k += 256)
+  {
+    const int line = k / len;
+    const int pos = k % len;
+    const int xx = along_x ? x0 - w + pos : x0 + line;
+    const int yy = along_x ? y0 + line : y0 - w + pos;
+    box_tile[k] = (xx >= 0 && xx < width && yy >= 0 && yy < height) ? in.readA(int2(xx, yy)).x : 0.0f;
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  const int i = along_x ? x : y;
+  const int n = along_x ? width : height;
+  const int base = (along_x ? int(lid.y) : int(lid.x)) * len + w - (along_x ? x0 : y0);
+  float m = 0.f, c = 0.f;
+  const int j0 = max(i - w, 0);
+  const int j1 = min(i + w + 1, n);
+  for(int j = j0; j < j1; j++) Kahan_sum(m, c, box_tile[base + j]);
+  return m / float(j1 - j0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void guided_filter_box_mean_x_tile(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
+                                   uniform int width, uniform int height,
+                                   uniform ImageIn in, uniform ImageOut out, uniform int w)
+{
+  const float mean = _box_mean_tile(in, gid, lid, width, height, w, true);
+  if(int(gid.x) < width && int(gid.y) < height) out.write(int2(gid.xy), float4(mean));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void guided_filter_box_mean_y_tile(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
+                                   uniform int width, uniform int height,
+                                   uniform ImageIn in, uniform ImageOut out, uniform int w)
+{
+  const float mean = _box_mean_tile(in, gid, lid, width, height, w, false);
+  if(int(gid.x) < width && int(gid.y) < height) out.write(int2(gid.xy), float4(mean));
+}
+
 // work item x, y takes chunk values of row y from x * chunk on
 [shader("compute")]
 [numthreads(16, 16, 1)]
