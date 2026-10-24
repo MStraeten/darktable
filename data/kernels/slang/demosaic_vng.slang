@@ -16,9 +16,9 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Slang port of the VNG kernels in ../demosaic_vng.cl. The OpenCL kernels
-// stage their neighborhood in local memory, filled through the clamping
-// sampler; these read the image through the same clamp instead.
+// Slang port of the VNG kernels in ../demosaic_vng.cl. Like the OpenCL
+// kernels, these stage the neighborhood of their work group in group shared
+// memory, filled through the clamping sampler.
 
 import common;
 
@@ -26,9 +26,13 @@ import common;
 int _off_x(int offset) { return (offset << 16) >> 16; }
 int _off_y(int offset) { return offset >> 16; }
 
+// a 16x16 work group with a margin of 1 (linear) or 2 pixels
+groupshared float vng_lin_tile[18 * 18];
+groupshared float4 vng_tile[20 * 20];
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID,
+void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
                          uniform ImageIn in, uniform ImageOut out,
                          uniform int width, uniform int height, uniform int border,
                          uniform uint filters, uniform StructuredBuffer<uint> xtrans,
@@ -36,6 +40,18 @@ void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID,
 {
   const int x = gid.x;
   const int y = gid.y;
+
+  // with a border, a work group inside it has nothing to do. The test is the
+  // same for the whole group, which must reach the barrier together
+  const int x0 = x - int(lid.x);
+  const int y0 = y - int(lid.y);
+  if(border > 0 && x0 > border && y0 > border && x0 + 15 <= width - border && y0 + 15 <= height - border)
+    return;
+
+  for(int k = int(lid.y * 16 + lid.x); k < 18 * 18; k += 256)
+    vng_lin_tile[k] = in.readsingle(x0 - 1 + k % 18, y0 - 1 + k / 18);
+  GroupMemoryBarrierWithGroupSync();
+
   if(x >= width || y >= height) return;
 
   if(border > 0 && x > border && y > border && x <= width - border && y <= height - border)
@@ -87,7 +103,7 @@ void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID,
     for(int i = 0; i < num_pixels; i++, ip += 3)
     {
       const int offset = lookup[ip];
-      const float v = max(0.0f, in.readsingle(x + _off_x(offset), y + _off_y(offset)));
+      const float v = max(0.0f, vng_lin_tile[(int(lid.y) + 1 + _off_y(offset)) * 18 + int(lid.x) + 1 + _off_x(offset)]);
       sum[lookup[ip + 2]] += v * lookup[ip + 1];
     }
     // for each interpolated color, load it into the pixel
@@ -95,7 +111,7 @@ void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID,
     {
       o[lookup[ip]] = sum[lookup[ip]] / lookup[ip + 1];
     }
-    o[lookup[ip]] = max(0.0f, in.readsingle(x, y));
+    o[lookup[ip]] = max(0.0f, vng_lin_tile[(int(lid.y) + 1) * 18 + int(lid.x) + 1]);
   }
 
   if(only_linear != 0 && !is_xtrans)
@@ -108,7 +124,7 @@ void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID,
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void vng_interpolate(uint3 gid : SV_DispatchThreadID,
+void vng_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
                      uniform ImageIn in, uniform ImageOut out,
                      uniform int width, uniform int height,
                      uniform uint filters, uniform StructuredBuffer<uint> xtrans,
@@ -116,13 +132,24 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID,
 {
   const int x = gid.x;
   const int y = gid.y;
+
+  const int x0 = x - int(lid.x);
+  const int y0 = y - int(lid.y);
+  for(int k = int(lid.y * 16 + lid.x); k < 20 * 20; k += 256)
+    vng_tile[k] = in.readpixel(x0 - 2 + k % 20, y0 - 2 + k / 20);
+  GroupMemoryBarrierWithGroupSync();
+
   if(x >= width || y >= height) return;
+
+  // the pixel at offset dx, dy from this one
+  const int t0 = (int(lid.y) + 2) * 20 + int(lid.x) + 2;
+#define PX(dx, dy) vng_tile[t0 + (dy) * 20 + (dx)]
 
   const bool is_xtrans = filters == 9;
   // we don't touch data at the outermost 2 pixels
   if(x < 2 || x >= width-2 || y < 2 || y >= height-2)
   {
-    float4 val = in.readpixel(x, y);
+    float4 val = PX(0, 0);
     if(!is_xtrans)
     {
       val.y = 0.5f * (val.y + val.w);
@@ -161,8 +188,8 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID,
     const int weight = _off_x(ips[ip + 2]);
     const int color = _off_y(ips[ip + 2]);
 
-    const float4 p0 = in.readpixel(x + _off_x(offset0), y + _off_y(offset0));
-    const float4 p1 = in.readpixel(x + _off_x(offset1), y + _off_y(offset1));
+    const float4 p0 = PX(_off_x(offset0), _off_y(offset0));
+    const float4 p1 = PX(_off_x(offset1), _off_y(offset1));
     const float diff = abs(p0[color] - p1[color]) * weight;
 
     gval[ips[ip + 3]] += diff;
@@ -185,7 +212,7 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID,
     if(gmax < gval[g]) gmax = gval[g];
   }
 
-  const float4 center = in.readpixel(x, y);
+  const float4 center = PX(0, 0);
   float o[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
   if(gmax == 0.0f)
   {
@@ -212,8 +239,8 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID,
       const int c1 = nb[3 * g + 2];
       const int x1 = _off_x(offset1);
       const int y1 = _off_y(offset1);
-      const float4 p0 = in.readpixel(x + _off_x(offset0), y + _off_y(offset0));
-      const float4 p1 = in.readpixel(x + x1, y + y1);
+      const float4 p0 = PX(_off_x(offset0), _off_y(offset0));
+      const float4 p1 = PX(x1, y1);
 
       for(int c = 0; c < colors; c++)
       {
@@ -239,4 +266,5 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID,
   o[1] = is_xtrans ? o[1] : 0.5f * (o[1] + o[3]);
   o[3] = 0.0f;
   out.write(int2(x, y), max(float4(0.0f), float4(o[0], o[1], o[2], 0.0f)));
+#undef PX
 }
