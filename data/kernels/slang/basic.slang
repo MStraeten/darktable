@@ -1460,3 +1460,139 @@ void tonecurve(uint3 gid : SV_DispatchThreadID,
 
   out.write(int2(x, y), pixel);
 }
+
+// ---------------------------------------------------------------------------
+// ashift
+
+// ashift_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl: kwidth
+// 0 is bilinear, otherwise lanczos selects the filter, 0 for bicubic
+void _ashift(const uint3 gid, ImageIn in, ImageOut out, const int width, const int height,
+             const int iwidth, const int iheight, const int2 roi_in, const int2 roi_out,
+             const float in_scale, const float out_scale, const float2 clip,
+             StructuredBuffer<float> homograph, const int kwidth, const int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  float pin[3], pout[3];
+
+  // convert output pixel coordinates to original image coordinates
+  pout[0] = roi_out.x + x + clip.x;
+  pout[1] = roi_out.y + y + clip.y;
+  pout[0] /= out_scale;
+  pout[1] /= out_scale;
+  pout[2] = 1.0f;
+
+  // apply homograph
+  for(int i = 0; i < 3; i++)
+  {
+    pin[i] = 0.0f;
+    for(int j = 0; j < 3; j++) pin[i] += homograph[3 * i + j] * pout[j];
+  }
+
+  // convert to input pixel coordinates
+  pin[0] /= pin[2];
+  pin[1] /= pin[2];
+  pin[0] *= in_scale;
+  pin[1] *= in_scale;
+  pin[0] -= roi_in.x;
+  pin[1] -= roi_in.y;
+  const float rx = pin[0];
+  const float ry = pin[1];
+
+  float4 pixel = float4(0.0f);
+  if(kwidth == 0)
+  {
+    // done by hand, as hardware bilinear interpolation can't mirror
+    if(rx >= -1.0f && ry >= -1.0f && rx < float(iwidth) && ry < float(iheight))
+    {
+      const float fx = floor(rx);
+      const float fy = floor(ry);
+      const float dx = rx - fx;
+      const float dy = ry - fy;
+
+      const int x0 = clip_mirror(int(fx), iwidth - 1);
+      const int x1 = clip_mirror(int(fx) + 1, iwidth - 1);
+      const int y0 = clip_mirror(int(fy), iheight - 1);
+      const int y1 = clip_mirror(int(fy) + 1, iheight - 1);
+
+      pixel = (1.0f - dy) * ((1.0f - dx) * in.Areadpixel(x0, y0) + dx * in.Areadpixel(x1, y0))
+              + dy * ((1.0f - dx) * in.Areadpixel(x0, y1) + dx * in.Areadpixel(x1, y1));
+    }
+  }
+  else
+  {
+    const int tx = int(floor(rx));
+    const int ty = int(floor(ry));
+
+    float weight = 0.0f;
+    for(int jj = 1 - kwidth; jj <= kwidth; jj++)
+      for(int ii = 1 - kwidth; ii <= kwidth; ii++)
+      {
+        const int i = tx + ii;
+        const int j = ty + jj;
+
+        const float wx = lanczos != 0 ? interpolation_func_lanczos(float(lanczos), float(i) - rx)
+                                      : interpolation_func_bicubic(float(i) - rx);
+        const float wy = lanczos != 0 ? interpolation_func_lanczos(float(lanczos), float(j) - ry)
+                                      : interpolation_func_bicubic(float(j) - ry);
+        const float w = wx * wy;
+
+        pixel += in.Areadpixel(clip_mirror(i, iwidth - 1), clip_mirror(j, iheight - 1)) * w;
+        weight += w;
+      }
+
+    pixel = (tx >= -1 && ty >= -1 && tx < iwidth && ty < iheight) ? pixel / weight : float4(0.0f);
+  }
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void ashift_bilinear(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform int iwidth, uniform int iheight, uniform int2 roi_in, uniform int2 roi_out,
+                     uniform float in_scale, uniform float out_scale, uniform float2 clip,
+                     uniform StructuredBuffer<float> homograph)
+{
+  _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
+          homograph, 0, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void ashift_bicubic(uint3 gid : SV_DispatchThreadID,
+                    uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                    uniform int iwidth, uniform int iheight, uniform int2 roi_in, uniform int2 roi_out,
+                    uniform float in_scale, uniform float out_scale, uniform float2 clip,
+                    uniform StructuredBuffer<float> homograph)
+{
+  _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
+          homograph, 2, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void ashift_lanczos2(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform int iwidth, uniform int iheight, uniform int2 roi_in, uniform int2 roi_out,
+                     uniform float in_scale, uniform float out_scale, uniform float2 clip,
+                     uniform StructuredBuffer<float> homograph)
+{
+  _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
+          homograph, 2, 2);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void ashift_lanczos3(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform int iwidth, uniform int iheight, uniform int2 roi_in, uniform int2 roi_out,
+                     uniform float in_scale, uniform float out_scale, uniform float2 clip,
+                     uniform StructuredBuffer<float> homograph)
+{
+  _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
+          homograph, 3, 3);
+}

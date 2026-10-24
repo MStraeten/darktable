@@ -960,6 +960,21 @@ static int make_tests(test_t *t)
          FLOAT("dither", 1.0f / 256), INT("unbound", k));
   }
 
+  // rotate and perspective: a slight rotation with a keystone, partly
+  // outside the input
+  {
+    static const float as_homo[9] = { 0.995f, -0.06f, 9.0f, 0.07f, 1.01f, -6.0f, 1.2e-5f, -2e-5f, 1.0f };
+    static const char *as_kernels[4] = { "ashift_bilinear", "ashift_bicubic", "ashift_lanczos2", "ashift_lanczos3" };
+    // the homography lands a few ulp apart on the two devices, which on a
+    // noise image moves the interpolated values by up to about 1.6e-4
+    for(int k = 0; k < 4; k++)
+      TEST_TOL(as_kernels[k], "basic", as_kernels[k], 5e-4,
+               IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+               INT("iwidth", W), INT("iheight", H), INT2("roi_in", 3, 2), INT2("roi_out", 1, 4),
+               FLOAT("in_scale", 1.0f), FLOAT("out_scale", 1.0f), FLOAT2("clip", 2.5f, 1.5f),
+               BUFFER("homograph", as_homo, sizeof(as_homo)));
+  }
+
   // resampling, with plans like _prepare_resampling_plan() makes them: per
   // output pixel a length index, a kernel offset and an index offset, here
   // with 2 to 6 taps
