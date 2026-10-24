@@ -1213,11 +1213,11 @@ static int _box_slang(dt_slang_gpu_image_t *img, const int width, const int heig
 {
   dt_slang_gpu_image_t *temp = dt_slang_gpu_image_new(width, height, 1, NULL);
   int err = !temp
-    || dt_slang_gpu_run_1d_args("hazeremoval", max ? "hazeremoval_box_max_x" : "hazeremoval_box_min_x",
-                                height, SLARG(width), SLARG(height), SLIMG_DEV(img), SLIMG_DEV(temp),
+    || dt_slang_gpu_run_2d_args("hazeremoval", max ? "hazeremoval_box_max_x" : "hazeremoval_box_min_x",
+                                width, height, SLARG(width), SLARG(height), SLIMG_DEV(img), SLIMG_DEV(temp),
                                 SLARG(w))
-    || dt_slang_gpu_run_1d_args("hazeremoval", max ? "hazeremoval_box_max_y" : "hazeremoval_box_min_y",
-                                width, SLARG(width), SLARG(height), SLIMG_DEV(temp), SLIMG_DEV(img),
+    || dt_slang_gpu_run_2d_args("hazeremoval", max ? "hazeremoval_box_max_y" : "hazeremoval_box_min_y",
+                                width, height, SLARG(width), SLARG(height), SLIMG_DEV(temp), SLIMG_DEV(img),
                                 SLARG(w));
   dt_slang_gpu_image_free(temp);
   return err;

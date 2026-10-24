@@ -16,35 +16,22 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Slang port of ../hazeremoval.cl. The box filters walk whole rows or
-// columns, one work item each, as dt_slang_gpu_run_1d_args() lays them out.
+// Slang port of ../hazeremoval.cl. The OpenCL box filters walk whole rows or
+// columns, one work item each, which leaves most of a GPU idle; here each
+// work item takes one pixel, as the windows are small (w1 is at most 6).
 
 import common;
 
-// the running minimum (sign 1) or maximum (sign -1) over a 2w+1 window along
-// a line of n values, which in and out read and write at position i
-float _box_init(ImageIn in, int line, int n, int w, bool along_x, float sign)
+// the minimum (sign 1) or maximum (sign -1) over the 2w+1 window around x, y
+// along x or y, clipped to the image, as the running filter of OpenCL finds it
+float _box(ImageIn in, int x, int y, int width, int height, int w, bool along_x, float sign)
 {
+  const int i = along_x ? x : y;
+  const int n = along_x ? width : height;
   float m = asfloat(0x7f800000u);
-  for(int i = 0, i_end = min(w + 1, n); i < i_end; ++i)
-    m = min(sign * in.readsingle(along_x ? i : line, along_x ? line : i), m);
-  return m;
-}
-
-void _box(ImageIn in, ImageOut out, int line, int n, int w, bool along_x, float sign)
-{
-  float m = _box_init(in, line, n, w, along_x, sign);
-  for(int i = 0; i < n; i++)
-  {
-    out.write(along_x ? int2(i, line) : int2(line, i), float4(sign * m));
-    if(i - w >= 0 && sign * in.readsingle(along_x ? i - w : line, along_x ? line : i - w) == m)
-    {
-      m = asfloat(0x7f800000u);
-      for(int j = max(i - w + 1, 0), j_end = min(i + w + 2, n); j < j_end; ++j)
-        m = min(sign * in.readsingle(along_x ? j : line, along_x ? line : j), m);
-    }
-    if(i + w + 1 < n) m = min(sign * in.readsingle(along_x ? i + w + 1 : line, along_x ? line : i + w + 1), m);
-  }
+  for(int j = max(i - w, 0), j_end = min(i + w + 1, n); j < j_end; j++)
+    m = min(sign * in.readsingle(along_x ? j : x, along_x ? y : j), m);
+  return sign * m;
 }
 
 [shader("compute")]
@@ -53,9 +40,10 @@ void hazeremoval_box_min_x(uint3 gid : SV_DispatchThreadID,
                            uniform int width, uniform int height, uniform ImageIn in, uniform ImageOut out,
                            uniform int w)
 {
-  const int y = gid.y * 16 + gid.x;
-  if(y >= height) return;
-  _box(in, out, y, width, w, true, 1.0f);
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  out.write(int2(x, y), float4(_box(in, x, y, width, height, w, true, 1.0f)));
 }
 
 [shader("compute")]
@@ -64,9 +52,10 @@ void hazeremoval_box_min_y(uint3 gid : SV_DispatchThreadID,
                            uniform int width, uniform int height, uniform ImageIn in, uniform ImageOut out,
                            uniform int w)
 {
-  const int x = gid.y * 16 + gid.x;
-  if(x >= width) return;
-  _box(in, out, x, height, w, false, 1.0f);
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  out.write(int2(x, y), float4(_box(in, x, y, width, height, w, false, 1.0f)));
 }
 
 [shader("compute")]
@@ -75,9 +64,10 @@ void hazeremoval_box_max_x(uint3 gid : SV_DispatchThreadID,
                            uniform int width, uniform int height, uniform ImageIn in, uniform ImageOut out,
                            uniform int w)
 {
-  const int y = gid.y * 16 + gid.x;
-  if(y >= height) return;
-  _box(in, out, y, width, w, true, -1.0f);
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  out.write(int2(x, y), float4(_box(in, x, y, width, height, w, true, -1.0f)));
 }
 
 [shader("compute")]
@@ -86,9 +76,10 @@ void hazeremoval_box_max_y(uint3 gid : SV_DispatchThreadID,
                            uniform int width, uniform int height, uniform ImageIn in, uniform ImageOut out,
                            uniform int w)
 {
-  const int x = gid.y * 16 + gid.x;
-  if(x >= width) return;
-  _box(in, out, x, height, w, false, -1.0f);
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  out.write(int2(x, y), float4(_box(in, x, y, width, height, w, false, -1.0f)));
 }
 
 [shader("compute")]

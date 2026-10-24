@@ -17,9 +17,9 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Slang port of ../guided_filter.cl. The box means run over a single row of
-// work items in OpenCL; here they are dispatched on 16x16 work groups too, so
-// they skip the work items of the other rows.
+// Slang port of ../guided_filter.cl. The box means run one work item per row
+// or column in OpenCL, which leaves most of a GPU idle; here each work item
+// takes a chunk of a row or column, and starts its running sum anew.
 
 import common;
 
@@ -44,124 +44,56 @@ void guided_filter_split_rgb_image(uint3 gid : SV_DispatchThreadID,
   out_b.write(int2(x, y), float4(pixel.z));
 }
 
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void guided_filter_box_mean_x(uint3 gid : SV_DispatchThreadID,
-                              uniform int width, uniform int height,
-                              uniform ImageIn in, uniform ImageOut out, uniform int w)
+// the means over the 2w+1 windows, clipped to the line of n values, at
+// positions i0 to i1 - 1 along x (along_x) or y
+void _box_mean(ImageIn in, ImageOut out, int line, int n, int i0, int i1, int w, bool along_x)
 {
-  const int y = gid.y * 16 + gid.x;
-  if(y >= height) return;
-
   float m = 0.f, n_box = 0.f, c = 0.f;
-  if(width > 2 * w)
+  for(int j = max(i0 - w, 0), j_end = min(i0 + w + 1, n); j < j_end; j++)
   {
-    for(int i = 0; i < w + 1; i++)
+    Kahan_sum(m, c, in.readsingle(along_x ? j : line, along_x ? line : j));
+    n_box += 1.f;
+  }
+  for(int i = i0; i < i1; i++)
+  {
+    out.write(along_x ? int2(i, line) : int2(line, i), float4(m / n_box));
+    if(i - w >= 0)
     {
-      Kahan_sum(m, c, in.readsingle(i, y));
-      n_box += 1.f;
-    }
-    for(int i = 0; i < w; i++)
-    {
-      out.write(int2(i, y), float4(m / n_box));
-      Kahan_sum(m, c, in.readsingle(i + w + 1, y));
-      n_box += 1.f;
-    }
-    for(int i = w; i < width - w - 1; i++)
-    {
-      out.write(int2(i, y), float4(m / n_box));
-      Kahan_sum(m, c, in.readsingle(i + w + 1, y));
-      Kahan_sum(m, c, -in.readsingle(i - w, y));
-    }
-    for(int i = width - w - 1; i < width; i++)
-    {
-      out.write(int2(i, y), float4(m / n_box));
-      Kahan_sum(m, c, -in.readsingle(i - w, y));
+      Kahan_sum(m, c, -in.readsingle(along_x ? i - w : line, along_x ? line : i - w));
       n_box -= 1.f;
     }
-  }
-  else
-  {
-    for(int i = 0; i < min(w + 1, width); i++)
+    if(i + w + 1 < n)
     {
-      Kahan_sum(m, c, in.readsingle(i, y));
+      Kahan_sum(m, c, in.readsingle(along_x ? i + w + 1 : line, along_x ? line : i + w + 1));
       n_box += 1.f;
-    }
-    for(int i = 0; i < width; i++)
-    {
-      out.write(int2(i, y), float4(m / n_box));
-      if(i - w >= 0)
-      {
-        Kahan_sum(m, c, -in.readsingle(i - w, y));
-        n_box -= 1.f;
-      }
-      if(i + w + 1 < width)
-      {
-        Kahan_sum(m, c, in.readsingle(i + w + 1, y));
-        n_box += 1.f;
-      }
     }
   }
 }
 
+// work item x, y takes chunk values of row y from x * chunk on
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void guided_filter_box_mean_x(uint3 gid : SV_DispatchThreadID,
+                              uniform int width, uniform int height,
+                              uniform ImageIn in, uniform ImageOut out, uniform int w, uniform int chunk)
+{
+  const int x0 = gid.x * chunk;
+  const int y = gid.y;
+  if(x0 >= width || y >= height) return;
+  _box_mean(in, out, y, width, x0, min(x0 + chunk, width), w, true);
+}
+
+// work item x, y takes chunk values of column x from y * chunk on
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void guided_filter_box_mean_y(uint3 gid : SV_DispatchThreadID,
                               uniform int width, uniform int height,
-                              uniform ImageIn in, uniform ImageOut out, uniform int w)
+                              uniform ImageIn in, uniform ImageOut out, uniform int w, uniform int chunk)
 {
-  const int x = gid.y * 16 + gid.x;
-  if(x >= width) return;
-
-  float m = 0.f, n_box = 0.f, c = 0.f;
-  if(height > 2 * w)
-  {
-    for(int i = 0; i < w + 1; i++)
-    {
-      Kahan_sum(m, c, in.readsingle(x, i));
-      n_box += 1.f;
-    }
-    for(int i = 0; i < w; i++)
-    {
-      out.write(int2(x, i), float4(m / n_box));
-      Kahan_sum(m, c, in.readsingle(x, i + w + 1));
-      n_box += 1.f;
-    }
-    for(int i = w; i < height - w - 1; i++)
-    {
-      out.write(int2(x, i), float4(m / n_box));
-      Kahan_sum(m, c, in.readsingle(x, i + w + 1));
-      Kahan_sum(m, c, -in.readsingle(x, i - w));
-    }
-    for(int i = height - w - 1; i < height; i++)
-    {
-      out.write(int2(x, i), float4(m / n_box));
-      Kahan_sum(m, c, -in.readsingle(x, i - w));
-      n_box -= 1.f;
-    }
-  }
-  else
-  {
-    for(int i = 0; i < min(w + 1, height); i++)
-    {
-      Kahan_sum(m, c, in.readsingle(x, i));
-      n_box += 1.f;
-    }
-    for(int i = 0; i < height; i++)
-    {
-      out.write(int2(x, i), float4(m / n_box));
-      if(i - w >= 0)
-      {
-        Kahan_sum(m, c, -in.readsingle(x, i - w));
-        n_box -= 1.f;
-      }
-      if(i + w + 1 < height)
-      {
-        Kahan_sum(m, c, in.readsingle(x, i + w + 1));
-        n_box += 1.f;
-      }
-    }
-  }
+  const int x = gid.x;
+  const int y0 = gid.y * chunk;
+  if(x >= width || y0 >= height) return;
+  _box_mean(in, out, x, height, y0, min(y0 + chunk, height), w, false);
 }
 
 [shader("compute")]

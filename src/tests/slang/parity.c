@@ -972,9 +972,15 @@ static int make_tests(test_t *t)
   {
     static const char *hz_kernels[4] = { "hazeremoval_box_min_x", "hazeremoval_box_min_y",
                                          "hazeremoval_box_max_x", "hazeremoval_box_max_y" };
+    // one work item per pixel in Slang, per row or column in OpenCL
     for(int k = 0; k < 4; k++)
-      TEST_LINE(hz_kernels[k], "hazeremoval", hz_kernels[k], 0.0, (k & 1) ? W : H,
-                INT("width", W), INT("height", H), RAW_IN("in", image_raw), RAW_OUT("out"), INT("w", 6));
+    {
+      TEST(hz_kernels[k], "hazeremoval", hz_kernels[k],
+           INT("width", W), INT("height", H), RAW_IN("in", image_raw), RAW_OUT("out"), INT("w", 6));
+      t[n - 1].clgw = (k & 1) ? W : H;
+      t[n - 1].clgh = 1;
+      t[n - 1].clly = 1;
+    }
     TEST("hazeremoval_transision_map", "hazeremoval", "hazeremoval_transision_map",
          INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_OUT("out"), FLOAT("strength", 0.6f),
          FLOAT("A0_r", 0.9f), FLOAT("A0_g", 0.95f), FLOAT("A0_b", 1.05f));
@@ -1439,14 +1445,23 @@ static int make_tests(test_t *t)
               INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in),
               GF_OUT("out_r"), GF_OUT("out_g"), GF_OUT("out_b"), FLOAT("guide_weight", 10.0f));
     // a narrow window, and one wider than half the image
-    TEST_LINE("guided_filter_box_mean_x w7", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH,
-              INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 7));
-    TEST_LINE("guided_filter_box_mean_x w300", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH,
-              INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 300));
-    TEST_LINE("guided_filter_box_mean_y w7", "guided_filter", "guided_filter_box_mean_y", 1e-6, W,
-              INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 7));
-    TEST_LINE("guided_filter_box_mean_y w150", "guided_filter", "guided_filter_box_mean_y", 1e-6, W,
-              INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 150));
+    // a work item per chunk of a row or column in Slang, per row or column in OpenCL
+#define GF_BOX(lbl, kern, along_x, wnd)                                                      \
+    {                                                                                    \
+      const int chunk = (2 * (wnd) + 1) < 16 ? 16 : (2 * (wnd) + 1) > 64 ? 64 : 2 * (wnd) + 1; \
+      TEST_GRID(lbl, "guided_filter", kern, 1e-6, along_x ? (W + chunk - 1) / chunk : W,   \
+                along_x ? GH : (GH + chunk - 1) / chunk, INT("width", W), INT("height", GH),  \
+                GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", wnd), SLANG_INT("chunk", chunk)); \
+      t[n - 1].clgw = along_x ? GH : W;                                                    \
+      t[n - 1].clgh = 1;                                                                   \
+      t[n - 1].clly = 1;                                                                   \
+    }
+    // a narrow window, and one wider than half the image
+    GF_BOX("guided_filter_box_mean_x w7", "guided_filter_box_mean_x", 1, 7);
+    GF_BOX("guided_filter_box_mean_x w300", "guided_filter_box_mean_x", 1, 300);
+    GF_BOX("guided_filter_box_mean_y w7", "guided_filter_box_mean_y", 0, 7);
+    GF_BOX("guided_filter_box_mean_y w150", "guided_filter_box_mean_y", 0, 150);
+#undef GF_BOX
     TEST_GRID("guided_filter_covariances", "guided_filter", "guided_filter_covariances", 0.0, W, GH,
               INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in), GF_IN("img", rcd_dir),
               GF_OUT("cov_imgg_img_r"), GF_OUT("cov_imgg_img_g"), GF_OUT("cov_imgg_img_b"),
