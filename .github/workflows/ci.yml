@@ -92,6 +92,16 @@ jobs:
             generator: Ninja
             eco: -DDONT_USE_INTERNAL_LIBRAW=ON
             name_suffix: _tests
+          # Builds the Slang kernels and runs their parity test against the
+          # OpenCL kernels on Mesa's lavapipe and PoCL, which need no GPU
+          - distro: "ubuntu:26.04"
+            btype: Release
+            compiler: { compiler: GNU16, CC: gcc-16, CXX: g++-16, packages: gcc-16 g++-16 }
+            target: build
+            generator: Ninja
+            eco: -DDONT_USE_INTERNAL_LIBRAW=ON -DUSE_SLANG=ON
+            name_suffix: _slang
+            slang: true
     env:
       DISTRO: ${{ matrix.distro }}
       CC: ${{ matrix.compiler.CC }}
@@ -226,6 +236,13 @@ jobs:
           git clone --depth 1 https://github.com/darktable-org/darktable-spektrafilm.git \
               "$GITHUB_WORKSPACE/spektrafilm"
           echo "SPEKTRA_PACK_DIR=$GITHUB_WORKSPACE/spektrafilm/packs" >> "$GITHUB_ENV"
+      - name: Install the Slang compiler, Vulkan and OpenCL on the CPU
+        if: matrix.slang
+        run: |
+          eatmydata apt-get --yes install curl ca-certificates unzip \
+            libvulkan-dev mesa-vulkan-drivers ocl-icd-opencl-dev pocl-opencl-icd
+          slangc=$(./src/.ci/install-slangc.sh "${{ github.workspace }}/slang")
+          echo "ECO=${ECO} -DSLANGC_EXECUTABLE=${slangc}" >> "$GITHUB_ENV"
       - name: Build and Install
         run: |
           cmake -E make_directory "${BUILD_DIR}";
@@ -243,10 +260,24 @@ jobs:
                  --conf worker_threads=4 -t 4 \
                  --conf plugins/lighttable/export/force_lcms2=FALSE \
                  --conf plugins/lighttable/export/iccintent=0
+      - name: Check that the pipe runs on the Slang kernels
+        if: matrix.slang
+        run: |
+          ls "${INSTALL_PREFIX}"/share/darktable/kernels/slang/*.spv
+          ${INSTALL_PREFIX}/bin/darktable-cli \
+                 "${SRC_DIR}/src/tests/integration/images/mire1.cr2" \
+                 "${SRC_DIR}/tools/slang-bench/scene-referred.xmp" \
+                 slang.png \
+                 --width 1000 --height 1000 --apply-custom-presets false \
+                 --core --disable-opencl --library :memory: \
+                 --conf slang_gpu=TRUE -d pipe > slang.log 2>&1
+          echo "$(grep -c 'process slang' slang.log) module runs on Slang"
+          grep -q 'process slang' slang.log
+          ! grep 'slang fallback' slang.log
 
   Windows:
     if: github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch'
-    name: Windows_${{ matrix.msystem }}_${{ matrix.btype }}
+    name: Windows_${{ matrix.msystem }}_${{ matrix.btype }}${{ matrix.name_suffix }}
     runs-on: windows-latest
     strategy:
       fail-fast: true
@@ -261,6 +292,16 @@ jobs:
         generator:
           - Ninja
         eco: [-DDONT_USE_INTERNAL_LIBRAW=ON]
+        include:
+          # builds the Slang kernels and the Vulkan backend; there is no
+          # Vulkan device to run them on
+          - btype: Release
+            msystem: UCRT64
+            target: skiptest
+            generator: Ninja
+            eco: -DDONT_USE_INTERNAL_LIBRAW=ON -DUSE_SLANG=ON
+            name_suffix: _slang
+            slang: true
     defaults:
       run:
         shell: msys2 {0}
@@ -280,6 +321,7 @@ jobs:
             git
             intltool
             po4a
+            unzip
           pacboy: >-
             cc:p
             cmake:p
@@ -324,6 +366,8 @@ jobs:
             pugixml:p
             SDL2:p
             sqlite3:p
+            vulkan-headers:p
+            vulkan-loader:p
             zlib:p
           update: true
       - run: git config --global core.autocrlf input
@@ -340,6 +384,11 @@ jobs:
           git config submodule.src/tests/integration.update none
           git submodule update
           cd -
+      - name: Install the Slang compiler
+        if: matrix.slang
+        run: |
+          slangc=$($(cygpath ${SRC_DIR})/.ci/install-slangc.sh "$(cygpath '${{ github.workspace }}')/slang")
+          echo "ECO=${ECO} -DSLANGC_EXECUTABLE=$(cygpath -m "${slangc}")" >> "$GITHUB_ENV"
       - name: Build and Install
         run: |
           cmake -E make_directory "${BUILD_DIR}"
@@ -379,6 +428,16 @@ jobs:
         generator:
           - Ninja
         eco: [-DDONT_USE_INTERNAL_LIBRAW=ON -DUSE_GRAPHICSMAGICK=OFF -DUSE_IMAGEMAGICK=ON]
+        include:
+          # builds the Slang kernels into .metallib files and the Metal backend
+          - build: { os: macos-15, xcode: 26.3, deployment: 15.0 }
+            compiler: { compiler: XCode, CC: cc, CXX: c++ }
+            btype: Release
+            target: skiptest
+            generator: Ninja
+            eco: -DDONT_USE_INTERNAL_LIBRAW=ON -DUSE_GRAPHICSMAGICK=OFF -DUSE_IMAGEMAGICK=ON -DUSE_SLANG=ON
+            name_suffix: _slang
+            slang: true
     env:
       DEVELOPER_DIR: /Applications/Xcode_${{ matrix.build.xcode }}.app/Contents/Developer
       CC: ${{ matrix.compiler.CC }}
@@ -439,6 +498,14 @@ jobs:
           git clone --depth 1 https://github.com/darktable-org/darktable-spektrafilm.git \
               "$GITHUB_WORKSPACE/spektrafilm"
           echo "SPEKTRA_PACK_DIR=$GITHUB_WORKSPACE/spektrafilm/packs" >> "$GITHUB_ENV"
+      - name: Install the Slang compiler and the Metal toolchain
+        if: matrix.slang
+        run: |
+          # Xcode 26 ships the metal compiler as a separate component
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx -f metal
+          slangc=$(./src/.ci/install-slangc.sh "${{ github.workspace }}/slang")
+          echo "ECO=${ECO} -DSLANGC_EXECUTABLE=${slangc}" >> "$GITHUB_ENV"
       - name: Build and Install
         run: |
           cmake -E make_directory "${BUILD_DIR}";
@@ -456,3 +523,21 @@ jobs:
                  --conf worker_threads=4 -t 4 \
                  --conf plugins/lighttable/export/force_lcms2=FALSE \
                  --conf plugins/lighttable/export/iccintent=0
+      - name: Check that the Slang kernels are installed
+        if: matrix.slang
+        run: |
+          ls "${INSTALL_PREFIX}"/share/darktable/kernels/slang/*.metallib
+      - name: Check that the Slang kernels run
+        if: matrix.slang
+        # the hosted runners are virtual machines, whose Metal device may not
+        # run compute kernels
+        continue-on-error: true
+        run: |
+          ${INSTALL_PREFIX}/bin/darktable-cli \
+                 "${SRC_DIR}/data/pixmaps/256x256/darktable.png" \
+                 slang.png \
+                 --core --disable-opencl --library :memory: \
+                 --conf slang_gpu=TRUE -d pipe > slang.log 2>&1
+          echo "$(grep -c 'process slang' slang.log) module runs on Slang"
+          grep -q 'process slang' slang.log
+          ! grep 'slang fallback' slang.log
