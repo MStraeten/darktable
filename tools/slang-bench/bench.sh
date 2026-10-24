@@ -10,6 +10,9 @@
 # "reference" uses fixed, machine-independent memory limits and tiles more)
 # extra darktable-cli arguments for every run can be passed in BENCH_ARGS
 set -u
+# darktable prints its timings in the user's locale ("took 1,637 secs" in
+# German), which the patterns below do not read
+export LC_ALL=C
 SRC=$(cd "$1" && pwd); N=${2:-5}; SIZE=${3:-0}
 RESOURCES=${RESOURCES:-default}
 HERE=$(cd "$(dirname "$0")" && pwd)
