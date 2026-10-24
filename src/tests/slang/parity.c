@@ -81,6 +81,7 @@ typedef struct test_t
   const char *label;
   const char *program; // .cl file, also the .spv file name
   const char *kernel;
+  const char *slang_kernel; // the Slang entry point, where it differs from the OpenCL kernel
   double tolerance; // 0 for the default
   int gw, gh;       // work items, W x H if 0
   int clgw, clgh, cllx, clly; // OpenCL global and local sizes, if they differ from the above
@@ -363,6 +364,8 @@ static void markesteijn_hex(const uint8_t (*const xtrans)[6], signed char allhex
 #define FLOAT4_BUF(n, a, b, c, d) { .kind = ARG_FLOAT4_BUF, .name = n, .v = { a, b, c, d } }
 #define SLANG_INT(n, val) { .kind = ARG_INT, .name = n, .i = val, .slang_only = 1 }
 #define SLANG_BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz, .slang_only = 1 }
+#define SLANG_RAW_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = 1, .pixels = px, \
+                              .slang_only = 1 }
 #define CHAR2(n, a, b) { .kind = ARG_CHAR2, .name = n, .iv = { a, b } }
 #define RAW_U16(n, ptr, rw, rh) { .kind = ARG_RAW_U16, .name = n, .data = ptr, .w = rw, .h = rh, \
                                   .size = (size_t)(rw) * (rh) * sizeof(uint16_t) }
@@ -800,64 +803,68 @@ static int make_tests(test_t *t)
   }
 
   // the Markesteijn steps, each on plausible data of its own: color planes
-  // with all channels set, green limits around them, derivatives and
-  // homogeneity bytes in their ranges. The byte maps are padded to words
+  // with all channels set, green limits around them and the raw data as
+  // OpenCL's markesteijn_initial_copy() spreads it over the channels. The
+  // Slang kernels that merge the steps after the green interpolation have no
+  // OpenCL counterpart to compare with here
   {
     static signed char allhex[3][3][8][2];
     static int sg[2];
     markesteijn_hex(xtrans, allhex, sg);
     const size_t npix = (size_t)W * H;
     const size_t p4 = sizeof(float) * 4 * npix;
-    const size_t bsize = (npix + 3) / 4 * 4;
-    static float *mk_rgb[4], *mk_minmax, *mk_drv, *mk_thresh;
-    static uint8_t *mk_homo, *mk_homosum, *mk_homosum2, *mk_maxval;
+    static float *mk_rgb[4], *mk_cfa, *mk_yuv, *mk_minmax;
     for(int c = 0; c < 4; c++)
     {
       mk_rgb[c] = malloc(p4);
       for(size_t k = 0; k < 4 * npix; k++) mk_rgb[c][k] = fmaxf(0.0f, image_in[k] * (0.9f + 0.2f * frand()));
     }
+    mk_cfa = calloc(4 * npix, sizeof(float));
+    mk_yuv = calloc(4 * npix, sizeof(float));
     mk_minmax = malloc(sizeof(float) * 2 * npix);
-    mk_drv = malloc(sizeof(float) * npix);
-    mk_thresh = malloc(sizeof(float) * npix);
-    mk_homo = calloc(1, bsize);
-    mk_homosum = calloc(1, bsize);
-    mk_homosum2 = calloc(1, bsize);
-    mk_maxval = calloc(1, bsize);
-    for(size_t k = 0; k < npix; k++)
-    {
-      const float g = mk_rgb[0][4 * k + 1];
-      mk_minmax[2 * k] = g - 0.1f * frand();
-      mk_minmax[2 * k + 1] = g + 0.1f * frand();
-      mk_drv[k] = frand() * frand();
-      mk_thresh[k] = 0.1f * frand();
-      mk_homo[k] = rand() % 10;
-      mk_homosum[k] = rand() % 226;
-      mk_homosum2[k] = rand() % 226;
-      mk_maxval[k] = rand() % 226;
-    }
-#define BYTES_INOUT(n, ptr) { .kind = ARG_BUFFER_OUT, .name = n, .data = ptr, .size = bsize, .bytes = 1 }
+    for(int y = 0; y < H; y++)
+      for(int x = 0; x < W; x++)
+      {
+        const size_t k = (size_t)y * W + x;
+        mk_cfa[4 * k + fcol(y, x, 9, xtrans)] = fmaxf(0.0f, image_raw[k]);
+        const float *p = mk_rgb[0] + 4 * k;
+        const float Y = 0.2627f * p[0] + 0.6780f * p[1] + 0.0593f * p[2];
+        mk_yuv[4 * k] = Y;
+        mk_yuv[4 * k + 1] = (p[2] - Y) * 0.56433f;
+        mk_yuv[4 * k + 2] = (p[0] - Y) * 0.67815f;
+        const float g = mk_rgb[0][4 * k + 1];
+        mk_minmax[2 * k] = g - 0.1f * frand();
+        mk_minmax[2 * k + 1] = g + 0.1f * frand();
+      }
 #define MK_HEX BUFFER("allhex", allhex, sizeof(allhex))
 #define MK_XT BUFFER("xtrans", xtrans, sizeof(xtrans))
-    TEST("markesteijn_initial_copy", "demosaic_markesteijn", "markesteijn_initial_copy",
-         RAW_IN("in", image_raw), BUFFER_OUT("rgb", mk_rgb[0], p4), INT("width", W), INT("height", H), MK_XT);
     TEST("markesteijn_green_minmax", "demosaic_markesteijn", "markesteijn_green_minmax",
-         BUFFER("rgb", mk_rgb[0], p4), BUFFER_OUT("gminmax", NULL, sizeof(float) * 2 * npix), INT("width", W),
+         BUFFER("rgb", mk_cfa, p4), SLANG_RAW_IN("in", image_raw),
+         BUFFER_OUT("gminmax", NULL, sizeof(float) * 2 * npix), INT("width", W),
          INT("height", H), INT("border", 3), CHAR2("sgreen", sg[0], sg[1]), MK_XT, MK_HEX,
          LOCAL("buffer", sizeof(float) * 22 * 22));
-    TEST("markesteijn_interpolate_green", "demosaic_markesteijn", "markesteijn_interpolate_green",
-         SLANG_BUFFER("rgb_in", mk_rgb[0], p4),
-         BUFFER_OUT("rgb_0", mk_rgb[0], p4), BUFFER_OUT("rgb_1", mk_rgb[1], p4), BUFFER_OUT("rgb_2", mk_rgb[2], p4),
-         BUFFER_OUT("rgb_3", mk_rgb[3], p4), BUFFER("gminmax", mk_minmax, sizeof(float) * 2 * npix),
+    // the four buffers start as the OpenCL kernel finds them, and the Slang
+    // kernel fills them from the raw data as well
+    TEST("markesteijn_initial_green", "demosaic_markesteijn", "markesteijn_interpolate_green",
+         SLANG_RAW_IN("in", image_raw),
+         BUFFER_OUT("rgb_0", mk_cfa, p4), BUFFER_OUT("rgb_1", mk_cfa, p4), BUFFER_OUT("rgb_2", mk_cfa, p4),
+         BUFFER_OUT("rgb_3", mk_cfa, p4), BUFFER("gminmax", mk_minmax, sizeof(float) * 2 * npix),
          INT("width", W), INT("height", H), INT("border", 3), CHAR2("sgreen", sg[0], sg[1]), MK_XT, MK_HEX,
          LOCAL("buffer", 4 * sizeof(float) * 28 * 28));
+    t[n - 1].slang_kernel = "markesteijn_initial_green";
     for(int d = 0; d < 6; d += 3)
     {
       static const char *mk_labels[6] = { "markesteijn_solitary_green d0", 0, 0, "markesteijn_solitary_green d3" };
       const int i = d & 1 ? 0 : 1;
-      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_solitary_green",
-           BUFFER_OUT("rgb", mk_rgb[0], p4), BUFFER_OUT("aux", mk_rgb[1], p4), INT("width", W), INT("height", H),
-           INT("border", 5), INT("d", d), CHAR2("dir", i, i ^ 1), INT("hcomp", d & 1 ? 2 : 0),
-           CHAR2("sgreen", sg[0], sg[1]), MK_XT, LOCAL("buffer", 4 * sizeof(float) * 20 * 20));
+      // the Slang work items cover only the solitary green pixels
+      TEST_GRID(mk_labels[d], "demosaic_markesteijn", "markesteijn_solitary_green", 0.0,
+                (W - sg[0] + 2) / 3, (H - sg[1] + 2) / 3,
+                BUFFER_OUT("rgb", mk_rgb[0], p4), BUFFER_OUT("aux", mk_rgb[1], p4), INT("width", W),
+                INT("height", H), INT("border", 5), INT("d", d), CHAR2("dir", i, i ^ 1),
+                INT("hcomp", d & 1 ? 2 : 0), CHAR2("sgreen", sg[0], sg[1]), MK_XT,
+                LOCAL("buffer", 4 * sizeof(float) * 20 * 20));
+      t[n - 1].clgw = W;
+      t[n - 1].clgh = H;
     }
     TEST("markesteijn_recalculate_green", "demosaic_markesteijn", "markesteijn_recalculate_green",
          BUFFER_OUT("rgb_0", mk_rgb[0], p4), BUFFER_OUT("rgb_1", mk_rgb[1], p4), BUFFER_OUT("rgb_2", mk_rgb[2], p4),
@@ -878,48 +885,15 @@ static int make_tests(test_t *t)
            BUFFER_OUT("rgb", mk_rgb[d / 2], p4), INT("width", W), INT("height", H), INT("border", 8), INT("d", d),
            CHAR2("sgreen", sg[0], sg[1]), MK_XT, MK_HEX, LOCAL("buffer", 4 * sizeof(float) * 20 * 20));
     }
-    TEST("markesteijn_convert_yuv", "demosaic_markesteijn", "markesteijn_convert_yuv",
-         BUFFER("rgb", mk_rgb[0], p4), BUFFER_OUT("yuv", mk_rgb[1], p4), INT("width", W), INT("height", H),
-         INT("border", 8));
+    // OpenCL differentiates the converted buffer, the Slang kernel converts as it reads
     for(int d = 0; d < 8; d += 5)
     {
       static const char *mk_labels[8] = { "markesteijn_differentiate d0", 0, 0, 0, 0, "markesteijn_differentiate d5" };
       TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_differentiate",
-           BUFFER("yuv", mk_rgb[1], p4), BUFFER_OUT("drv", mk_drv, sizeof(float) * npix), INT("width", W),
+           BUFFER("yuv", mk_yuv, p4), SLANG_BUFFER("rgb", mk_rgb[0], p4),
+           BUFFER_OUT("drv", NULL, sizeof(float) * npix), INT("width", W),
            INT("height", H), INT("border", 8), INT("d", d), LOCAL("buffer", 4 * sizeof(float) * 18 * 18));
     }
-    for(int d = 0; d < 2; d++)
-    {
-      static const char *mk_labels[2] = { "markesteijn_homo_threshold d0", "markesteijn_homo_threshold d1" };
-      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_homo_threshold",
-           BUFFER("drv", mk_drv, sizeof(float) * npix), BUFFER_OUT("thresh", mk_thresh, sizeof(float) * npix),
-           INT("width", W), INT("height", H), INT("border", 10), INT("d", d));
-    }
-    TEST("markesteijn_homo_set", "demosaic_markesteijn", "markesteijn_homo_set",
-         BUFFER("drv", mk_drv, sizeof(float) * npix), BUFFER("thresh", mk_thresh, sizeof(float) * npix),
-         BYTES_INOUT("homo", mk_homo), INT("width", W), INT("height", H), INT("border", 10),
-         LOCAL("buffer", sizeof(float) * 18 * 18));
-    TEST("markesteijn_homo_sum", "demosaic_markesteijn", "markesteijn_homo_sum",
-         BUFFER("homo", mk_homo, bsize), BYTES_INOUT("homosum", mk_homosum), INT("width", W), INT("height", H),
-         INT("border", 12), LOCAL("buffer", 20 * 20));
-    for(int d = 0; d < 2; d++)
-    {
-      static const char *mk_labels[2] = { "markesteijn_homo_max d0", "markesteijn_homo_max d1" };
-      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_homo_max",
-           BUFFER("homosum", mk_homosum, bsize), BYTES_INOUT("maxval", mk_maxval), INT("width", W),
-           INT("height", H), INT("border", 12), INT("d", d));
-    }
-    TEST("markesteijn_homo_max_corr", "demosaic_markesteijn", "markesteijn_homo_max_corr",
-         BYTES_INOUT("maxval", mk_maxval), INT("width", W), INT("height", H), INT("border", 12));
-    TEST("markesteijn_homo_quench", "demosaic_markesteijn", "markesteijn_homo_quench",
-         BYTES_INOUT("homosum1", mk_homosum), BYTES_INOUT("homosum2", mk_homosum2), INT("width", W),
-         INT("height", H), INT("border", 12));
-    TEST("markesteijn_accu", "demosaic_markesteijn", "markesteijn_accu",
-         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("rgb", mk_rgb[2], p4), BUFFER("homosum", mk_homosum, bsize),
-         BUFFER("maxval", mk_maxval, bsize), INT("width", W), INT("height", H), INT("border", 12));
-    TEST("markesteijn_final", "demosaic_markesteijn", "markesteijn_final",
-         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("border", 12));
-#undef BYTES_INOUT
 #undef MK_HEX
 #undef MK_XT
   }
@@ -2563,7 +2537,8 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
   size_t len;
   uint32_t *code = (uint32_t *)slurp(path, &len);
   spv_info_t info;
-  spv_reflect(code, len / 4, t->kernel, &info);
+  const char *entry = t->slang_kernel ? t->slang_kernel : t->kernel;
+  spv_reflect(code, len / 4, entry, &info);
 
   VkDescriptorSetLayoutBinding lb[MAX_ARGS];
   VkWriteDescriptorSet wr[MAX_ARGS];
@@ -2676,7 +2651,7 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
   const VkComputePipelineCreateInfo cpci = {
     .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
     .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-               .module = sm, .pName = t->kernel },
+               .module = sm, .pName = entry },
     .layout = layout };
   VkPipeline pipe;
   CK(vkCreateComputePipelines(e->dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe));

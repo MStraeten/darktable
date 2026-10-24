@@ -2113,25 +2113,41 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
       }
 
   const size_t npix = (size_t)width * height;
-  // the byte maps are packed four to a word
-  const size_t bytemap_size = (npix + 3) / 4 * 4;
 
+  // the homogeneity maps hold four directions per word
   dt_slang_gpu_buffer_t *rgbv[8] = { NULL };
   dt_slang_gpu_buffer_t *drv[8] = { NULL };
-  dt_slang_gpu_buffer_t *homo[8] = { NULL };
-  dt_slang_gpu_buffer_t *homosum[8] = { NULL };
+  dt_slang_gpu_buffer_t *homo[2] = { NULL };
+  dt_slang_gpu_buffer_t *homosum[2] = { NULL };
   dt_slang_gpu_buffer_t *gminmax = dt_slang_gpu_buffer_new(sizeof(float) * 2 * npix, NULL);
   dt_slang_gpu_buffer_t *aux = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npix, NULL);
-  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
 
-  gboolean ok = gminmax && aux && dev_tmp;
+  gboolean ok = gminmax && aux;
   for(int n = 0; n < ndir && ok; n++)
   {
     rgbv[n] = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npix, NULL);
     drv[n] = dt_slang_gpu_buffer_new(sizeof(float) * npix, NULL);
-    homo[n] = dt_slang_gpu_buffer_new(bytemap_size, NULL);
-    homosum[n] = dt_slang_gpu_buffer_new(bytemap_size, NULL);
-    ok = rgbv[n] && drv[n] && homo[n] && homosum[n];
+    ok = rgbv[n] && drv[n];
+  }
+  for(int n = 0; n < ndir / 4 && ok; n++)
+  {
+    homo[n] = dt_slang_gpu_buffer_new(sizeof(uint32_t) * npix, NULL);
+    homosum[n] = dt_slang_gpu_buffer_new(sizeof(uint32_t) * npix, NULL);
+    ok = homo[n] && homosum[n];
+  }
+
+  // the kernels taking all eight directions get the first four twice with
+  // one pass, and read only the first ndir of them
+  dt_slang_gpu_buffer_t *rgb8[8], *drv8[8], *homo2[2], *homosum2[2];
+  for(int n = 0; n < 8; n++)
+  {
+    rgb8[n] = rgbv[n % ndir];
+    drv8[n] = drv[n % ndir];
+  }
+  for(int n = 0; n < 2; n++)
+  {
+    homo2[n] = homo[n % (ndir / 4)];
+    homosum2[n] = homosum[n % (ndir / 4)];
   }
 
 #define MRUN(kernel, ...) \
@@ -2139,21 +2155,18 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
 
   dt_slang_gpu_buffer_t **rgb = rgbv;
 
-  MRUN("markesteijn_initial_copy", SLIMG_DEV(dev_in), SLBUF_DEV(rgb[0]), SLARG(width), SLARG(height),
-       SLBUF(xtrans, 36));
-  for(int c = 1; c <= 3; c++)
-    MRUN("markesteijn_copy", SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[c]), SLARG(width), SLARG(height));
-
   const int pad_g1_g3 = PAD_G1_G3;
-  MRUN("markesteijn_green_minmax", SLBUF_DEV(rgb[0]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
+  MRUN("markesteijn_green_minmax", SLIMG_DEV(dev_in), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
        SLARG(pad_g1_g3), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
 
-  // OpenCL reads the greens from a local copy taken before any are written
   const int pad_g_interp = PAD_G_INTERP;
-  MRUN("markesteijn_copy", SLBUF_DEV(rgb[0]), SLBUF_DEV(aux), SLARG(width), SLARG(height));
-  MRUN("markesteijn_interpolate_green", SLBUF_DEV(aux), SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[1]),
+  MRUN("markesteijn_initial_green", SLIMG_DEV(dev_in), SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[1]),
        SLBUF_DEV(rgb[2]), SLBUF_DEV(rgb[3]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
        SLARG(pad_g_interp), SLARG(sgreen), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+
+  // the solitary green pixels are every third one from sgreen on
+  const int sg_width = (width - sgreen[0] + 2) / 3;
+  const int sg_height = (height - sgreen[1] + 2) / 3;
 
   for(int pass = 0; pass < passes && ok; pass++)
   {
@@ -2177,8 +2190,11 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
     for(int d = 0, i = 1, h = 0; d < 6; d++, i ^= 1, h ^= 2)
     {
       const int dir[2] = { i, i ^ 1 };
-      MRUN("markesteijn_solitary_green", SLBUF_DEV(trgb[0]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
-           SLARG(pad_rb_g), SLARG(d), SLARG(dir), SLARG(h), SLARG(sgreen), SLBUF(xtrans, 36));
+      if(ok)
+        ok = !dt_slang_gpu_run_2d_args(prg, "markesteijn_solitary_green", sg_width, sg_height,
+                                       SLBUF_DEV(trgb[0]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
+                                       SLARG(pad_rb_g), SLARG(d), SLARG(dir), SLARG(h), SLARG(sgreen),
+                                       SLBUF(xtrans, 36));
       if((d < 2) || (d & 1)) trgb++;
     }
 
@@ -2196,62 +2212,37 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
   // convert to perceptual colorspace and differentiate in all directions
   const int pad_yuv = (passes == 1) ? 8 : 13;
   for(int d = 0; d < ndir; d++)
-  {
-    MRUN("markesteijn_convert_yuv", SLBUF_DEV(rgbv[d]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
-         SLARG(pad_yuv));
-    MRUN("markesteijn_differentiate", SLBUF_DEV(aux), SLBUF_DEV(drv[d]), SLARG(width), SLARG(height),
+    MRUN("markesteijn_differentiate", SLBUF_DEV(rgbv[d]), SLBUF_DEV(drv[d]), SLARG(width), SLARG(height),
          SLARG(pad_yuv), SLARG(d));
-  }
 
-  // thresholds for the homogeneity maps go to aux
+  // the homogeneity maps and their 5x5 sums
   const int pad_homo = (passes == 1) ? 10 : 15;
-  for(int d = 0; d < ndir; d++)
-    MRUN("markesteijn_homo_threshold", SLBUF_DEV(drv[d]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
-         SLARG(pad_homo), SLARG(d));
-  for(int d = 0; d < ndir; d++)
-    MRUN("markesteijn_homo_set", SLBUF_DEV(drv[d]), SLBUF_DEV(aux), SLBUF_DEV(homo[d]), SLARG(width),
-         SLARG(height), SLARG(pad_homo));
-  for(int d = 0; d < ndir; d++)
-    MRUN("markesteijn_homo_sum", SLBUF_DEV(homo[d]), SLBUF_DEV(homosum[d]), SLARG(width), SLARG(height),
-         SLARG(pad_tile));
+  MRUN("markesteijn_homo_set", SLBUF_DEV(drv8[0]), SLBUF_DEV(drv8[1]), SLBUF_DEV(drv8[2]), SLBUF_DEV(drv8[3]),
+       SLBUF_DEV(drv8[4]), SLBUF_DEV(drv8[5]), SLBUF_DEV(drv8[6]), SLBUF_DEV(drv8[7]), SLBUF_DEV(homo2[0]),
+       SLBUF_DEV(homo2[1]), SLARG(width), SLARG(height), SLARG(pad_homo), SLARG(ndir));
+  MRUN("markesteijn_homo_sum", SLBUF_DEV(homo2[0]), SLBUF_DEV(homo2[1]), SLBUF_DEV(homosum2[0]),
+       SLBUF_DEV(homosum2[1]), SLARG(width), SLARG(height), SLARG(pad_tile), SLARG(ndir));
 
-  // the maximum of the homogeneity maps replaces the thresholds in aux
-  for(int d = 0; d < ndir; d++)
-    MRUN("markesteijn_homo_max", SLBUF_DEV(homosum[d]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
-         SLARG(pad_tile), SLARG(d));
-  MRUN("markesteijn_homo_max_corr", SLBUF_DEV(aux), SLARG(width), SLARG(height), SLARG(pad_tile));
-  for(int d = 0; d < ndir - 4; d++)
-    MRUN("markesteijn_homo_quench", SLBUF_DEV(homosum[d]), SLBUF_DEV(homosum[d + 4]), SLARG(width),
-         SLARG(height), SLARG(pad_tile));
-
-  // accumulate the inner part, which ends in dev_tmp as ndir is even, so
-  // the OpenCL copy before the final kernel is not needed. Both kernels
-  // leave the border from VNG in dev_out alone
-  MRUN("markesteijn_zero", SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height), SLARG(pad_tile));
-  dt_slang_gpu_image_t *t1 = dev_tmp;
-  dt_slang_gpu_image_t *t2 = dev_out;
-  for(int d = 0; d < ndir; d++)
-  {
-    MRUN("markesteijn_accu", SLIMG_DEV(t1), SLIMG_DEV(t2), SLBUF_DEV(rgbv[d]), SLBUF_DEV(homosum[d]),
-         SLBUF_DEV(aux), SLARG(width), SLARG(height), SLARG(pad_tile));
-    dt_slang_gpu_image_t *t = t2;
-    t2 = t1;
-    t1 = t;
-  }
-  MRUN("markesteijn_final", SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
-       SLARG(pad_tile));
+  // average the most homogeneous directions into the inner part of dev_out,
+  // which leaves the border from VNG alone
+  MRUN("markesteijn_accu_final", SLBUF_DEV(rgb8[0]), SLBUF_DEV(rgb8[1]), SLBUF_DEV(rgb8[2]),
+       SLBUF_DEV(rgb8[3]), SLBUF_DEV(rgb8[4]), SLBUF_DEV(rgb8[5]), SLBUF_DEV(rgb8[6]), SLBUF_DEV(rgb8[7]),
+       SLBUF_DEV(homosum2[0]), SLBUF_DEV(homosum2[1]), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+       SLARG(pad_tile), SLARG(ndir));
 #undef MRUN
 
   for(int n = 0; n < 8; n++)
   {
     dt_slang_gpu_buffer_free(rgbv[n]);
     dt_slang_gpu_buffer_free(drv[n]);
+  }
+  for(int n = 0; n < 2; n++)
+  {
     dt_slang_gpu_buffer_free(homo[n]);
     dt_slang_gpu_buffer_free(homosum[n]);
   }
   dt_slang_gpu_buffer_free(gminmax);
   dt_slang_gpu_buffer_free(aux);
-  dt_slang_gpu_image_free(dev_tmp);
   return ok;
 }
 #endif
