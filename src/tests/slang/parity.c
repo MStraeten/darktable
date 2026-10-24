@@ -2140,7 +2140,65 @@ typedef struct cl_env_t
   cl_context ctx;
   cl_command_queue queue;
   cl_device_id dev;
+  int no_r;           // single channel images have to be stored as RGBA
 } cl_env_t;
+
+static int cl_has_format(const cl_env_t *e, const cl_image_format fmt)
+{
+  cl_image_format formats[256];
+  cl_uint n = 0;
+  CK(clGetSupportedImageFormats(e->ctx, CL_MEM_READ_WRITE, CL_MEM_OBJECT_IMAGE2D, 256, formats, &n));
+  for(cl_uint i = 0; i < n && i < 256; i++)
+    if(formats[i].image_channel_order == fmt.image_channel_order
+       && formats[i].image_channel_data_type == fmt.image_channel_data_type)
+      return 1;
+  return 0;
+}
+
+// a single channel image, or where the device has no CL_R images (PoCL 6
+// only offers RGBA) an RGBA one with the value in x, which reads back the
+// same: CL_R images read as (r, 0, 0, 1)
+static cl_mem cl_image_1ch(const cl_env_t *e, cl_mem_flags flags, cl_channel_type type,
+                           const cl_image_desc *desc, const void *px)
+{
+  cl_int err;
+  if(!e->no_r)
+  {
+    const cl_image_format fmt = { CL_R, type };
+    cl_mem m = clCreateImage(e->ctx, flags | CL_MEM_COPY_HOST_PTR, &fmt, desc, (void *)px, &err);
+    CK(err);
+    return m;
+  }
+  const size_t npix = desc->image_width * desc->image_height;
+  const cl_image_format fmt = { CL_RGBA, type };
+  cl_mem m;
+  if(type == CL_FLOAT)
+  {
+    float *rgba = malloc(npix * 4 * sizeof(float));
+    for(size_t i = 0; i < npix; i++)
+    {
+      rgba[4 * i] = ((const float *)px)[i];
+      rgba[4 * i + 1] = rgba[4 * i + 2] = 0.0f;
+      rgba[4 * i + 3] = 1.0f;
+    }
+    m = clCreateImage(e->ctx, flags | CL_MEM_COPY_HOST_PTR, &fmt, desc, rgba, &err);
+    free(rgba);
+  }
+  else
+  {
+    uint16_t *rgba = malloc(npix * 4 * sizeof(uint16_t));
+    for(size_t i = 0; i < npix; i++)
+    {
+      rgba[4 * i] = ((const uint16_t *)px)[i];
+      rgba[4 * i + 1] = rgba[4 * i + 2] = 0;
+      rgba[4 * i + 3] = 1;
+    }
+    m = clCreateImage(e->ctx, flags | CL_MEM_COPY_HOST_PTR, &fmt, desc, rgba, &err);
+    free(rgba);
+  }
+  CK(err);
+  return m;
+}
 
 static void cl_init(cl_env_t *e)
 {
@@ -2152,6 +2210,9 @@ static void cl_init(cl_env_t *e)
   CK(err);
   e->queue = clCreateCommandQueue(e->ctx, e->dev, 0, &err);
   CK(err);
+  e->no_r = !cl_has_format(e, (cl_image_format){ CL_R, CL_FLOAT })
+            || !cl_has_format(e, (cl_image_format){ CL_R, CL_UNSIGNED_INT16 });
+  if(e->no_r) printf("OpenCL device has no single channel images, using RGBA\n");
 }
 
 // bytes a kernel writes to an output argument, 0 for inputs
@@ -2210,14 +2271,24 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
     switch(arg->kind)
     {
       case ARG_IMAGE_IN:
-        mem[a] = clCreateImage(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, &fmt, &desc, (void *)arg->pixels, &err);
-        CK(err);
+        if(arg->channels == 1)
+          mem[a] = cl_image_1ch(e, CL_MEM_READ_ONLY, CL_FLOAT, &desc, arg->pixels);
+        else
+        {
+          mem[a] = clCreateImage(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, &fmt, &desc, (void *)arg->pixels, &err);
+          CK(err);
+        }
         CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
         break;
       case ARG_IMAGE_OUT:
-        mem[a] = clCreateImage(e->ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, &fmt, &desc,
-                               (void *)initial_data(arg), &err);
-        CK(err);
+        if(arg->channels == 1)
+          mem[a] = cl_image_1ch(e, CL_MEM_READ_WRITE, CL_FLOAT, &desc, initial_data(arg));
+        else
+        {
+          mem[a] = clCreateImage(e->ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, &fmt, &desc,
+                                 (void *)initial_data(arg), &err);
+          CK(err);
+        }
         CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
         break;
       case ARG_BUFFER_OUT:
@@ -2230,13 +2301,9 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
         CK(clSetKernelArg(k, a_cl, arg->size, NULL));
         break;
       case ARG_RAW_U16:
-      {
-        const cl_image_format ufmt = { CL_R, CL_UNSIGNED_INT16 };
-        mem[a] = clCreateImage(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, &ufmt, &desc, (void *)arg->data, &err);
-        CK(err);
+        mem[a] = cl_image_1ch(e, CL_MEM_READ_ONLY, CL_UNSIGNED_INT16, &desc, arg->data);
         CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
         break;
-      }
       case ARG_BUFFER:
         mem[a] = clCreateBuffer(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, arg->size, (void *)arg->data, &err);
         CK(err);
@@ -2285,7 +2352,15 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
   {
     const arg_t *arg = &t->args[a];
     const size_t origin[3] = { 0, 0, 0 }, region[3] = { arg->w, arg->h, 1 };
-    if(arg->kind == ARG_IMAGE_OUT)
+    if(arg->kind == ARG_IMAGE_OUT && arg->channels == 1 && e->no_r)
+    {
+      const size_t npix = (size_t)arg->w * arg->h;
+      float *rgba = malloc(npix * 4 * sizeof(float));
+      CK(clEnqueueReadImage(e->queue, mem[a], CL_TRUE, origin, region, 0, 0, rgba, 0, NULL, NULL));
+      for(size_t i = 0; i < npix; i++) ((float *)outs[a])[i] = rgba[4 * i];
+      free(rgba);
+    }
+    else if(arg->kind == ARG_IMAGE_OUT)
       CK(clEnqueueReadImage(e->queue, mem[a], CL_TRUE, origin, region, 0, 0, outs[a], 0, NULL, NULL));
     else if(arg->kind == ARG_BUFFER_OUT)
       CK(clEnqueueReadBuffer(e->queue, mem[a], CL_TRUE, 0, arg->size, outs[a], 0, NULL, NULL));
