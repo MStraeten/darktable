@@ -1286,6 +1286,162 @@ void cleanup_global(dt_iop_module_so_t *self)
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// the four stage mask pipeline of run_gf_pipeline_cl(): scalar mask,
+// perceptual guide, guided filter and filter confidence
+static int _gf_pipeline_slang(const dt_iop_satcurve_data_t *d,
+                              dt_slang_gpu_image_t *dev_in,
+                              const float *input_matrix,
+                              const float L_white,
+                              const int width,
+                              const int height,
+                              dt_slang_gpu_image_t *mask_scalar,
+                              dt_slang_gpu_image_t *guide,
+                              dt_slang_gpu_image_t *mask_filtered,
+                              dt_slang_gpu_image_t *mask_control,
+                              dt_slang_gpu_image_t *noise_confidence)
+{
+  return dt_slang_gpu_run_2d_args("satcurve", "satcurve_prepare_scalar_mask", width, height,
+                                  SLIMG_DEV(dev_in), SLIMG_DEV(mask_scalar), SLARG(width), SLARG(height),
+                                  SLBUF(input_matrix, 12 * sizeof(float)),
+                                  SLBUF(d->gamut_lut, LUT_ELEM * sizeof(float)), SLARG(d->formula),
+                                  SLARG(L_white))
+    || dt_slang_gpu_run_2d_args("satcurve", "satcurve_prepare_perceptual_guide", width, height,
+                                SLIMG_DEV(dev_in), SLIMG_DEV(guide), SLARG(width), SLARG(height),
+                                SLBUF(input_matrix, 12 * sizeof(float)), SLARG(L_white))
+    || guided_filter_slang(guide, mask_scalar, mask_filtered, width, height, MAX(1, (int)d->gf_radius),
+                           MAX(0.01f, d->gf_feathering * 0.01f), 1.0f, 0.0f, 1.0f)
+    || dt_slang_gpu_run_2d_args("satcurve", "satcurve_prepare_filter_confidence", width, height,
+                                SLIMG_DEV(mask_scalar), SLIMG_DEV(mask_filtered), SLIMG_DEV(guide),
+                                SLIMG_DEV(mask_control), SLIMG_DEV(noise_confidence), SLARG(width),
+                                SLARG(height), SLARG(d->gf_protect_from), SLARG(d->gf_protect_to));
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_satcurve_data_t *d = piece->data;
+  dt_iop_satcurve_gui_data_t *g = self->gui_data;
+  if(piece->colors != 4) return FALSE;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+      dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  if(work_profile == NULL) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  gboolean want_mask = FALSE;
+  if(self->dev->gui_attached && dt_pipe_is_full(piece->pipe) && g)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    want_mask = g->mask_display;
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  dt_colormatrix_t input_matrix = { { 0.0f } };
+  dt_colormatrix_t output_matrix = { { 0.0f } };
+  dt_colormatrix_mul(input_matrix, XYZ_D50_to_D65_CAT16, work_profile->matrix_in);
+  dt_colormatrix_mul(output_matrix, work_profile->matrix_out, XYZ_D65_to_D50_CAT16);
+
+  const float L_white = Y_to_dt_UCS_L_star(1.f);
+  int err = 0;
+
+  // the histogram, before every early return as in process_cl()
+  const gboolean want_histogram = self->dev->gui_attached && dt_pipe_is_full(piece->pipe)
+                                  && dt_iop_has_focus(self) && piece->pipe == self->dev->full.pipe;
+  if(want_histogram)
+  {
+    int hist_bins_host[DT_IOP_SATCURVE_HIST_RES] = { 0 };
+    dt_slang_gpu_buffer_t *hist_bins = dt_slang_gpu_buffer_new(sizeof(hist_bins_host), NULL);
+    if(hist_bins
+       && !dt_slang_gpu_run_2d_args("satcurve", "satcurve_histogram", width, height,
+                                    SLIMG_DEV(dev_in), SLARG(width), SLARG(height),
+                                    SLBUF(input_matrix, 12 * sizeof(float)),
+                                    SLBUF(d->gamut_lut, LUT_ELEM * sizeof(float)), SLARG(d->formula),
+                                    SLARG(L_white), SLBUF_DEV(hist_bins))
+       && !dt_slang_gpu_buffer_read(hist_bins, hist_bins_host, sizeof(hist_bins_host)))
+      _commit_sat_histogram(self, hist_bins_host);
+    dt_slang_gpu_buffer_free(hist_bins);
+  }
+
+  const gboolean neutral = channel_is_neutral(&d->channel[DT_IOP_SATCURVE_CHANNEL_SATURATION])
+                           && channel_is_neutral(&d->channel[DT_IOP_SATCURVE_CHANNEL_BRILLIANCE]);
+  if(!want_mask && neutral)
+    return !dt_slang_gpu_run_2d_args("satcurve", "satcurve_copy", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height));
+
+  // the guided filter scratch images. Where they don't fit, the mask goes
+  // unfiltered as in process_cl()
+  gboolean gf_active = guided_filter_active(d);
+  dt_slang_gpu_image_t *mask_scalar = NULL, *mask_filtered = NULL, *guide = NULL, *noise_confidence = NULL,
+                       *mask_control = NULL;
+  if(gf_active)
+  {
+    mask_scalar = dt_slang_gpu_image_new(width, height, 1, NULL);
+    mask_filtered = dt_slang_gpu_image_new(width, height, 1, NULL);
+    guide = dt_slang_gpu_image_new(width, height, 4, NULL);
+    noise_confidence = dt_slang_gpu_image_new(width, height, 1, NULL);
+    mask_control = dt_slang_gpu_image_new(width, height, 1, NULL);
+    if(mask_scalar && mask_filtered && guide && noise_confidence && mask_control)
+      err = _gf_pipeline_slang(d, dev_in, (const float *)input_matrix, L_white, width, height, mask_scalar,
+                               guide, mask_filtered, mask_control, noise_confidence);
+    else
+    {
+      dt_control_log(_("saturation curve: guided filter failed to allocate memory, "
+                       "disabling it for this run"));
+      gf_active = FALSE;
+    }
+  }
+
+  if(err)
+    ;
+  else if(want_mask)
+  {
+    const float mask_noise_protection = 0.0f;
+    err = gf_active
+      ? dt_slang_gpu_run_2d_args("satcurve", "satcurve_mask_from_control", width, height,
+                                 SLIMG_DEV(mask_scalar), SLIMG_DEV(mask_filtered), SLIMG_DEV(noise_confidence),
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLARG(d->gf_protect_from), SLARG(d->gf_protect_to),
+                                 SLARG(mask_noise_protection))
+      : dt_slang_gpu_run_2d_args("satcurve", "satcurve_mask", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLBUF(input_matrix, 12 * sizeof(float)),
+                                 SLBUF(d->gamut_lut, LUT_ELEM * sizeof(float)), SLARG(d->formula),
+                                 SLARG(L_white));
+    if(!err) piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+  }
+  else
+  {
+    // without the guided filter the kernel reads the masks from the input,
+    // and ignores them
+    const int use_mask = gf_active ? 1 : 0;
+    dt_slang_gpu_image_t *mask_arg = gf_active ? mask_control : dev_in;
+    dt_slang_gpu_image_t *confidence_arg = gf_active ? noise_confidence : dev_in;
+    err = dt_slang_gpu_run_2d_args("satcurve", "satcurvergb", width, height,
+            SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLIMG_DEV(mask_arg), SLIMG_DEV(mask_arg),
+            SLIMG_DEV(confidence_arg), SLARG(use_mask), SLARG(width), SLARG(height),
+            SLBUF(input_matrix, 12 * sizeof(float)), SLBUF(output_matrix, 12 * sizeof(float)),
+            SLBUF(d->channel[DT_IOP_SATCURVE_CHANNEL_SATURATION].lut, DT_IOP_SATCURVE_RES * sizeof(float)),
+            SLBUF(d->channel[DT_IOP_SATCURVE_CHANNEL_BRILLIANCE].lut, DT_IOP_SATCURVE_RES * sizeof(float)),
+            SLBUF(d->gamut_lut, LUT_ELEM * sizeof(float)), SLARG(d->formula), SLARG(L_white),
+            SLARG(d->noise_protection));
+  }
+
+  dt_slang_gpu_image_free(mask_scalar);
+  dt_slang_gpu_image_free(mask_filtered);
+  dt_slang_gpu_image_free(guide);
+  dt_slang_gpu_image_free(noise_confidence);
+  dt_slang_gpu_image_free(mask_control);
+  return !err;
+}
+#endif
+
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
 {
   dt_iop_satcurve_data_t *d = dt_calloc_align_type(dt_iop_satcurve_data_t, 1);
