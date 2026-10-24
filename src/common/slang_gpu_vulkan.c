@@ -70,6 +70,8 @@ typedef struct dt_slang_vulkan_t
   GHashTable *kernels; // "program:kernel" -> dt_slang_kernel_t
   GList *images;       // freed device images, for reuse
   GList *buffers;      // freed device buffers, for reuse
+  struct dt_slang_mem_t *staging[2]; // for copies to (0) and from (1) device images, kept between them
+  size_t staging_size[2];
 } dt_slang_vulkan_t;
 
 static dt_slang_vulkan_t _vk = { 0 };
@@ -81,6 +83,7 @@ static GThread *_prepare_thread = NULL;
 
 static void _image_free(struct dt_slang_gpu_image_t *img);
 static void _buffer_free(struct dt_slang_gpu_buffer_t *buf);
+static void _staging_free(void);
 
 static void _destroy_kernel(gpointer data)
 {
@@ -236,6 +239,7 @@ void dt_slang_gpu_cleanup(void)
   if(_vk.dev) vkDeviceWaitIdle(_vk.dev);
   g_list_free_full(_vk.images, (GDestroyNotify)_image_free);
   g_list_free_full(_vk.buffers, (GDestroyNotify)_buffer_free);
+  _staging_free();
   if(_vk.kernels) g_hash_table_destroy(_vk.kernels);
   if(_vk.pool) vkDestroyCommandPool(_vk.dev, _vk.pool, NULL);
   if(_vk.dev) vkDestroyDevice(_vk.dev, NULL);
@@ -547,6 +551,7 @@ typedef struct dt_slang_mem_t
   VkImage image;
   VkDeviceMemory image_mem;
   VkImageView view;
+  gboolean coherent;     // the mapped memory needs no invalidation before host reads
 } dt_slang_mem_t;
 
 static gboolean _memtype(const uint32_t bits, const VkMemoryPropertyFlags want, uint32_t *type)
@@ -560,12 +565,13 @@ static gboolean _memtype(const uint32_t bits, const VkMemoryPropertyFlags want, 
   return FALSE;
 }
 
-// a mapped buffer, in device local memory if prefer_device and the device
-// has some that the host can map
-static gboolean _alloc_buffer_in(dt_slang_mem_t *m,
-                                 const VkDeviceSize size,
-                                 const VkBufferUsageFlags usage,
-                                 const gboolean prefer_device)
+// a mapped buffer in the first memory type matching one of the n wanted
+// property sets, in order
+static gboolean _alloc_mapped(dt_slang_mem_t *m,
+                              const VkDeviceSize size,
+                              const VkBufferUsageFlags usage,
+                              const VkMemoryPropertyFlags *want,
+                              const int n)
 {
   const VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                    .size = size,
@@ -573,22 +579,71 @@ static gboolean _alloc_buffer_in(dt_slang_mem_t *m,
   if(vkCreateBuffer(_vk.dev, &bci, NULL, &m->buffer) != VK_SUCCESS) return FALSE;
   VkMemoryRequirements req;
   vkGetBufferMemoryRequirements(_vk.dev, m->buffer, &req);
-  const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   uint32_t type;
-  if(!(prefer_device && _memtype(req.memoryTypeBits, host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type))
-     && !_memtype(req.memoryTypeBits, host, &type))
-    return FALSE;
+  int i = 0;
+  while(i < n && !_memtype(req.memoryTypeBits, want[i], &type)) i++;
+  if(i == n) return FALSE;
+  m->coherent = (_vk.memprops.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
   const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                      .allocationSize = req.size,
                                      .memoryTypeIndex = type };
+  // the whole allocation is mapped, which is what an invalidation of a
+  // non-coherent type has to cover
   return vkAllocateMemory(_vk.dev, &mai, NULL, &m->buffer_mem) == VK_SUCCESS
          && vkBindBufferMemory(_vk.dev, m->buffer, m->buffer_mem, 0) == VK_SUCCESS
-         && vkMapMemory(_vk.dev, m->buffer_mem, 0, size, 0, &m->map) == VK_SUCCESS;
+         && vkMapMemory(_vk.dev, m->buffer_mem, 0, VK_WHOLE_SIZE, 0, &m->map) == VK_SUCCESS;
+}
+
+// a mapped buffer, in device local memory if prefer_device and the device
+// has some that the host can map
+static gboolean _alloc_buffer_in(dt_slang_mem_t *m,
+                                 const VkDeviceSize size,
+                                 const VkBufferUsageFlags usage,
+                                 const gboolean prefer_device)
+{
+  const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  const VkMemoryPropertyFlags want[2] = { host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, host };
+  return prefer_device ? _alloc_mapped(m, size, usage, want, 2) : _alloc_mapped(m, size, usage, want + 1, 1);
 }
 
 static gboolean _alloc_buffer(dt_slang_mem_t *m, const VkDeviceSize size, const VkBufferUsageFlags usage)
 {
   return _alloc_buffer_in(m, size, usage, FALSE);
+}
+
+// a mapped buffer the device copies results into for the host. Host reads
+// from uncached memory are slow: on an NVIDIA laptop GPU, reading a
+// 3908x2602 image took 600 ms from the coherent type the other buffers use
+static gboolean _alloc_readback(dt_slang_mem_t *m, const VkDeviceSize size)
+{
+  const VkMemoryPropertyFlags want[3]
+      = { VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT
+              | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT };
+  return _alloc_mapped(m, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, want, 3);
+}
+
+// makes what the device wrote to m visible to the host, after the commands
+// writing it have finished
+static void _invalidate(const dt_slang_mem_t *m)
+{
+  if(m->coherent) return;
+  const VkMappedMemoryRange range = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                      .memory = m->buffer_mem,
+                                      .offset = 0,
+                                      .size = VK_WHOLE_SIZE };
+  vkInvalidateMappedMemoryRanges(_vk.dev, 1, &range);
+}
+
+// orders the transfers recorded before it ahead of host reads
+static void _host_read_barrier(VkCommandBuffer cb)
+{
+  const VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                               .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                               .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0,
+                       NULL);
 }
 
 static gboolean _create_image(VkImage *image,
@@ -642,7 +697,7 @@ static gboolean _alloc_image(dt_slang_mem_t *m, const dt_slang_arg_t *arg)
     return FALSE;
 
   const size_t bytes = sizeof(float) * arg->channels * arg->width * arg->height;
-  if(!_alloc_buffer(m, bytes, out ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+  if(out ? !_alloc_readback(m, bytes) : !_alloc_buffer(m, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
     return FALSE;
   if(!out) memcpy(m->map, arg->ptr, bytes);
   return TRUE;
@@ -723,33 +778,68 @@ static void _image_free(dt_slang_gpu_image_t *img)
   g_free(img);
 }
 
+static void _staging_free(void)
+{
+  for(int k = 0; k < 2; k++)
+  {
+    if(_vk.staging[k]) _free_mem(_vk.staging[k]);
+    g_free(_vk.staging[k]);
+    _vk.staging[k] = NULL;
+    _vk.staging_size[k] = 0;
+  }
+}
+
+// the staging buffer for copies to or from the device of at least bytes.
+// Allocating one per copy cost more than the copy on some drivers, so the
+// largest one so far is kept
+static dt_slang_mem_t *_staging(const size_t bytes, const gboolean to_device)
+{
+  const int k = to_device ? 0 : 1;
+  if(_vk.staging[k] && _vk.staging_size[k] >= bytes) return _vk.staging[k];
+
+  if(_vk.staging[k]) _free_mem(_vk.staging[k]);
+  g_free(_vk.staging[k]);
+  _vk.staging_size[k] = 0;
+  _vk.staging[k] = g_new0(dt_slang_mem_t, 1);
+  if(to_device ? !_alloc_buffer(_vk.staging[k], bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
+               : !_alloc_readback(_vk.staging[k], bytes))
+  {
+    _free_mem(_vk.staging[k]);
+    g_free(_vk.staging[k]);
+    _vk.staging[k] = NULL;
+    return NULL;
+  }
+  _vk.staging_size[k] = bytes;
+  return _vk.staging[k];
+}
+
 // copies between host memory and a device image through a staging buffer
 static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean to_device)
 {
   const size_t bytes = sizeof(float) * img->channels * img->width * img->height;
-  dt_slang_mem_t staging = { 0 };
-  int err = 1;
-  if(!_alloc_buffer(&staging, bytes, to_device ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                                                : VK_BUFFER_USAGE_TRANSFER_DST_BIT))
-    goto done;
-  if(to_device) memcpy(staging.map, host, bytes);
+  dt_slang_mem_t *staging = _staging(bytes, to_device);
+  if(!staging) return 1;
+  if(to_device) memcpy(staging->map, host, bytes);
 
   VkCommandBuffer cb = _begin_commands();
-  if(!cb) goto done;
+  if(!cb) return 1;
   const VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                                    .imageExtent = { img->width, img->height, 1 } };
   if(to_device)
-    vkCmdCopyBufferToImage(cb, staging.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    vkCmdCopyBufferToImage(cb, staging->buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
   else
-    vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, staging.buffer, 1, &copy);
-  if(!_submit_commands(cb)) goto done;
+  {
+    vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, staging->buffer, 1, &copy);
+    _host_read_barrier(cb);
+  }
+  if(!_submit_commands(cb)) return 1;
 
-  if(!to_device) memcpy(host, staging.map, bytes);
-  err = 0;
-
-done:
-  _free_mem(&staging);
-  return err;
+  if(!to_device)
+  {
+    _invalidate(staging);
+    memcpy(host, staging->map, bytes);
+  }
+  return 0;
 }
 
 dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
@@ -1106,6 +1196,7 @@ static int _run(const char *program,
     _barrier(cb, mem[r].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     vkCmdCopyImageToBuffer(cb, mem[r].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mem[r].buffer, 1, &copy);
   }
+  _host_read_barrier(cb);
   const gboolean submitted = _submit_commands(cb);
   cb = VK_NULL_HANDLE;
   if(!submitted) goto done;
@@ -1113,8 +1204,9 @@ static int _run(const char *program,
   for(int r = 0; r < nres; r++)
   {
     const dt_slang_arg_t *arg = &args[res_arg[r]];
-    if(arg->kind == DT_SLANG_ARG_IMAGE_OUT)
-      memcpy((void *)arg->ptr, mem[r].map, sizeof(float) * arg->channels * arg->width * arg->height);
+    if(arg->kind != DT_SLANG_ARG_IMAGE_OUT) continue;
+    _invalidate(&mem[r]);
+    memcpy((void *)arg->ptr, mem[r].map, sizeof(float) * arg->channels * arg->width * arg->height);
   }
   err = 0;
 
