@@ -78,13 +78,16 @@ typedef struct dt_slang_vulkan_t
   GList *images;       // freed device images, for reuse
   GList *buffers;      // freed device buffers, for reuse
   GList *staging;      // staging buffers no batch uses, for reuse
-  GList *doomed_images;  // evicted from the pools, freed once the queue is idle
+  GList *doomed_images;  // evicted from the pools, freed once no batch uses them
   GList *doomed_buffers;
   GQueue inflight;     // submitted batches, oldest first
+  uint64_t submitted;  // serial of the last submitted batch
+  uint64_t retired;    // serial of the last finished one
   GList *spare;        // finished batches, for reuse
   gboolean timestamps; // the queue can time kernels
   float timestamp_period; // ns per timestamp tick
   VkDeviceSize pool_budget; // bytes the image and buffer pools may keep together
+  gboolean memory_budget;   // VK_EXT_memory_budget reports the free device memory
 } dt_slang_vulkan_t;
 
 static dt_slang_vulkan_t _vk = { 0 };
@@ -180,6 +183,14 @@ static gboolean _init_device(void)
   for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
     if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
       _vk.pool_budget = MAX(_vk.pool_budget, _vk.memprops.memoryHeaps[h].size / 4);
+
+  uint32_t next = 0;
+  vkEnumerateDeviceExtensionProperties(_vk.pdev, NULL, &next, NULL);
+  VkExtensionProperties *ext = g_new(VkExtensionProperties, next);
+  vkEnumerateDeviceExtensionProperties(_vk.pdev, NULL, &next, ext);
+  for(uint32_t e = 0; e < next; e++)
+    if(!strcmp(ext[e].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) _vk.memory_budget = TRUE;
+  g_free(ext);
 
   VkPhysicalDeviceFeatures features;
   vkGetPhysicalDeviceFeatures(_vk.pdev, &features);
@@ -558,11 +569,15 @@ typedef struct dt_slang_mem_t
 } dt_slang_mem_t;
 
 static gboolean _reclaim(void);
+static void _make_room(const uint32_t heap, const VkDeviceSize size);
 
 // device memory, after freeing the pools if the device is out of it. Pooled
 // images and buffers otherwise filled a 4 GB GPU after a few exports
 static gboolean _allocate(const VkMemoryAllocateInfo *mai, VkDeviceMemory *mem)
 {
+  const uint32_t heap = _vk.memprops.memoryTypes[mai->memoryTypeIndex].heapIndex;
+  if(_vk.memprops.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+    _make_room(heap, mai->allocationSize);
   VkResult res = vkAllocateMemory(_vk.dev, mai, NULL, mem);
   if(res == VK_ERROR_OUT_OF_DEVICE_MEMORY && _reclaim())
     res = vkAllocateMemory(_vk.dev, mai, NULL, mem);
@@ -759,6 +774,7 @@ struct dt_slang_gpu_image_t
   VkDeviceMemory mem;
   VkImageView view;
   int width, height, channels;
+  uint64_t last_use; // serial of the last batch that may use it, once freed
 };
 
 // device buffers live in device memory; the host fills, clears and reads
@@ -767,6 +783,7 @@ struct dt_slang_gpu_buffer_t
 {
   dt_slang_mem_t mem;
   size_t size;
+  uint64_t last_use;
 };
 
 static void _image_free(dt_slang_gpu_image_t *img)
@@ -818,6 +835,7 @@ typedef struct dt_slang_batch_t
   GList *mems;                  // dt_slang_mem_t, freed when done
   const char *entry;            // the kernel, for the timing
   int width, height;
+  uint64_t serial;              // its place in the queue, from 1
 } dt_slang_batch_t;
 
 static void _batch_destroy(dt_slang_batch_t *b)
@@ -841,28 +859,50 @@ static void _staging_release(dt_slang_staging_t *s)
   }
 }
 
-// images and buffers that still may be in use are freed once the queue is idle
+static size_t _image_bytes(const dt_slang_gpu_image_t *img)
+{
+  return sizeof(float) * img->channels * img->width * img->height;
+}
+
+// images and buffers evicted from the pools are freed once the batches that
+// may use them have finished. Waiting for an idle queue instead let them pile
+// up during a chain of kernels without reads.
 static void _free_doomed(void)
 {
-  g_list_free_full(_vk.doomed_images, (GDestroyNotify)_image_free);
-  g_list_free_full(_vk.doomed_buffers, (GDestroyNotify)_buffer_free);
-  _vk.doomed_images = NULL;
-  _vk.doomed_buffers = NULL;
+  for(GList *l = _vk.doomed_images; l;)
+  {
+    GList *next = g_list_next(l);
+    dt_slang_gpu_image_t *img = l->data;
+    if(img->last_use <= _vk.retired)
+    {
+      _image_free(img);
+      _vk.doomed_images = g_list_delete_link(_vk.doomed_images, l);
+    }
+    l = next;
+  }
+  for(GList *l = _vk.doomed_buffers; l;)
+  {
+    GList *next = g_list_next(l);
+    dt_slang_gpu_buffer_t *buf = l->data;
+    if(buf->last_use <= _vk.retired)
+    {
+      _buffer_free(buf);
+      _vk.doomed_buffers = g_list_delete_link(_vk.doomed_buffers, l);
+    }
+    l = next;
+  }
 }
 
 // cuts a pool list after the first max entries or once *bytes, counting
 // on from the other pool, exceeds the budget. The cut entries may still be
-// in use, so they are freed once the queue is idle
+// in use, so they are freed once their batches have finished
 static GList *_trim(GList *list, const int max, VkDeviceSize *bytes, GList **doomed, const gboolean images)
 {
   int n = 0;
   for(GList *l = list; l; l = g_list_next(l), n++)
   {
     if(images)
-    {
-      const dt_slang_gpu_image_t *i = l->data;
-      *bytes += sizeof(float) * i->channels * i->width * i->height;
-    }
+      *bytes += _image_bytes(l->data);
     else
       *bytes += ((const dt_slang_gpu_buffer_t *)l->data)->size;
     if(n >= max || *bytes > _vk.pool_budget)
@@ -889,6 +929,7 @@ static void _trim_pools(void)
 static void _buffer_release(dt_slang_gpu_buffer_t *buf)
 {
   // a demosaic chain holds eight buffers of the same size
+  buf->last_use = _vk.submitted;
   _vk.buffers = g_list_prepend(_vk.buffers, buf);
   _trim_pools();
 }
@@ -925,6 +966,7 @@ static void _retire(dt_slang_batch_t *b)
                (double)(ts[1] - ts[0]) * _vk.timestamp_period * 1e-9);
   }
   vkResetFences(_vk.dev, 1, &b->fence);
+  _vk.retired = b->serial;
   _batch_release(b);
 }
 
@@ -934,7 +976,19 @@ static void _retire_finished(void)
   dt_slang_batch_t *b;
   while((b = g_queue_peek_head(&_vk.inflight)) && vkGetFenceStatus(_vk.dev, b->fence) == VK_SUCCESS)
     _retire(g_queue_pop_head(&_vk.inflight));
-  if(g_queue_is_empty(&_vk.inflight)) _free_doomed();
+  _free_doomed();
+}
+
+// waits for the batches up to serial
+static void _wait_until(const uint64_t serial)
+{
+  dt_slang_batch_t *b;
+  while((b = g_queue_peek_head(&_vk.inflight)) && b->serial <= serial)
+  {
+    vkWaitForFences(_vk.dev, 1, &b->fence, VK_TRUE, UINT64_MAX);
+    _retire(g_queue_pop_head(&_vk.inflight));
+  }
+  _free_doomed();
 }
 
 // waits for everything submitted so far
@@ -962,6 +1016,69 @@ static gboolean _reclaim(void)
   _vk.buffers = NULL;
   _free_doomed();
   return TRUE;
+}
+
+// the oldest pooled image or buffer, moved to the doomed ones. Returns its size
+static size_t _evict_oldest(uint64_t *last_use)
+{
+  GList *li = g_list_last(_vk.images);
+  GList *lb = g_list_last(_vk.buffers);
+  const dt_slang_gpu_image_t *img = li ? li->data : NULL;
+  const dt_slang_gpu_buffer_t *buf = lb ? lb->data : NULL;
+  if(img && (!buf || img->last_use <= buf->last_use))
+  {
+    _vk.images = g_list_remove_link(_vk.images, li);
+    _vk.doomed_images = g_list_concat(_vk.doomed_images, li);
+    *last_use = MAX(*last_use, img->last_use);
+    return _image_bytes(img);
+  }
+  if(buf)
+  {
+    _vk.buffers = g_list_remove_link(_vk.buffers, lb);
+    _vk.doomed_buffers = g_list_concat(_vk.doomed_buffers, lb);
+    *last_use = MAX(*last_use, buf->last_use);
+    return buf->size;
+  }
+  return 0;
+}
+
+// frees doomed and then the oldest pooled images and buffers until size bytes
+// fit the heap's budget, waiting only for the batches that use them. Running
+// out of device memory first made the reclaim above wait for the whole queue
+// and free every pool, on each export after the first on a 4 GB GPU.
+static void _make_room(const uint32_t heap, const VkDeviceSize size)
+{
+  if(!_vk.memory_budget) return;
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT budget
+      = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+  VkPhysicalDeviceMemoryProperties2 props2
+      = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
+  vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
+  if(budget.heapUsage[heap] + size <= budget.heapBudget[heap]) return;
+
+  const VkDeviceSize need = budget.heapUsage[heap] + size - budget.heapBudget[heap];
+  VkDeviceSize found = 0;
+  uint64_t until = 0;
+  for(GList *l = _vk.doomed_images; l; l = g_list_next(l))
+  {
+    const dt_slang_gpu_image_t *img = l->data;
+    found += _image_bytes(img);
+    until = MAX(until, img->last_use);
+  }
+  for(GList *l = _vk.doomed_buffers; l; l = g_list_next(l))
+  {
+    const dt_slang_gpu_buffer_t *buf = l->data;
+    found += buf->size;
+    until = MAX(until, buf->last_use);
+  }
+  size_t evicted;
+  while(found < need && (evicted = _evict_oldest(&until))) found += evicted;
+  if(found == 0) return;
+
+  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] freeing %" PRIu64 " MB of pooled memory for %" PRIu64 " MB,"
+           " %" PRIu64 " of %" PRIu64 " MB used", (uint64_t)(found >> 20), (uint64_t)(size >> 20),
+           (uint64_t)(budget.heapUsage[heap] >> 20), (uint64_t)(budget.heapBudget[heap] >> 20));
+  _wait_until(until);
 }
 
 static dt_slang_batch_t *_batch_begin(const char *entry, const int width, const int height)
@@ -1045,6 +1162,7 @@ static gboolean _batch_submit(dt_slang_batch_t *b, const gboolean wait)
     _batch_release(b);
     return FALSE;
   }
+  b->serial = ++_vk.submitted;
   g_queue_push_tail(&_vk.inflight, b);
   if(wait) _wait_all();
   return TRUE;
@@ -1264,6 +1382,7 @@ void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img)
   g_mutex_lock(&_vk_lock);
   // kernels still running may use the image, so a pooled one is reused only
   // by later kernels
+  img->last_use = _vk.submitted;
   _vk.images = g_list_prepend(_vk.images, img);
   _trim_pools();
   _retire_finished();
