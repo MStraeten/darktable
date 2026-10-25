@@ -69,6 +69,7 @@ typedef struct dt_slang_vulkan_t
 {
   gboolean initialized;
   gboolean usable;
+  gboolean lost;       // the device failed, and nothing more runs on it
   VkInstance instance;
   VkPhysicalDevice pdev;
   VkPhysicalDeviceMemoryProperties memprops;
@@ -262,7 +263,7 @@ gboolean dt_slang_gpu_enabled(void)
     _vk.initialized = TRUE;
     _vk.usable = _init_device();
   }
-  const gboolean usable = _vk.usable;
+  const gboolean usable = _vk.usable && !dt_slang_gpu_stopped();
   g_mutex_unlock(&_vk_lock);
   return usable;
 }
@@ -1001,12 +1002,56 @@ static void _retire(dt_slang_batch_t *b)
   _batch_release(b);
 }
 
+// counts a failed submission or wait, once per lost device: after the first
+// error every batch still queued on it fails too
+static void _device_error(const char *what, const VkResult r, const gboolean fatal)
+{
+  if(_vk.lost) return;
+  _vk.lost = fatal;
+  gchar *msg = g_strdup_printf("%s (VkResult %d)", what, r);
+  dt_slang_gpu_report_error(msg, fatal);
+  g_free(msg);
+}
+
+// waits for everything submitted so far. Returns FALSE if the device failed
+// any of it, in which case the results of every kernel since the last wait
+// are undefined
+static gboolean _wait_all(void)
+{
+  gboolean ok = TRUE;
+  dt_slang_batch_t *b;
+  while((b = g_queue_pop_head(&_vk.inflight)))
+  {
+    // a wait fails only for a lost device or one out of memory, and neither
+    // leaves a way to tell which commands ran, so both count as lost
+    const VkResult r = vkWaitForFences(_vk.dev, 1, &b->fence, VK_TRUE, UINT64_MAX);
+    if(r != VK_SUCCESS)
+    {
+      if(ok) _device_error("waiting for the kernels", r, TRUE);
+      ok = FALSE;
+    }
+    _retire(b);
+  }
+  _free_doomed();
+  return ok && !_vk.lost;
+}
+
 // retires the batches that have finished, oldest first
 static void _retire_finished(void)
 {
   dt_slang_batch_t *b;
-  while((b = g_queue_peek_head(&_vk.inflight)) && vkGetFenceStatus(_vk.dev, b->fence) == VK_SUCCESS)
+  while((b = g_queue_peek_head(&_vk.inflight)))
+  {
+    const VkResult r = vkGetFenceStatus(_vk.dev, b->fence);
+    if(r == VK_NOT_READY) break;
+    if(r != VK_SUCCESS)
+    {
+      // a lost device finishes nothing still queued
+      _wait_all();
+      return;
+    }
     _retire(g_queue_pop_head(&_vk.inflight));
+  }
   _free_doomed();
 }
 
@@ -1016,20 +1061,9 @@ static void _wait_until(const uint64_t serial)
   dt_slang_batch_t *b;
   while((b = g_queue_peek_head(&_vk.inflight)) && b->serial <= serial)
   {
-    vkWaitForFences(_vk.dev, 1, &b->fence, VK_TRUE, UINT64_MAX);
+    const VkResult r = vkWaitForFences(_vk.dev, 1, &b->fence, VK_TRUE, UINT64_MAX);
+    if(r != VK_SUCCESS) _device_error("waiting for the kernels", r, TRUE);
     _retire(g_queue_pop_head(&_vk.inflight));
-  }
-  _free_doomed();
-}
-
-// waits for everything submitted so far
-static void _wait_all(void)
-{
-  dt_slang_batch_t *b;
-  while((b = g_queue_pop_head(&_vk.inflight)))
-  {
-    vkWaitForFences(_vk.dev, 1, &b->fence, VK_TRUE, UINT64_MAX);
-    _retire(b);
   }
   _free_doomed();
 }
@@ -1120,7 +1154,8 @@ static dt_slang_batch_t *_batch_begin(const char *entry, const int width, const 
   if(g_queue_get_length(&_vk.inflight) >= DT_SLANG_MAX_INFLIGHT)
   {
     dt_slang_batch_t *oldest = g_queue_pop_head(&_vk.inflight);
-    vkWaitForFences(_vk.dev, 1, &oldest->fence, VK_TRUE, UINT64_MAX);
+    const VkResult r = vkWaitForFences(_vk.dev, 1, &oldest->fence, VK_TRUE, UINT64_MAX);
+    if(r != VK_SUCCESS) _device_error("waiting for the kernels", r, TRUE);
     _retire(oldest);
   }
 
@@ -1181,22 +1216,25 @@ static void _batch_timestamp(dt_slang_batch_t *b, const int which)
                       b->queries, which);
 }
 
-// submits b, and with wait waits for it and everything before it
+// submits b, and with wait waits for it and everything before it. Returns
+// FALSE if b can't be submitted, or with wait if the device failed
 static gboolean _batch_submit(dt_slang_batch_t *b, const gboolean wait)
 {
   const VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                                 .commandBufferCount = 1,
                                 .pCommandBuffers = &b->cb };
-  if(vkEndCommandBuffer(b->cb) != VK_SUCCESS
-     || vkQueueSubmit(_vk.queue, 1, &submit, b->fence) != VK_SUCCESS)
+  VkResult r = vkEndCommandBuffer(b->cb);
+  if(r == VK_SUCCESS) r = vkQueueSubmit(_vk.queue, 1, &submit, b->fence);
+  if(r != VK_SUCCESS)
   {
+    // out of memory leaves the device usable
+    _device_error("submitting kernels", r, r == VK_ERROR_DEVICE_LOST);
     _batch_release(b);
     return FALSE;
   }
   b->serial = ++_vk.submitted;
   g_queue_push_tail(&_vk.inflight, b);
-  if(wait) _wait_all();
-  return TRUE;
+  return wait ? _wait_all() : TRUE;
 }
 
 // a staging buffer of at least bytes that no batch is using

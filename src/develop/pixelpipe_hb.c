@@ -2193,6 +2193,7 @@ static gboolean _slang_possible(dt_dev_pixelpipe_t *pipe,
   const int ch_out = out_format->channels;
   return module->process_slang
     && piece->process_cl_ready
+    && pipe->slang_enabled
     && dt_slang_gpu_enabled()
     && *output != input
     && ((input_format->datatype == TYPE_FLOAT
@@ -4258,6 +4259,9 @@ gboolean dt_dev_pixelpipe_process(dt_dev_pixelpipe_t *pipe,
   pipe->nocache = dt_pipe_is_image(pipe);
   pipe->runs++;
   pipe->opencl_enabled = dt_opencl_running();
+#ifdef HAVE_SLANG_GPU
+  pipe->slang_enabled = TRUE;
+#endif
 
   // if devid is a valid CL device we don't lock it as the caller has done so already
   const gboolean claimed = devid > DT_DEVICE_CPU;
@@ -4327,6 +4331,9 @@ restart:
                   pipe->image.filename, pipe->image.id, avail_mem / DT_MEGA);
   dt_print_mem_usage("before pixelpipe process");
 
+#ifdef HAVE_SLANG_GPU
+  const int slang_errors = dt_slang_gpu_errors();
+#endif
   // run pixelpipe recursively and get error status
   const gboolean err = _dev_pixelpipe_process_rec_and_backcopy(pipe, dev, &buf,
                                                                &cl_mem_out, &out_format,
@@ -4384,6 +4391,28 @@ restart:
 
     goto restart; // try again (this time without opencl)
   }
+
+#ifdef HAVE_SLANG_GPU
+  // like a late OpenCL error: a failed kernel often shows only when a later
+  // read waits for it, so nothing the Slang kernels did in this run can be
+  // trusted. An error of another pipe counts too, as the pipes share the device
+  if(pipe->slang_enabled && dt_slang_gpu_errors() != slang_errors)
+  {
+    dt_pthread_mutex_lock(&pipe->busy_mutex);
+    pipe->slang_enabled = FALSE;
+    dt_pthread_mutex_unlock(&pipe->busy_mutex);
+    dt_slang_gpu_run_failed();
+
+    dt_dev_pixelpipe_cache_flush(pipe);
+    dt_dev_pixelpipe_change(pipe, dev);
+
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_OPENCL,
+      "pipe restarting on CPU", pipe, NULL, DT_DEVICE_NONE, NULL, &roi,
+      "ID=%i after a Slang device error", pipe->image.id);
+
+    goto restart; // try again without the Slang kernels
+  }
+#endif
 
   // release resources:
   if(pipe->forms)

@@ -68,8 +68,26 @@ typedef struct dt_slang_arg_t
 
 #ifdef HAVE_SLANG_GPU
 
-// TRUE if the slang_gpu config key is set and a device could be set up
+// TRUE if the slang_gpu config key is set, a device could be set up and
+// device errors haven't stopped the kernels for this session
 gboolean dt_slang_gpu_enabled(void);
+
+// failed pixelpipe runs after which the kernels stay off for the session, as
+// with DT_OPENCL_MAX_ERRORS. A lost device stops them at once.
+#define DT_SLANG_GPU_MAX_ERRORS 5
+
+// device errors so far: failed submissions, kernels the device couldn't run,
+// a lost device. Failing to allocate is not one; the module falls back to its
+// CPU code. The pixelpipe restarts on the CPU when this grows during a run,
+// since kernels that ran before the error may have left bad results.
+int dt_slang_gpu_errors(void);
+// counts a pixelpipe run that restarted on the CPU after a device error
+void dt_slang_gpu_run_failed(void);
+
+// for the backends: counts a device error, and stops the kernels for the
+// session if the device can't be used any more
+void dt_slang_gpu_report_error(const char *what, const gboolean fatal);
+gboolean dt_slang_gpu_stopped(void);
 
 // runs kernel from data/kernels/slang/<program> over width x height work items
 // and returns 0 on success. Any failure leaves the output undefined, and the

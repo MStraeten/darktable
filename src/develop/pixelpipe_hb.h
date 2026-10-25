@@ -326,6 +326,8 @@ typedef struct dt_dev_pixelpipe_t
   // the CPU path runs the module tiled on the Slang kernels, as its
   // full-size images don't fit the device
   gboolean slang_tiling;
+  // Slang kernels allowed for this run? Off after a device error
+  gboolean slang_enabled;
 #endif
   // running in a tiling context?
   gboolean tiling;

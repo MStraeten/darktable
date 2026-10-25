@@ -70,7 +70,7 @@ typedef struct dt_slang_metal_t
   __strong id<MTLCommandQueue> queue;
   __strong NSMutableDictionary<NSString *, NSObject *> *libraries; // program -> MTLLibrary
   __strong NSMutableDictionary<NSString *, DtSlangKernel *> *kernels; // "program:kernel"
-  __strong id<MTLCommandBuffer> pending; // committed without waiting
+  __strong NSMutableArray<id<MTLCommandBuffer>> *inflight; // committed, not yet checked
   __strong NSMutableArray *images;        // freed device images, most recent first
   __strong NSMutableArray *buffers;       // freed device buffers, most recent first
   __strong NSMutableArray *staging;       // transfer buffers, see _staging_get()
@@ -131,7 +131,7 @@ gboolean dt_slang_gpu_enabled(void)
       _mtl.usable = _init_device();
     }
   }
-  const gboolean usable = _mtl.usable;
+  const gboolean usable = _mtl.usable && !dt_slang_gpu_stopped();
   g_mutex_unlock(&_mtl_lock);
   return usable;
 }
@@ -141,8 +141,8 @@ void dt_slang_gpu_cleanup(void)
   if(_prepare_thread) g_thread_join(_prepare_thread);
   _prepare_thread = NULL;
   g_mutex_lock(&_mtl_lock);
-  if(_mtl.pending) [_mtl.pending waitUntilCompleted];
-  _mtl.pending = nil;
+  for(id<MTLCommandBuffer> cb in _mtl.inflight) [cb waitUntilCompleted];
+  _mtl.inflight = nil;
   _mtl.images = nil;
   _mtl.buffers = nil;
   g_mutex_lock(&_staging_lock);
@@ -454,14 +454,47 @@ static DtSlangImage *_image_wrap(const void *host, const int width, const int he
 @implementation DtSlangBuffer
 @end
 
-// waits for the last command buffer that ran without waiting
-static void _finish(void)
+// checks the command buffers that have finished, oldest first, or with wait
+// all of them. Each one is checked: the queue runs them in order but goes on
+// after one fails, so a read that only looked at the last one would miss a
+// kernel failing before it. Returns FALSE if one failed.
+static gboolean _check(const gboolean wait)
 {
-  if(_mtl.pending)
+  gboolean ok = TRUE;
+  while(_mtl.inflight.count)
   {
-    [_mtl.pending waitUntilCompleted];
-    _mtl.pending = nil;
+    id<MTLCommandBuffer> cb = _mtl.inflight.firstObject;
+    if(wait)
+      [cb waitUntilCompleted];
+    else if(cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError)
+      break;
+    if(cb.status == MTLCommandBufferStatusError)
+    {
+      gchar *what = g_strdup_printf("a command buffer failed: %s", cb.error.localizedDescription.UTF8String);
+      // Apple Silicon has no removable GPU, so a failed command buffer
+      // leaves the device usable and only counts towards the failed runs
+      dt_slang_gpu_report_error(what, FALSE);
+      g_free(what);
+      ok = FALSE;
+    }
+    [_mtl.inflight removeObjectAtIndex:0];
   }
+  return ok;
+}
+
+// commits cb without waiting for it
+static void _commit(id<MTLCommandBuffer> cb)
+{
+  [cb commit];
+  if(!_mtl.inflight) _mtl.inflight = [NSMutableArray array];
+  [_mtl.inflight addObject:cb];
+  _check(FALSE);
+}
+
+// waits for every committed command buffer. Returns FALSE if one failed.
+static gboolean _finish(void)
+{
+  return _check(TRUE);
 }
 
 // --------------------------------------------------------------------------------------------
@@ -562,8 +595,7 @@ static gboolean _upload(DtSlangImage *img, id<MTLBuffer> dst, const void *host, 
     [blit copyFromBuffer:staging sourceOffset:0 toBuffer:dst destinationOffset:0 size:size];
   [blit endEncoding];
   [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { _staging_put(staging); }];
-  [cb commit];
-  _mtl.pending = cb;
+  _commit(cb);
   return TRUE;
 }
 
@@ -589,22 +621,14 @@ static gboolean _download(DtSlangImage *img, id<MTLBuffer> src, void *host, cons
   else
     [blit copyFromBuffer:src sourceOffset:0 toBuffer:dst destinationOffset:0 size:size];
   [blit endEncoding];
-  id<MTLCommandBuffer> last = _mtl.pending;
-  _mtl.pending = nil;
-  [cb commit];
-  [cb waitUntilCompleted];
-  // done by now: the blit was queued after it, and hazard tracking orders the two
-  if(last) [last waitUntilCompleted];
-  if(last && last.status != MTLCommandBufferStatusCompleted)
+  // the blit runs after the kernels writing the source, so waiting for every
+  // command buffer also tells whether one of those failed
+  _commit(cb);
+  if(!_finish())
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this %s failed: %s", img ? "image" : "buffer",
-             last.error.localizedDescription.UTF8String);
-    return FALSE;
-  }
-  if(cb.status != MTLCommandBufferStatusCompleted)
-  {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] copying from the device failed: %s",
-             cb.error.localizedDescription.UTF8String);
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this %s or the copy from the device failed",
+             img ? "image" : "buffer");
+    if(!wrapped) _staging_put(dst);
     return FALSE;
   }
   if(!wrapped)
@@ -721,21 +745,15 @@ static int _run(const char *program,
   [enc dispatchThreadgroups:MTLSizeMake((width + tw - 1) / tw, (height + th - 1) / th, 1)
       threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
   [enc endEncoding];
-  [cb commit];
+  _commit(cb);
 
   // without host outputs nothing needs to wait: the queue runs command
   // buffers in order, and a read waits in _finish()
-  if(!host_out)
-  {
-    _mtl.pending = cb;
-    return 0;
-  }
+  if(!host_out) return 0;
 
-  [cb waitUntilCompleted];
-  if(cb.status != MTLCommandBufferStatusCompleted)
+  if(!_finish())
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] running %s failed: %s", entry,
-             cb.error.localizedDescription.UTF8String);
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] running %s failed", entry);
     return 1;
   }
   for(int t = 0; t < ntex; t++)
@@ -879,7 +897,8 @@ void dt_slang_gpu_release_pools(void)
 
 void dt_slang_gpu_wait(void)
 {
-  if(!dt_slang_gpu_enabled()) return;
+  // kernels started before an error stopped them may still write to host memory
+  if(!_mtl.usable) return;
   g_mutex_lock(&_mtl_lock);
   _finish();
   g_mutex_unlock(&_mtl_lock);
@@ -961,13 +980,11 @@ int dt_slang_gpu_image_read(dt_slang_gpu_image_t *image, void *host)
              img->width, img->height, dt_get_debug_wtime() - start);
     return 0;
   }
-  id<MTLCommandBuffer> last = _mtl.pending;
-  _finish();
+  const gboolean ok = _finish();
   g_mutex_unlock(&_mtl_lock);
-  if(last && last.status != MTLCommandBufferStatusCompleted)
+  if(!ok)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this image failed: %s",
-             last.error.localizedDescription.UTF8String);
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this image failed");
     return 1;
   }
   const size_t row = sizeof(float) * img->channels * img->width;
@@ -1018,8 +1035,7 @@ static gboolean _clear(id<MTLBuffer> buffer)
   if(!blit) return FALSE;
   [blit fillBuffer:buffer range:NSMakeRange(0, buffer.length) value:0];
   [blit endEncoding];
-  [cb commit];
-  _mtl.pending = cb;
+  _commit(cb);
   return TRUE;
 }
 
@@ -1132,13 +1148,11 @@ int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buffer, void *host, const si
     g_mutex_unlock(&_mtl_lock);
     return ok ? 0 : 1;
   }
-  id<MTLCommandBuffer> last = _mtl.pending;
-  _finish();
+  const gboolean ok = _finish();
   g_mutex_unlock(&_mtl_lock);
-  if(last && last.status != MTLCommandBufferStatusCompleted)
+  if(!ok)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this buffer failed: %s",
-             last.error.localizedDescription.UTF8String);
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this buffer failed");
     return 1;
   }
   memcpy(host, buf->buffer.contents, size);
