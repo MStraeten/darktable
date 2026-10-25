@@ -38,6 +38,9 @@
 #define DT_SLANG_POOL_SIZE 12
 #define DT_SLANG_BUFFER_POOL_SIZE 12
 #define DT_SLANG_STAGING_POOL_SIZE 8
+// staging buffers larger than DT_SLANG_DIRECT_BUFFER, for images and for
+// tables such as lens's coordinates
+#define DT_SLANG_LARGE_STAGING_POOL_SIZE 8
 // submissions queued before the oldest is waited for
 #define DT_SLANG_MAX_INFLIGHT 64
 // host buffers up to this size are bound in host memory, larger ones copied to the device
@@ -669,6 +672,22 @@ static gboolean _alloc_device(dt_slang_mem_t *m, const VkDeviceSize size)
          && vkBindBufferMemory(_vk.dev, m->buffer, m->buffer_mem, 0) == VK_SUCCESS;
 }
 
+// copies to and from mapped memory. Large ones are split over the cores: a
+// single core takes about 30 ms for lens's 244 MB of per-pixel coordinates
+static void _copy(void *dst, const void *src, const size_t bytes)
+{
+  const size_t chunk = (size_t)1 << 20;
+  if(bytes < 16 * chunk)
+  {
+    memcpy(dst, src, bytes);
+    return;
+  }
+  const size_t n = (bytes + chunk - 1) / chunk;
+  DT_OMP_FOR()
+  for(size_t i = 0; i < n; i++)
+    memcpy((char *)dst + i * chunk, (const char *)src + i * chunk, MIN(chunk, bytes - i * chunk));
+}
+
 // makes what the device wrote to m visible to the host, after the commands
 // writing it have finished
 static void _invalidate(const dt_slang_mem_t *m)
@@ -847,15 +866,25 @@ static void _batch_destroy(dt_slang_batch_t *b)
   g_free(b);
 }
 
+// small and large staging buffers are pooled apart: the small ones of
+// every kernel's tables pushed the large ones out, so an export allocated
+// and faulted in its 232 MB of lens coordinates and its 155 MB readback anew
 static void _staging_release(dt_slang_staging_t *s)
 {
   _vk.staging = g_list_prepend(_vk.staging, s);
-  GList *last = g_list_nth(_vk.staging, DT_SLANG_STAGING_POOL_SIZE);
-  if(last)
+  const gboolean large = s->size > DT_SLANG_DIRECT_BUFFER;
+  int n = 0;
+  for(GList *l = _vk.staging; l;)
   {
-    last->prev->next = NULL;
-    last->prev = NULL;
-    g_list_free_full(last, (GDestroyNotify)_staging_destroy);
+    GList *next = g_list_next(l);
+    const dt_slang_staging_t *p = l->data;
+    if((p->size > DT_SLANG_DIRECT_BUFFER) == large
+       && ++n > (large ? DT_SLANG_LARGE_STAGING_POOL_SIZE : DT_SLANG_STAGING_POOL_SIZE))
+    {
+      _staging_destroy(l->data);
+      _vk.staging = g_list_delete_link(_vk.staging, l);
+    }
+    l = next;
   }
 }
 
@@ -1225,9 +1254,13 @@ static dt_slang_gpu_buffer_t *_buffer_acquire(const size_t size)
 // records an upload of bytes from host into dst at offset 0 in b
 static gboolean _record_upload(dt_slang_batch_t *b, const void *host, const size_t bytes, VkBuffer dst)
 {
+  const double start = dt_get_debug_wtime();
   dt_slang_staging_t *s = _staging_acquire(bytes, TRUE);
   if(!s) return FALSE;
-  memcpy(s->mem.map, host, bytes);
+  _copy(s->mem.map, host, bytes);
+  if(bytes >= (16 << 20))
+    dt_print(DT_DEBUG_PERF, "[slang_gpu] staging %zu MB for the device took %.3f secs",
+             bytes >> 20, dt_get_debug_wtime() - start);
   b->staging = g_list_prepend(b->staging, s);
   const VkBufferCopy copy = { 0, 0, bytes };
   vkCmdCopyBuffer(b->cb, s->mem.buffer, dst, 1, &copy);
@@ -1251,7 +1284,7 @@ static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean
                                    .imageExtent = { img->width, img->height, 1 } };
   if(to_device)
   {
-    memcpy(s->mem.map, host, bytes);
+    _copy(s->mem.map, host, bytes);
     b->staging = g_list_prepend(b->staging, s);
     vkCmdCopyBufferToImage(b->cb, s->mem.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     return _batch_submit(b, FALSE) ? 0 : 1;
@@ -1263,7 +1296,7 @@ static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean
   if(ok)
   {
     _invalidate(&s->mem);
-    memcpy(host, s->mem.map, bytes);
+    _copy(host, s->mem.map, bytes);
   }
   _staging_release(s);
   return ok ? 0 : 1;
@@ -1488,7 +1521,7 @@ int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buf, void *host, const size_
     if(_batch_submit(b, TRUE))
     {
       _invalidate(&s->mem);
-      memcpy(host, s->mem.map, size);
+      _copy(host, s->mem.map, size);
       err = 0;
     }
   }
@@ -1626,7 +1659,7 @@ static int _run(const char *program,
       {
         dt_slang_staging_t *s = _staging_acquire(bytes, TRUE);
         if(!s) goto done;
-        memcpy(s->mem.map, arg->ptr, bytes);
+        _copy(s->mem.map, arg->ptr, bytes);
         b->staging = g_list_prepend(b->staging, s);
         _barrier(b->cb, m->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         vkCmdCopyBufferToImage(b->cb, s->mem.buffer, m->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
@@ -1678,7 +1711,7 @@ static int _run(const char *program,
     const dt_slang_arg_t *arg = &args[res_arg[r]];
     if(arg->kind != DT_SLANG_ARG_IMAGE_OUT) continue;
     _invalidate(&readback[r]->mem);
-    memcpy((void *)arg->ptr, readback[r]->mem.map, sizeof(float) * arg->channels * arg->width * arg->height);
+    _copy((void *)arg->ptr, readback[r]->mem.map, sizeof(float) * arg->channels * arg->width * arg->height);
   }
   err = 0;
 
