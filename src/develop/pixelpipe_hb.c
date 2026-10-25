@@ -302,6 +302,7 @@ static gboolean _dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
   pipe->slang_image = NULL;
   pipe->slang_host = NULL;
   pipe->slang_host_valid = FALSE;
+  pipe->slang_tiling = FALSE;
 #endif
   pipe->tiling = FALSE;
   pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_NONE;
@@ -1879,7 +1880,42 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
     ? pipe->bcache_data && phash == pipe->bcache_hash && phash != DT_INVALID_HASH
     : FALSE;
 
-  if(!fitting && _piece_may_tile(piece))
+  // set by _pixelpipe_process_on_slang() for a module too large for the device
+  gboolean tiled_on_slang = FALSE;
+#ifdef HAVE_SLANG_GPU
+  if(pipe->slang_tiling && !bcaching)
+  {
+    dt_print_pipe(DT_DEBUG_PIPE,
+                  "process tiles slang",
+                  pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "%s%s%s",
+                  dt_iop_colorspace_to_name(cst_to),
+                  cst_to != cst_out ? " -> " : "",
+                  cst_to != cst_out ? dt_iop_colorspace_to_name(cst_out) : "");
+    tiled_on_slang = !default_process_tiling_slang(module, piece, tmp, *output, roi_in, roi_out, in_bpp);
+    if(!tiled_on_slang)
+      dt_print_pipe(DT_DEBUG_PIPE, "slang fallback",
+                    pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "running on the CPU");
+  }
+  pipe->slang_tiling = FALSE;
+#endif
+
+  if(tiled_on_slang)
+  {
+    if(want_bcache)
+    {
+      if(dt_pipe_no_mask_display(pipe))
+      {
+        float *cache = _get_fast_blendcache(nfloats, phash, pipe);
+        if(cache) dt_iop_image_copy(cache, *output, nfloats);
+      }
+      else
+        pipe->bcache_hash = DT_INVALID_HASH;
+    }
+    *pixelpipe_flow |= (PIXELPIPE_FLOW_PROCESSED_ON_GPU
+                        | PIXELPIPE_FLOW_PROCESSED_WITH_TILING);
+    *pixelpipe_flow &= ~(PIXELPIPE_FLOW_PROCESSED_ON_CPU);
+  }
+  else if(!fitting && _piece_may_tile(piece))
   {
     dt_print_pipe(DT_DEBUG_PIPE,
                   bcaching ? "from blend cache tile" : "process tiles",
@@ -2136,6 +2172,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                                        const dt_iop_roi_t *roi_out,
                                        dt_iop_module_t *module,
                                        dt_dev_pixelpipe_iop_t *piece,
+                                       const dt_develop_tiling_t *tiling,
                                        dt_pixelpipe_flow_t *pixelpipe_flow,
                                        const gboolean important_input,
                                        const gboolean important_out)
@@ -2173,13 +2210,37 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     return 0;
   }
 
+  const dt_iop_colorspace_type_t cst_to = module->input_colorspace(module, pipe, piece);
+  const gboolean convert = input_format->cst != cst_to;
+
+  // sized like dt_opencl_image_fits_device(), plus the images a conversion
+  // on the device and blending add. A module that doesn't fit runs in tiles
+  // from the CPU path, which then also converts, collects the histogram and
+  // blends on the host.
+  size_t available = 0;
+  int max_dim = 0;
+  dt_slang_gpu_memory_info(&available, &max_dim);
+  const int m_width = MAX(roi_in->width, roi_out->width);
+  const int m_height = MAX(roi_in->height, roi_out->height);
+  const float images = tiling->factor_cl + (convert ? 1.0f : 0.0f) + (_piece_wants_blending(piece) ? 1.0f : 0.0f);
+  const float needed = 4.0f * sizeof(float) * m_width * m_height * images + tiling->overhead;
+  if(m_width > max_dim || m_height > max_dim || needed > (float)available)
+  {
+    if(resident && !_slang_sync_host(pipe)) return -1;
+    _slang_release(pipe);
+    pipe->slang_tiling = !raw_u16 && _piece_may_tile(piece);
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_TILING,
+                  pipe->slang_tiling ? "slang tiling" : "slang too large",
+                  pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "needs %zuMB of %zuMB",
+                  (size_t)needed / DT_MEGA, available / DT_MEGA);
+    return 0;
+  }
+
   // the Bayer and X-Trans patterns as seen from this module's roi
   dt_dev_prepare_piece_cfa(piece, roi_in);
 
   // the cache keeps a focused module's input, and histograms are collected
   // on the host
-  const dt_iop_colorspace_type_t cst_to = module->input_colorspace(module, pipe, piece);
-  const gboolean convert = input_format->cst != cst_to;
   const gboolean histogram = (dev->gui_attached || !(piece->request_histogram & DT_REQUEST_ONLY_IN_GUI))
                              && (piece->request_histogram & DT_REQUEST_ON);
   // the color picker reads the input and output on the host, as the
@@ -3789,7 +3850,7 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
     // or on the Slang kernels, for modules that have them
     const int slang = _pixelpipe_process_on_slang(pipe, dev, input, input_format, &roi_in,
                                                   output, *out_format, roi_out, module, piece,
-                                                  &pixelpipe_flow, important_input, important_out);
+                                                  &tiling, &pixelpipe_flow, important_input, important_out);
     if(slang < 0) return TRUE;
     if(slang == 0)
 #endif
