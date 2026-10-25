@@ -31,6 +31,12 @@
 #include <string.h>
 #include <unistd.h>
 
+// the macOS 15 SDK renamed MTLPipelineOptionArgumentInfo, keeping its value;
+// Xcode 15 (SDK 14) has only the old name
+#if !defined(MAC_OS_VERSION_15_0)
+#define MTLPipelineOptionBindingInfo MTLPipelineOptionArgumentInfo
+#endif
+
 #define DT_SLANG_MAX_PARAMS 32
 #define DT_SLANG_POOL_SIZE 4
 #define DT_SLANG_BUFFER_POOL_SIZE 12
