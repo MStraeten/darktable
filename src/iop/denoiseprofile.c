@@ -2947,7 +2947,7 @@ static int process_wavelets_slang(dt_iop_module_t *self,
     const int nblocks = bufsize;
     const float fpixels = npixels;
     const dt_aligned_pixel_t boost = { 1.0f, 1.0f, 1.0f, 1.0f };
-    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_reduce_first", nbx, nby,
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_reduce_first", 16 * nbx, nby,
                                    SLIMG_DEV(dev_detail[s]), SLARG(width), SLARG(height), SLBUF_DEV(dev_m))
       || dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_threshold", 16, 16,
                                   SLBUF_DEV(dev_m), SLARG(nblocks), SLARG(fpixels), SLARG(sb2), SLARG(adjt),

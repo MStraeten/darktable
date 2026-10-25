@@ -430,36 +430,45 @@ void denoiseprofile_synthesize(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), sum);
 }
 
-// the sum of the squared pixels in each 16x16 block, one work item per
-// block, where the OpenCL kernel runs a work group per block
+// the sum of the squared pixels in each 16x16 block. One work item per
+// block, each looping over 256 pixels, kept a discrete GPU mostly idle and
+// read memory 16 pixels apart; here each work item sums one column of a
+// block, so a row of work items reads a row of pixels, and the 16 columns of
+// a block are added in group memory. The grid is (blocks across * 16) x
+// blocks down, so one row of a work group covers one block.
 static const int REDUCE_BLOCK = 16;
+groupshared float4 reduce_columns[16][16];
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void denoiseprofile_reduce_first(uint3 gid : SV_DispatchThreadID,
+void denoiseprofile_reduce_first(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
                                  uniform ImageIn in, uniform int width, uniform int height,
                                  uniform RWStructuredBuffer<float4> accu)
 {
-  const int bx = gid.x;
-  const int by = gid.y;
   const int nbx = (width + REDUCE_BLOCK - 1) / REDUCE_BLOCK;
   const int nby = (height + REDUCE_BLOCK - 1) / REDUCE_BLOCK;
-  if(bx >= nbx || by >= nby) return;
+  const int x = gid.x;
+  const int by = gid.y;
 
   float4 sum = float4(0.0f);
-  for(int j = 0; j < REDUCE_BLOCK; j++)
-  {
-    const int y = by * REDUCE_BLOCK + j;
-    if(y >= height) break;
-    for(int i = 0; i < REDUCE_BLOCK; i++)
+  if(x < width && by < nby)
+    for(int j = 0; j < REDUCE_BLOCK; j++)
     {
-      const int x = bx * REDUCE_BLOCK + i;
-      if(x >= width) break;
+      const int y = by * REDUCE_BLOCK + j;
+      if(y >= height) break;
       const float4 pixel = in.readpixel(x, y);
       sum += pixel * pixel;
     }
+  reduce_columns[lid.y][lid.x] = sum;
+  GroupMemoryBarrierWithGroupSync();
+
+  const int bx = x / REDUCE_BLOCK;
+  if(lid.x == 0 && bx < nbx && by < nby)
+  {
+    float4 total = float4(0.0f);
+    for(int i = 0; i < REDUCE_BLOCK; i++) total += reduce_columns[lid.y][i];
+    accu[by * nbx + bx] = total;
   }
-  accu[by * nbx + bx] = sum;
 }
 
 // adds up the block sums of denoiseprofile_reduce_first() and turns them
