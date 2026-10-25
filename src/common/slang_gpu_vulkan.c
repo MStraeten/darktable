@@ -84,7 +84,7 @@ typedef struct dt_slang_vulkan_t
   GList *spare;        // finished batches, for reuse
   gboolean timestamps; // the queue can time kernels
   float timestamp_period; // ns per timestamp tick
-  VkDeviceSize pool_budget; // bytes the image pool may keep
+  VkDeviceSize pool_budget; // bytes the image and buffer pools may keep together
 } dt_slang_vulkan_t;
 
 static dt_slang_vulkan_t _vk = { 0 };
@@ -179,7 +179,7 @@ static gboolean _init_device(void)
              _vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? ", device local" : "");
   for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
     if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-      _vk.pool_budget = MAX(_vk.pool_budget, _vk.memprops.memoryHeaps[h].size / 3);
+      _vk.pool_budget = MAX(_vk.pool_budget, _vk.memprops.memoryHeaps[h].size / 4);
 
   VkPhysicalDeviceFeatures features;
   vkGetPhysicalDeviceFeatures(_vk.pdev, &features);
@@ -557,6 +557,18 @@ typedef struct dt_slang_mem_t
   gboolean coherent;     // the mapped memory needs no invalidation before host reads
 } dt_slang_mem_t;
 
+static gboolean _reclaim(void);
+
+// device memory, after freeing the pools if the device is out of it. Pooled
+// images and buffers otherwise filled a 4 GB GPU after a few exports
+static gboolean _allocate(const VkMemoryAllocateInfo *mai, VkDeviceMemory *mem)
+{
+  VkResult res = vkAllocateMemory(_vk.dev, mai, NULL, mem);
+  if(res == VK_ERROR_OUT_OF_DEVICE_MEMORY && _reclaim())
+    res = vkAllocateMemory(_vk.dev, mai, NULL, mem);
+  return res == VK_SUCCESS;
+}
+
 static gboolean _memtype(const uint32_t bits, const VkMemoryPropertyFlags want, uint32_t *type)
 {
   for(uint32_t i = 0; i < _vk.memprops.memoryTypeCount; i++)
@@ -638,7 +650,7 @@ static gboolean _alloc_device(dt_slang_mem_t *m, const VkDeviceSize size)
   const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                      .allocationSize = req.size,
                                      .memoryTypeIndex = type };
-  return vkAllocateMemory(_vk.dev, &mai, NULL, &m->buffer_mem) == VK_SUCCESS
+  return _allocate(&mai, &m->buffer_mem)
          && vkBindBufferMemory(_vk.dev, m->buffer, m->buffer_mem, 0) == VK_SUCCESS;
 }
 
@@ -704,7 +716,7 @@ static gboolean _create_image(VkImage *image,
   const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                      .allocationSize = req.size,
                                      .memoryTypeIndex = type };
-  if(vkAllocateMemory(_vk.dev, &mai, NULL, mem) != VK_SUCCESS
+  if(!_allocate(&mai, mem)
      || vkBindImageMemory(_vk.dev, *image, *mem, 0) != VK_SUCCESS)
     return FALSE;
   const VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -838,17 +850,47 @@ static void _free_doomed(void)
   _vk.doomed_buffers = NULL;
 }
 
+// cuts a pool list after the first max entries or once *bytes, counting
+// on from the other pool, exceeds the budget. The cut entries may still be
+// in use, so they are freed once the queue is idle
+static GList *_trim(GList *list, const int max, VkDeviceSize *bytes, GList **doomed, const gboolean images)
+{
+  int n = 0;
+  for(GList *l = list; l; l = g_list_next(l), n++)
+  {
+    if(images)
+    {
+      const dt_slang_gpu_image_t *i = l->data;
+      *bytes += sizeof(float) * i->channels * i->width * i->height;
+    }
+    else
+      *bytes += ((const dt_slang_gpu_buffer_t *)l->data)->size;
+    if(n >= max || *bytes > _vk.pool_budget)
+    {
+      if(l->prev) l->prev->next = NULL;
+      else list = NULL;
+      l->prev = NULL;
+      *doomed = g_list_concat(*doomed, l);
+      break;
+    }
+  }
+  return list;
+}
+
+// the pools keep what a module chain uses, within a quarter of the device
+// memory: allocating images on every run left the GPU waiting
+static void _trim_pools(void)
+{
+  VkDeviceSize bytes = 0;
+  _vk.images = _trim(_vk.images, DT_SLANG_POOL_SIZE, &bytes, &_vk.doomed_images, TRUE);
+  _vk.buffers = _trim(_vk.buffers, DT_SLANG_BUFFER_POOL_SIZE, &bytes, &_vk.doomed_buffers, FALSE);
+}
+
 static void _buffer_release(dt_slang_gpu_buffer_t *buf)
 {
   // a demosaic chain holds eight buffers of the same size
   _vk.buffers = g_list_prepend(_vk.buffers, buf);
-  GList *last = g_list_nth(_vk.buffers, DT_SLANG_BUFFER_POOL_SIZE);
-  if(last)
-  {
-    last->prev->next = NULL;
-    last->prev = NULL;
-    _vk.doomed_buffers = g_list_concat(_vk.doomed_buffers, last);
-  }
+  _trim_pools();
 }
 
 // hands back what b used and keeps b for reuse. Pooled images and buffers
@@ -905,6 +947,21 @@ static void _wait_all(void)
     _retire(b);
   }
   _free_doomed();
+}
+
+// frees the pooled images and buffers for an allocation the device had no
+// memory for. TRUE if there was something to free
+static gboolean _reclaim(void)
+{
+  if(!_vk.images && !_vk.buffers && !_vk.doomed_images && !_vk.doomed_buffers) return FALSE;
+  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] out of device memory, freeing the pooled images and buffers");
+  _wait_all();
+  _vk.doomed_images = g_list_concat(_vk.doomed_images, _vk.images);
+  _vk.doomed_buffers = g_list_concat(_vk.doomed_buffers, _vk.buffers);
+  _vk.images = NULL;
+  _vk.buffers = NULL;
+  _free_doomed();
+  return TRUE;
 }
 
 static dt_slang_batch_t *_batch_begin(const char *entry, const int width, const int height)
@@ -1205,25 +1262,10 @@ void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img)
 {
   if(!img) return;
   g_mutex_lock(&_vk_lock);
-  // allocating images on every run left the GPU waiting, so the pool keeps
-  // what a module chain uses, within a third of the device memory. Kernels
-  // still running may use the image, so a pooled one is reused only by later
-  // kernels and an evicted one is freed once the queue is idle
+  // kernels still running may use the image, so a pooled one is reused only
+  // by later kernels
   _vk.images = g_list_prepend(_vk.images, img);
-  VkDeviceSize bytes = 0;
-  int n = 0;
-  for(GList *l = _vk.images; l; l = g_list_next(l), n++)
-  {
-    const dt_slang_gpu_image_t *i = l->data;
-    bytes += sizeof(float) * i->channels * i->width * i->height;
-    if(n > 0 && (n >= DT_SLANG_POOL_SIZE || bytes > _vk.pool_budget))
-    {
-      l->prev->next = NULL;
-      l->prev = NULL;
-      _vk.doomed_images = g_list_concat(_vk.doomed_images, l);
-      break;
-    }
-  }
+  _trim_pools();
   _retire_finished();
   g_mutex_unlock(&_vk_lock);
 }
