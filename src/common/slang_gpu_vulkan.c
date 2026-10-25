@@ -1729,6 +1729,49 @@ mismatch:
   return 1;
 }
 
+void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
+{
+  *available = 0;
+  *max_dim = 0;
+  if(!dt_slang_gpu_enabled()) return;
+
+  g_mutex_lock(&_vk_lock);
+  VkDeviceSize best = 0;
+  if(_vk.memory_budget)
+  {
+    // the budget covers other applications too, and what the pools keep
+    // counts as used although it would be freed for the module
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget
+        = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+    VkPhysicalDeviceMemoryProperties2 props2
+        = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
+    vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
+    VkDeviceSize pooled = 0;
+    for(GList *l = _vk.images; l; l = g_list_next(l))
+    {
+      const dt_slang_gpu_image_t *i = l->data;
+      pooled += sizeof(float) * i->channels * i->width * i->height;
+    }
+    for(GList *l = _vk.buffers; l; l = g_list_next(l))
+      pooled += ((const dt_slang_gpu_buffer_t *)l->data)->size;
+    for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
+      if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+      {
+        const VkDeviceSize used = budget.heapUsage[h] > pooled ? budget.heapUsage[h] - pooled : 0;
+        if(budget.heapBudget[h] > used) best = MAX(best, budget.heapBudget[h] - used);
+      }
+  }
+  else
+    for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
+      if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+        best = MAX(best, _vk.memprops.memoryHeaps[h].size / 4 * 3);
+  const int cap = dt_conf_get_int("slang_gpu_memory");
+  if(cap > 0) best = MIN(best, (VkDeviceSize)cap << 20);
+  *available = best;
+  *max_dim = _vk.max_image_dim;
+  g_mutex_unlock(&_vk_lock);
+}
+
 int dt_slang_gpu_run_2d(const char *program,
                         const char *kernel,
                         const int width,

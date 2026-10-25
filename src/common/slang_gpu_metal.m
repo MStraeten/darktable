@@ -694,6 +694,27 @@ void dt_slang_gpu_wait(void)
   g_mutex_unlock(&_mtl_lock);
 }
 
+void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
+{
+  *available = 0;
+  *max_dim = 0;
+  if(!dt_slang_gpu_enabled()) return;
+  g_mutex_lock(&_mtl_lock);
+  // what the pools keep counts as allocated although it would be freed for
+  // the module
+  size_t pooled = 0;
+  for(DtSlangImage *img in _mtl.images) pooled += img->buffer.length;
+  for(DtSlangBuffer *buf in _mtl.buffers) pooled += buf->buffer.length;
+  const size_t limit = _mtl.dev.recommendedMaxWorkingSetSize;
+  const size_t used = _mtl.dev.currentAllocatedSize > pooled ? _mtl.dev.currentAllocatedSize - pooled : 0;
+  size_t best = limit > used ? limit - used : 0;
+  const int cap = dt_conf_get_int("slang_gpu_memory");
+  if(cap > 0) best = MIN(best, (size_t)cap << 20);
+  *available = best;
+  *max_dim = (int)_mtl.max_image_dim;
+  g_mutex_unlock(&_mtl_lock);
+}
+
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *image)
 {
   if(!image) return;

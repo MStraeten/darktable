@@ -118,6 +118,12 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host);
 // waits for every kernel that has been started
 void dt_slang_gpu_wait(void);
 
+// the device memory a module may use now, in bytes, counting the pooled
+// images and buffers that would be freed for it, and the largest image
+// width or height. The pixelpipe tiles a module that needs more. The
+// slang_gpu_memory config key (MB) lowers the memory, to test tiling.
+void dt_slang_gpu_memory_info(size_t *available, int *max_dim);
+
 // a buffer of size bytes on the device, for the intermediate results of a
 // chain of kernels. It is filled from host if that is not NULL, and zeroed
 // otherwise. Returns NULL on failure.

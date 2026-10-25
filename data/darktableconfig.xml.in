@@ -576,6 +576,13 @@
     <shortdescription>Vulkan device for the Slang GPU kernels</shortdescription>
     <longdescription>experimental: the index or part of the name of the Vulkan device to run the Slang kernels on. empty picks a discrete GPU, then an integrated one</longdescription>
   </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_memory</name>
+    <type min="0">int</type>
+    <default>0</default>
+    <shortdescription>device memory for the Slang GPU kernels (MB)</shortdescription>
+    <longdescription>experimental: the most device memory, in MB, a module may use on the Slang GPU path before it is processed in tiles. 0 uses what the device reports as free</longdescription>
+  </dtconfig>
   <dtconfig prefs="processing" section="opencl" capability="opencl">
     <name>opencl_scheduling_profile</name>
     <type>
