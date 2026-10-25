@@ -25,6 +25,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,8 +34,14 @@
 #define DT_SLANG_MAX_PARAMS 32
 // Vulkan guarantees 128 bytes of push constants, most devices have 256
 #define DT_SLANG_PUSH_SIZE 256
-#define DT_SLANG_POOL_SIZE 4
+// denoiseprofile holds ten full-size images at once
+#define DT_SLANG_POOL_SIZE 12
 #define DT_SLANG_BUFFER_POOL_SIZE 12
+#define DT_SLANG_STAGING_POOL_SIZE 8
+// submissions queued before the oldest is waited for
+#define DT_SLANG_MAX_INFLIGHT 64
+// host buffers up to this size are bound in host memory, larger ones copied to the device
+#define DT_SLANG_DIRECT_BUFFER (256 * 1024)
 
 typedef struct dt_slang_resource_t
 {
@@ -70,8 +77,14 @@ typedef struct dt_slang_vulkan_t
   GHashTable *kernels; // "program:kernel" -> dt_slang_kernel_t
   GList *images;       // freed device images, for reuse
   GList *buffers;      // freed device buffers, for reuse
-  struct dt_slang_mem_t *staging[2]; // for copies to (0) and from (1) device images, kept between them
-  size_t staging_size[2];
+  GList *staging;      // staging buffers no batch uses, for reuse
+  GList *doomed_images;  // evicted from the pools, freed once the queue is idle
+  GList *doomed_buffers;
+  GQueue inflight;     // submitted batches, oldest first
+  GList *spare;        // finished batches, for reuse
+  gboolean timestamps; // the queue can time kernels
+  float timestamp_period; // ns per timestamp tick
+  VkDeviceSize pool_budget; // bytes the image pool may keep
 } dt_slang_vulkan_t;
 
 static dt_slang_vulkan_t _vk = { 0 };
@@ -80,10 +93,6 @@ static GThread *_prepare_thread = NULL;
 
 // --------------------------------------------------------------------------------------------
 // device
-
-static void _image_free(struct dt_slang_gpu_image_t *img);
-static void _buffer_free(struct dt_slang_gpu_buffer_t *buf);
-static void _staging_free(void);
 
 static void _destroy_kernel(gpointer data)
 {
@@ -164,6 +173,13 @@ static gboolean _init_device(void)
   _vk.max_image_dim = props.limits.maxImageDimension2D;
   _vk.push_size = MIN(DT_SLANG_PUSH_SIZE, props.limits.maxPushConstantsSize);
   vkGetPhysicalDeviceMemoryProperties(_vk.pdev, &_vk.memprops);
+  for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] memory heap %u: %" PRIu64 " MB%s", h,
+             (uint64_t)(_vk.memprops.memoryHeaps[h].size >> 20),
+             _vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? ", device local" : "");
+  for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
+    if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+      _vk.pool_budget = MAX(_vk.pool_budget, _vk.memprops.memoryHeaps[h].size / 3);
 
   VkPhysicalDeviceFeatures features;
   vkGetPhysicalDeviceFeatures(_vk.pdev, &features);
@@ -180,6 +196,9 @@ static gboolean _init_device(void)
   uint32_t family = UINT32_MAX;
   for(uint32_t f = 0; f < nfam && family == UINT32_MAX; f++)
     if(fam[f].queueFlags & VK_QUEUE_COMPUTE_BIT) family = f;
+  _vk.timestamps = family != UINT32_MAX && fam[family].timestampValidBits > 0
+                   && props.limits.timestampPeriod > 0.0f;
+  _vk.timestamp_period = props.limits.timestampPeriod;
   g_free(fam);
   if(family == UINT32_MAX)
   {
@@ -207,7 +226,8 @@ static gboolean _init_device(void)
   vkGetDeviceQueue(_vk.dev, family, 0, &_vk.queue);
 
   const VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                                         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+                                         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT
+                                                  | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                                          .queueFamilyIndex = family };
   if(vkCreateCommandPool(_vk.dev, &cpci, NULL, &_vk.pool) != VK_SUCCESS) return FALSE;
 
@@ -229,23 +249,6 @@ gboolean dt_slang_gpu_enabled(void)
   const gboolean usable = _vk.usable;
   g_mutex_unlock(&_vk_lock);
   return usable;
-}
-
-void dt_slang_gpu_cleanup(void)
-{
-  if(_prepare_thread) g_thread_join(_prepare_thread);
-  _prepare_thread = NULL;
-  g_mutex_lock(&_vk_lock);
-  if(_vk.dev) vkDeviceWaitIdle(_vk.dev);
-  g_list_free_full(_vk.images, (GDestroyNotify)_image_free);
-  g_list_free_full(_vk.buffers, (GDestroyNotify)_buffer_free);
-  _staging_free();
-  if(_vk.kernels) g_hash_table_destroy(_vk.kernels);
-  if(_vk.pool) vkDestroyCommandPool(_vk.dev, _vk.pool, NULL);
-  if(_vk.dev) vkDestroyDevice(_vk.dev, NULL);
-  if(_vk.instance) vkDestroyInstance(_vk.instance, NULL);
-  memset(&_vk, 0, sizeof(_vk));
-  g_mutex_unlock(&_vk_lock);
 }
 
 // --------------------------------------------------------------------------------------------
@@ -594,26 +597,17 @@ static gboolean _alloc_mapped(dt_slang_mem_t *m,
          && vkMapMemory(_vk.dev, m->buffer_mem, 0, VK_WHOLE_SIZE, 0, &m->map) == VK_SUCCESS;
 }
 
-// a mapped buffer, in device local memory if prefer_device and the device
-// has some that the host can map
-static gboolean _alloc_buffer_in(dt_slang_mem_t *m,
-                                 const VkDeviceSize size,
-                                 const VkBufferUsageFlags usage,
-                                 const gboolean prefer_device)
+// a mapped buffer the host writes for the device
+static gboolean _alloc_upload(dt_slang_mem_t *m, const VkDeviceSize size)
 {
-  const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  const VkMemoryPropertyFlags want[2] = { host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, host };
-  return prefer_device ? _alloc_mapped(m, size, usage, want, 2) : _alloc_mapped(m, size, usage, want + 1, 1);
-}
-
-static gboolean _alloc_buffer(dt_slang_mem_t *m, const VkDeviceSize size, const VkBufferUsageFlags usage)
-{
-  return _alloc_buffer_in(m, size, usage, FALSE);
+  const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  return _alloc_mapped(m, size,
+                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &want, 1);
 }
 
 // a mapped buffer the device copies results into for the host. Host reads
 // from uncached memory are slow: on an NVIDIA laptop GPU, reading a
-// 3908x2602 image took 600 ms from the coherent type the other buffers use
+// 3908x2602 image took 600 ms from the coherent type the uploads use
 static gboolean _alloc_readback(dt_slang_mem_t *m, const VkDeviceSize size)
 {
   const VkMemoryPropertyFlags want[3]
@@ -622,6 +616,30 @@ static gboolean _alloc_readback(dt_slang_mem_t *m, const VkDeviceSize size)
           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT };
   return _alloc_mapped(m, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, want, 3);
+}
+
+// a storage buffer in device memory, which the host never maps. Mapped
+// device memory is limited to a 256 MB window on discrete GPUs without
+// resizable BAR, so the large buffers used to end up in host memory, read
+// over PCIe and cleared by the CPU
+static gboolean _alloc_device(dt_slang_mem_t *m, const VkDeviceSize size)
+{
+  const VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                   .size = size,
+                                   .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                            | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+  if(vkCreateBuffer(_vk.dev, &bci, NULL, &m->buffer) != VK_SUCCESS) return FALSE;
+  VkMemoryRequirements req;
+  vkGetBufferMemoryRequirements(_vk.dev, m->buffer, &req);
+  uint32_t type;
+  if(!_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)
+     && !_memtype(req.memoryTypeBits, 0, &type))
+    return FALSE;
+  const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                     .allocationSize = req.size,
+                                     .memoryTypeIndex = type };
+  return vkAllocateMemory(_vk.dev, &mai, NULL, &m->buffer_mem) == VK_SUCCESS
+         && vkBindBufferMemory(_vk.dev, m->buffer, m->buffer_mem, 0) == VK_SUCCESS;
 }
 
 // makes what the device wrote to m visible to the host, after the commands
@@ -636,7 +654,6 @@ static void _invalidate(const dt_slang_mem_t *m)
   vkInvalidateMappedMemoryRanges(_vk.dev, 1, &range);
 }
 
-// orders the transfers recorded before it ahead of host reads
 static void _host_read_barrier(VkCommandBuffer cb)
 {
   const VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -644,6 +661,16 @@ static void _host_read_barrier(VkCommandBuffer cb)
                                .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0,
                        NULL);
+}
+
+// orders everything recorded so far in cb before what follows
+static void _memory_barrier(VkCommandBuffer cb)
+{
+  const VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                               .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                               .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                       0, 1, &mb, 0, NULL, 0, NULL);
 }
 
 static gboolean _create_image(VkImage *image,
@@ -688,21 +715,6 @@ static gboolean _create_image(VkImage *image,
   return vkCreateImageView(_vk.dev, &vci, NULL, view) == VK_SUCCESS;
 }
 
-static gboolean _alloc_image(dt_slang_mem_t *m, const dt_slang_arg_t *arg)
-{
-  const gboolean out = arg->kind == DT_SLANG_ARG_IMAGE_OUT;
-  if(!_create_image(&m->image, &m->image_mem, &m->view, arg->width, arg->height, arg->channels,
-                    out ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                        : VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
-    return FALSE;
-
-  const size_t bytes = sizeof(float) * arg->channels * arg->width * arg->height;
-  if(out ? !_alloc_readback(m, bytes) : !_alloc_buffer(m, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
-    return FALSE;
-  if(!out) memcpy(m->map, arg->ptr, bytes);
-  return TRUE;
-}
-
 static void _free_mem(dt_slang_mem_t *m)
 {
   if(m->view) vkDestroyImageView(_vk.dev, m->view, NULL);
@@ -727,39 +739,6 @@ static void _barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkIm
                        0, 0, NULL, 0, NULL, 1, &b);
 }
 
-static VkCommandBuffer _begin_commands(void)
-{
-  const VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                                             .commandPool = _vk.pool,
-                                             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                             .commandBufferCount = 1 };
-  VkCommandBuffer cb = VK_NULL_HANDLE;
-  if(vkAllocateCommandBuffers(_vk.dev, &cbai, &cb) != VK_SUCCESS) return VK_NULL_HANDLE;
-  const VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-  vkBeginCommandBuffer(cb, &begin);
-  // device images carry data from one submission to the next
-  const VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                               .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-                               .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
-  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                       0, 1, &mb, 0, NULL, 0, NULL);
-  return cb;
-}
-
-// ends, submits and frees cb, and waits for it
-static gboolean _submit_commands(VkCommandBuffer cb)
-{
-  const VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                                .commandBufferCount = 1,
-                                .pCommandBuffers = &cb };
-  const gboolean ok = vkEndCommandBuffer(cb) == VK_SUCCESS
-                      && vkQueueSubmit(_vk.queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS
-                      && vkQueueWaitIdle(_vk.queue) == VK_SUCCESS;
-  vkFreeCommandBuffers(_vk.dev, _vk.pool, 1, &cb);
-  return ok;
-}
-
 // device images stay in the GENERAL layout, which allows sampling, storage
 // writes and transfers alike, so kernels can take them as input or output
 struct dt_slang_gpu_image_t
@@ -770,6 +749,14 @@ struct dt_slang_gpu_image_t
   int width, height, channels;
 };
 
+// device buffers live in device memory; the host fills, clears and reads
+// them with transfer commands
+struct dt_slang_gpu_buffer_t
+{
+  dt_slang_mem_t mem;
+  size_t size;
+};
+
 static void _image_free(dt_slang_gpu_image_t *img)
 {
   if(img->view) vkDestroyImageView(_vk.dev, img->view, NULL);
@@ -778,69 +765,359 @@ static void _image_free(dt_slang_gpu_image_t *img)
   g_free(img);
 }
 
-static void _staging_free(void)
+static void _buffer_free(dt_slang_gpu_buffer_t *buf)
 {
-  for(int k = 0; k < 2; k++)
+  _free_mem(&buf->mem);
+  g_free(buf);
+}
+
+// a mapped buffer for one copy between host and device, kept for reuse
+typedef struct dt_slang_staging_t
+{
+  dt_slang_mem_t mem;
+  size_t size;
+  gboolean to_device;
+} dt_slang_staging_t;
+
+static void _staging_destroy(dt_slang_staging_t *s)
+{
+  _free_mem(&s->mem);
+  g_free(s);
+}
+
+// --------------------------------------------------------------------------------------------
+// submissions
+
+// Every call records its commands into a batch of its own and submits it
+// without waiting, as OpenCL queues kernels: waiting for each one left the
+// GPU idle between kernels and let it clock down. A batch keeps what its
+// commands use (staging buffers, temporary images and buffers) until its
+// fence shows it has finished. The queue runs batches in submission order,
+// and each starts with a full memory barrier, so a kernel sees the results of
+// those before it.
+typedef struct dt_slang_batch_t
+{
+  VkCommandBuffer cb;
+  VkFence fence;
+  VkDescriptorPool dpool;
+  VkQueryPool queries;          // start and end timestamp, with -d perf
+  GList *staging;               // dt_slang_staging_t, back to the staging pool when done
+  GList *buffers;               // dt_slang_gpu_buffer_t, back to the buffer pool when done
+  GList *mems;                  // dt_slang_mem_t, freed when done
+  const char *entry;            // the kernel, for the timing
+  int width, height;
+} dt_slang_batch_t;
+
+static void _batch_destroy(dt_slang_batch_t *b)
+{
+  if(b->queries) vkDestroyQueryPool(_vk.dev, b->queries, NULL);
+  if(b->dpool) vkDestroyDescriptorPool(_vk.dev, b->dpool, NULL);
+  if(b->fence) vkDestroyFence(_vk.dev, b->fence, NULL);
+  if(b->cb) vkFreeCommandBuffers(_vk.dev, _vk.pool, 1, &b->cb);
+  g_free(b);
+}
+
+static void _staging_release(dt_slang_staging_t *s)
+{
+  _vk.staging = g_list_prepend(_vk.staging, s);
+  GList *last = g_list_nth(_vk.staging, DT_SLANG_STAGING_POOL_SIZE);
+  if(last)
   {
-    if(_vk.staging[k]) _free_mem(_vk.staging[k]);
-    g_free(_vk.staging[k]);
-    _vk.staging[k] = NULL;
-    _vk.staging_size[k] = 0;
+    last->prev->next = NULL;
+    last->prev = NULL;
+    g_list_free_full(last, (GDestroyNotify)_staging_destroy);
   }
 }
 
-// the staging buffer for copies to or from the device of at least bytes.
-// Allocating one per copy cost more than the copy on some drivers, so the
-// largest one so far is kept
-static dt_slang_mem_t *_staging(const size_t bytes, const gboolean to_device)
+// images and buffers that still may be in use are freed once the queue is idle
+static void _free_doomed(void)
 {
-  const int k = to_device ? 0 : 1;
-  if(_vk.staging[k] && _vk.staging_size[k] >= bytes) return _vk.staging[k];
+  g_list_free_full(_vk.doomed_images, (GDestroyNotify)_image_free);
+  g_list_free_full(_vk.doomed_buffers, (GDestroyNotify)_buffer_free);
+  _vk.doomed_images = NULL;
+  _vk.doomed_buffers = NULL;
+}
 
-  if(_vk.staging[k]) _free_mem(_vk.staging[k]);
-  g_free(_vk.staging[k]);
-  _vk.staging_size[k] = 0;
-  _vk.staging[k] = g_new0(dt_slang_mem_t, 1);
-  if(to_device ? !_alloc_buffer(_vk.staging[k], bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)
-               : !_alloc_readback(_vk.staging[k], bytes))
+static void _buffer_release(dt_slang_gpu_buffer_t *buf)
+{
+  // a demosaic chain holds eight buffers of the same size
+  _vk.buffers = g_list_prepend(_vk.buffers, buf);
+  GList *last = g_list_nth(_vk.buffers, DT_SLANG_BUFFER_POOL_SIZE);
+  if(last)
   {
-    _free_mem(_vk.staging[k]);
-    g_free(_vk.staging[k]);
-    _vk.staging[k] = NULL;
+    last->prev->next = NULL;
+    last->prev = NULL;
+    _vk.doomed_buffers = g_list_concat(_vk.doomed_buffers, last);
+  }
+}
+
+// hands back what b used and keeps b for reuse. Pooled images and buffers
+// may still be in use by earlier batches, which is fine: only later batches
+// get them again
+static void _batch_release(dt_slang_batch_t *b)
+{
+  b->entry = NULL;
+  g_list_free_full(b->staging, (GDestroyNotify)_staging_release);
+  g_list_free_full(b->buffers, (GDestroyNotify)_buffer_release);
+  for(GList *l = b->mems; l; l = g_list_next(l))
+  {
+    _free_mem(l->data);
+    g_free(l->data);
+  }
+  g_list_free(b->mems);
+  b->staging = b->buffers = b->mems = NULL;
+  vkResetCommandBuffer(b->cb, 0);
+  vkResetDescriptorPool(_vk.dev, b->dpool, 0);
+  _vk.spare = g_list_prepend(_vk.spare, b);
+}
+
+// a finished batch: logs its time and hands back what it used
+static void _retire(dt_slang_batch_t *b)
+{
+  if(b->queries && b->entry)
+  {
+    uint64_t ts[2] = { 0 };
+    if(vkGetQueryPoolResults(_vk.dev, b->queries, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
+                             VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+      dt_print(DT_DEBUG_PERF, "[slang_gpu] %s %dx%d took %.3f secs (Vulkan)", b->entry, b->width, b->height,
+               (double)(ts[1] - ts[0]) * _vk.timestamp_period * 1e-9);
+  }
+  vkResetFences(_vk.dev, 1, &b->fence);
+  _batch_release(b);
+}
+
+// retires the batches that have finished, oldest first
+static void _retire_finished(void)
+{
+  dt_slang_batch_t *b;
+  while((b = g_queue_peek_head(&_vk.inflight)) && vkGetFenceStatus(_vk.dev, b->fence) == VK_SUCCESS)
+    _retire(g_queue_pop_head(&_vk.inflight));
+  if(g_queue_is_empty(&_vk.inflight)) _free_doomed();
+}
+
+// waits for everything submitted so far
+static void _wait_all(void)
+{
+  dt_slang_batch_t *b;
+  while((b = g_queue_pop_head(&_vk.inflight)))
+  {
+    vkWaitForFences(_vk.dev, 1, &b->fence, VK_TRUE, UINT64_MAX);
+    _retire(b);
+  }
+  _free_doomed();
+}
+
+static dt_slang_batch_t *_batch_begin(const char *entry, const int width, const int height)
+{
+  _retire_finished();
+  // a long chain of kernels without a read would otherwise hold its
+  // staging buffers and temporaries all at once
+  if(g_queue_get_length(&_vk.inflight) >= DT_SLANG_MAX_INFLIGHT)
+  {
+    dt_slang_batch_t *oldest = g_queue_pop_head(&_vk.inflight);
+    vkWaitForFences(_vk.dev, 1, &oldest->fence, VK_TRUE, UINT64_MAX);
+    _retire(oldest);
+  }
+
+  dt_slang_batch_t *b = NULL;
+  if(_vk.spare)
+  {
+    b = _vk.spare->data;
+    _vk.spare = g_list_delete_link(_vk.spare, _vk.spare);
+  }
+  else
+  {
+    b = g_new0(dt_slang_batch_t, 1);
+    const VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                               .commandPool = _vk.pool,
+                                               .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                               .commandBufferCount = 1 };
+    const VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    const VkDescriptorPoolSize sizes[3] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, DT_SLANG_MAX_PARAMS },
+                                            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, DT_SLANG_MAX_PARAMS },
+                                            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DT_SLANG_MAX_PARAMS } };
+    const VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                              .maxSets = 1,
+                                              .poolSizeCount = 3,
+                                              .pPoolSizes = sizes };
+    if(vkAllocateCommandBuffers(_vk.dev, &cbai, &b->cb) != VK_SUCCESS
+       || vkCreateFence(_vk.dev, &fci, NULL, &b->fence) != VK_SUCCESS
+       || vkCreateDescriptorPool(_vk.dev, &dpci, NULL, &b->dpool) != VK_SUCCESS)
+    {
+      _batch_destroy(b);
+      return NULL;
+    }
+  }
+  if(_vk.timestamps && !b->queries && (darktable.unmuted & DT_DEBUG_PERF))
+  {
+    const VkQueryPoolCreateInfo qpci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                         .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                         .queryCount = 2 };
+    if(vkCreateQueryPool(_vk.dev, &qpci, NULL, &b->queries) != VK_SUCCESS) b->queries = VK_NULL_HANDLE;
+  }
+  b->entry = entry;
+  b->width = width;
+  b->height = height;
+
+  const VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+  vkBeginCommandBuffer(b->cb, &begin);
+  // device images and buffers carry data from one batch to the next
+  _memory_barrier(b->cb);
+  return b;
+}
+
+// starts the timing of a batch's kernel, after its uploads
+static void _batch_timestamp(dt_slang_batch_t *b, const int which)
+{
+  if(!b->queries || !b->entry) return;
+  if(which == 0) vkCmdResetQueryPool(b->cb, b->queries, 0, 2);
+  vkCmdWriteTimestamp(b->cb, which == 0 ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                      b->queries, which);
+}
+
+// submits b, and with wait waits for it and everything before it
+static gboolean _batch_submit(dt_slang_batch_t *b, const gboolean wait)
+{
+  const VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                .commandBufferCount = 1,
+                                .pCommandBuffers = &b->cb };
+  if(vkEndCommandBuffer(b->cb) != VK_SUCCESS
+     || vkQueueSubmit(_vk.queue, 1, &submit, b->fence) != VK_SUCCESS)
+  {
+    _batch_release(b);
+    return FALSE;
+  }
+  g_queue_push_tail(&_vk.inflight, b);
+  if(wait) _wait_all();
+  return TRUE;
+}
+
+// a staging buffer of at least bytes that no batch is using
+static dt_slang_staging_t *_staging_acquire(const size_t bytes, const gboolean to_device)
+{
+  dt_slang_staging_t *best = NULL;
+  GList *best_link = NULL;
+  for(GList *l = _vk.staging; l; l = g_list_next(l))
+  {
+    dt_slang_staging_t *s = l->data;
+    if(s->to_device == to_device && s->size >= bytes && (!best || s->size < best->size))
+    {
+      best = s;
+      best_link = l;
+    }
+  }
+  if(best)
+  {
+    _vk.staging = g_list_delete_link(_vk.staging, best_link);
+    return best;
+  }
+  dt_slang_staging_t *s = g_new0(dt_slang_staging_t, 1);
+  s->size = bytes;
+  s->to_device = to_device;
+  if(to_device ? !_alloc_upload(&s->mem, bytes) : !_alloc_readback(&s->mem, bytes))
+  {
+    _staging_destroy(s);
     return NULL;
   }
-  _vk.staging_size[k] = bytes;
-  return _vk.staging[k];
+  return s;
 }
 
-// copies between host memory and a device image through a staging buffer
+// a device buffer of exactly size bytes, from the pool or new; its contents
+// are whatever its last user left
+static dt_slang_gpu_buffer_t *_buffer_acquire(const size_t size)
+{
+  for(GList *l = _vk.buffers; l; l = g_list_next(l))
+  {
+    dt_slang_gpu_buffer_t *pooled = l->data;
+    if(pooled->size == size)
+    {
+      _vk.buffers = g_list_delete_link(_vk.buffers, l);
+      return pooled;
+    }
+  }
+  dt_slang_gpu_buffer_t *buf = g_new0(dt_slang_gpu_buffer_t, 1);
+  buf->size = size;
+  if(!_alloc_device(&buf->mem, size))
+  {
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
+    _buffer_free(buf);
+    return NULL;
+  }
+  return buf;
+}
+
+// records an upload of bytes from host into dst at offset 0 in b
+static gboolean _record_upload(dt_slang_batch_t *b, const void *host, const size_t bytes, VkBuffer dst)
+{
+  dt_slang_staging_t *s = _staging_acquire(bytes, TRUE);
+  if(!s) return FALSE;
+  memcpy(s->mem.map, host, bytes);
+  b->staging = g_list_prepend(b->staging, s);
+  const VkBufferCopy copy = { 0, 0, bytes };
+  vkCmdCopyBuffer(b->cb, s->mem.buffer, dst, 1, &copy);
+  return TRUE;
+}
+
+// copies between host memory and a device image through a staging buffer.
+// Writes don't wait; reads wait for the kernels before them.
 static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean to_device)
 {
   const size_t bytes = sizeof(float) * img->channels * img->width * img->height;
-  dt_slang_mem_t *staging = _staging(bytes, to_device);
-  if(!staging) return 1;
-  if(to_device) memcpy(staging->map, host, bytes);
-
-  VkCommandBuffer cb = _begin_commands();
-  if(!cb) return 1;
+  dt_slang_staging_t *s = _staging_acquire(bytes, to_device);
+  if(!s) return 1;
+  dt_slang_batch_t *b = _batch_begin(NULL, 0, 0);
+  if(!b)
+  {
+    _staging_release(s);
+    return 1;
+  }
   const VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                                    .imageExtent = { img->width, img->height, 1 } };
   if(to_device)
-    vkCmdCopyBufferToImage(cb, staging->buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-  else
   {
-    vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, staging->buffer, 1, &copy);
-    _host_read_barrier(cb);
+    memcpy(s->mem.map, host, bytes);
+    b->staging = g_list_prepend(b->staging, s);
+    vkCmdCopyBufferToImage(b->cb, s->mem.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    return _batch_submit(b, FALSE) ? 0 : 1;
   }
-  if(!_submit_commands(cb)) return 1;
 
-  if(!to_device)
+  vkCmdCopyImageToBuffer(b->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, s->mem.buffer, 1, &copy);
+  _host_read_barrier(b->cb);
+  const gboolean ok = _batch_submit(b, TRUE);
+  if(ok)
   {
-    _invalidate(staging);
-    memcpy(host, staging->map, bytes);
+    _invalidate(&s->mem);
+    memcpy(host, s->mem.map, bytes);
   }
-  return 0;
+  _staging_release(s);
+  return ok ? 0 : 1;
 }
+
+void dt_slang_gpu_cleanup(void)
+{
+  if(_prepare_thread) g_thread_join(_prepare_thread);
+  _prepare_thread = NULL;
+  g_mutex_lock(&_vk_lock);
+  if(_vk.dev)
+  {
+    _wait_all();
+    vkDeviceWaitIdle(_vk.dev);
+  }
+  g_list_free_full(_vk.spare, (GDestroyNotify)_batch_destroy);
+  g_list_free_full(_vk.images, (GDestroyNotify)_image_free);
+  g_list_free_full(_vk.buffers, (GDestroyNotify)_buffer_free);
+  g_list_free_full(_vk.staging, (GDestroyNotify)_staging_destroy);
+  if(_vk.kernels) g_hash_table_destroy(_vk.kernels);
+  if(_vk.pool) vkDestroyCommandPool(_vk.dev, _vk.pool, NULL);
+  if(_vk.dev) vkDestroyDevice(_vk.dev, NULL);
+  if(_vk.instance) vkDestroyInstance(_vk.instance, NULL);
+  memset(&_vk, 0, sizeof(_vk));
+  g_mutex_unlock(&_vk_lock);
+}
+
+// --------------------------------------------------------------------------------------------
+// images
 
 dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
                                              const int height,
@@ -861,7 +1138,7 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
       _vk.images = g_list_delete_link(_vk.images, l);
       if(host && _image_transfer(img, (void *)host, TRUE))
       {
-        _image_free(img);
+        _vk.doomed_images = g_list_prepend(_vk.doomed_images, img);
         img = NULL;
       }
       g_mutex_unlock(&_vk_lock);
@@ -879,18 +1156,19 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
                      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
   if(ok)
   {
-    VkCommandBuffer cb = _begin_commands();
-    ok = cb != VK_NULL_HANDLE;
+    dt_slang_batch_t *b = _batch_begin(NULL, 0, 0);
+    ok = b != NULL;
     if(ok)
     {
-      _barrier(cb, img->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-      ok = _submit_commands(cb);
+      _barrier(b->cb, img->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+      ok = _batch_submit(b, FALSE);
     }
   }
   if(ok && host) ok = _image_transfer(img, (void *)host, TRUE) == 0;
   if(!ok)
   {
     dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a %dx%d device image", width, height);
+    _wait_all();
     _image_free(img);
     img = NULL;
   }
@@ -915,24 +1193,38 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_alias(const int width,
   return NULL;
 }
 
-// kernels run synchronously here
 void dt_slang_gpu_wait(void)
 {
+  if(!_vk.usable) return;
+  g_mutex_lock(&_vk_lock);
+  _wait_all();
+  g_mutex_unlock(&_vk_lock);
 }
 
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img)
 {
   if(!img) return;
   g_mutex_lock(&_vk_lock);
-  // enough for a pipe's input and output, and those of a second pipe
+  // allocating images on every run left the GPU waiting, so the pool keeps
+  // what a module chain uses, within a third of the device memory. Kernels
+  // still running may use the image, so a pooled one is reused only by later
+  // kernels and an evicted one is freed once the queue is idle
   _vk.images = g_list_prepend(_vk.images, img);
-  GList *last = g_list_nth(_vk.images, DT_SLANG_POOL_SIZE);
-  if(last)
+  VkDeviceSize bytes = 0;
+  int n = 0;
+  for(GList *l = _vk.images; l; l = g_list_next(l), n++)
   {
-    last->prev->next = NULL;
-    last->prev = NULL;
-    g_list_free_full(last, (GDestroyNotify)_image_free);
+    const dt_slang_gpu_image_t *i = l->data;
+    bytes += sizeof(float) * i->channels * i->width * i->height;
+    if(n > 0 && (n >= DT_SLANG_POOL_SIZE || bytes > _vk.pool_budget))
+    {
+      l->prev->next = NULL;
+      l->prev = NULL;
+      _vk.doomed_images = g_list_concat(_vk.doomed_images, l);
+      break;
+    }
   }
+  _retire_finished();
   g_mutex_unlock(&_vk_lock);
 }
 
@@ -968,52 +1260,34 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host)
   return err;
 }
 
-// device buffers are mapped storage buffers, so the host reads them directly
-// once the queue is idle, which it is between runs
-struct dt_slang_gpu_buffer_t
-{
-  dt_slang_mem_t mem;
-  size_t size;
-};
-
-static void _buffer_free(dt_slang_gpu_buffer_t *buf)
-{
-  _free_mem(&buf->mem);
-  g_free(buf);
-}
+// --------------------------------------------------------------------------------------------
+// buffers
 
 static dt_slang_gpu_buffer_t *_buffer_new(const size_t size, const void *host, const gboolean zero)
 {
   if(!dt_slang_gpu_enabled() || size == 0) return NULL;
 
   g_mutex_lock(&_vk_lock);
-  dt_slang_gpu_buffer_t *buf = NULL;
-  for(GList *l = _vk.buffers; l; l = g_list_next(l))
+  dt_slang_gpu_buffer_t *buf = _buffer_acquire(size);
+  // neither a pooled buffer nor fresh device memory is zeroed
+  if(buf && (host || zero))
   {
-    dt_slang_gpu_buffer_t *pooled = l->data;
-    if(pooled->size == size)
+    dt_slang_batch_t *b = _batch_begin(NULL, 0, 0);
+    gboolean ok = b != NULL;
+    if(ok)
     {
-      _vk.buffers = g_list_delete_link(_vk.buffers, l);
-      buf = pooled;
-      break;
+      if(host)
+        ok = _record_upload(b, host, size, buf->mem.buffer);
+      else
+        vkCmdFillBuffer(b->cb, buf->mem.buffer, 0, VK_WHOLE_SIZE, 0);
+      ok = _batch_submit(b, FALSE) && ok;
     }
-  }
-  if(!buf)
-  {
-    buf = g_new0(dt_slang_gpu_buffer_t, 1);
-    buf->size = size;
-    if(!_alloc_buffer_in(&buf->mem, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, TRUE))
+    if(!ok)
     {
-      dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
-      _buffer_free(buf);
+      _buffer_release(buf);
       buf = NULL;
     }
   }
-  // neither a pooled buffer nor fresh device memory is zeroed
-  if(buf && host)
-    memcpy(buf->mem.map, host, size);
-  else if(buf && zero)
-    memset(buf->mem.map, 0, size);
   g_mutex_unlock(&_vk_lock);
   return buf;
 }
@@ -1032,15 +1306,9 @@ void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buf)
 {
   if(!buf) return;
   g_mutex_lock(&_vk_lock);
-  // a demosaic chain holds eight buffers of the same size
-  _vk.buffers = g_list_prepend(_vk.buffers, buf);
-  GList *last = g_list_nth(_vk.buffers, DT_SLANG_BUFFER_POOL_SIZE);
-  if(last)
-  {
-    last->prev->next = NULL;
-    last->prev = NULL;
-    g_list_free_full(last, (GDestroyNotify)_buffer_free);
-  }
+  // as for images, kernels still running may use the buffer
+  _buffer_release(buf);
+  _retire_finished();
   g_mutex_unlock(&_vk_lock);
 }
 
@@ -1048,9 +1316,24 @@ int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buf, void *host, const size_
 {
   if(!buf || !host || size > buf->size) return 1;
   g_mutex_lock(&_vk_lock);
-  memcpy(host, buf->mem.map, size);
+  int err = 1;
+  dt_slang_staging_t *s = _staging_acquire(size, FALSE);
+  dt_slang_batch_t *b = s ? _batch_begin(NULL, 0, 0) : NULL;
+  if(b)
+  {
+    const VkBufferCopy copy = { 0, 0, size };
+    vkCmdCopyBuffer(b->cb, buf->mem.buffer, s->mem.buffer, 1, &copy);
+    _host_read_barrier(b->cb);
+    if(_batch_submit(b, TRUE))
+    {
+      _invalidate(&s->mem);
+      memcpy(host, s->mem.map, size);
+      err = 0;
+    }
+  }
+  if(s) _staging_release(s);
   g_mutex_unlock(&_vk_lock);
-  return 0;
+  return err;
 }
 
 // --------------------------------------------------------------------------------------------
@@ -1070,6 +1353,7 @@ static int _run(const char *program,
   // descriptor bindings and values to push constants, each in order
   int res_arg[DT_SLANG_MAX_PARAMS], nres = 0, nvals = 0;
   uint8_t push[DT_SLANG_PUSH_SIZE] = { 0 };
+  gboolean host_out = FALSE;
   for(int a = 0; a < nargs; a++)
   {
     const dt_slang_arg_t *arg = &args[a];
@@ -1100,14 +1384,19 @@ static int _run(const char *program,
       dt_print(DT_DEBUG_OPENCL, "[slang_gpu] %dx%d image too large for %s", arg->width, arg->height, entry);
       return 1;
     }
+    if(arg->kind == DT_SLANG_ARG_IMAGE_OUT) host_out = TRUE;
     res_arg[nres++] = a;
   }
   if(nres != k->nres || nvals != k->nvals) goto mismatch;
 
+  dt_slang_batch_t *b = _batch_begin(entry, width, height);
+  if(!b) return 1;
+
   int err = 1;
-  dt_slang_mem_t mem[DT_SLANG_MAX_PARAMS] = { { 0 } };
-  VkDescriptorPool dpool = VK_NULL_HANDLE;
-  VkCommandBuffer cb = VK_NULL_HANDLE;
+  // host outputs are copied out after the wait, so their staging buffers
+  // stay out of the batch
+  dt_slang_staging_t *readback[DT_SLANG_MAX_PARAMS] = { NULL };
+  VkImage images[DT_SLANG_MAX_PARAMS] = { VK_NULL_HANDLE };
 
   VkWriteDescriptorSet writes[DT_SLANG_MAX_PARAMS];
   VkDescriptorImageInfo image_info[DT_SLANG_MAX_PARAMS];
@@ -1133,32 +1422,64 @@ static int _run(const char *program,
     }
     else if(arg->kind == DT_SLANG_ARG_BUFFER)
     {
-      if(!_alloc_buffer(&mem[r], arg->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) goto done;
-      memcpy(mem[r].map, arg->ptr, arg->size);
-      buffer_info[r] = (VkDescriptorBufferInfo){ mem[r].buffer, 0, arg->size };
+      // small tables are read from the staging buffer itself; large ones,
+      // such as lens's per-pixel coordinates, get copied to device memory
+      if(arg->size <= DT_SLANG_DIRECT_BUFFER)
+      {
+        dt_slang_staging_t *s = _staging_acquire(arg->size, TRUE);
+        if(!s) goto done;
+        memcpy(s->mem.map, arg->ptr, arg->size);
+        b->staging = g_list_prepend(b->staging, s);
+        buffer_info[r] = (VkDescriptorBufferInfo){ s->mem.buffer, 0, arg->size };
+      }
+      else
+      {
+        dt_slang_gpu_buffer_t *buf = _buffer_acquire(arg->size);
+        if(!buf) goto done;
+        b->buffers = g_list_prepend(b->buffers, buf);
+        if(!_record_upload(b, arg->ptr, arg->size, buf->mem.buffer)) goto done;
+        buffer_info[r] = (VkDescriptorBufferInfo){ buf->mem.buffer, 0, arg->size };
+      }
       writes[r].pBufferInfo = &buffer_info[r];
     }
     else
     {
-      if(!_alloc_image(&mem[r], arg)) goto done;
+      const gboolean out = arg->kind == DT_SLANG_ARG_IMAGE_OUT;
+      dt_slang_mem_t *m = g_new0(dt_slang_mem_t, 1);
+      b->mems = g_list_prepend(b->mems, m);
+      if(!_create_image(&m->image, &m->image_mem, &m->view, arg->width, arg->height, arg->channels,
+                        out ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                            : VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        goto done;
+      images[r] = m->image;
+      const size_t bytes = sizeof(float) * arg->channels * arg->width * arg->height;
+      const VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                       .imageExtent = { arg->width, arg->height, 1 } };
+      if(out)
+      {
+        readback[r] = _staging_acquire(bytes, FALSE);
+        if(!readback[r]) goto done;
+        _barrier(b->cb, m->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+      }
+      else
+      {
+        dt_slang_staging_t *s = _staging_acquire(bytes, TRUE);
+        if(!s) goto done;
+        memcpy(s->mem.map, arg->ptr, bytes);
+        b->staging = g_list_prepend(b->staging, s);
+        _barrier(b->cb, m->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdCopyBufferToImage(b->cb, s->mem.buffer, m->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        _barrier(b->cb, m->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+      }
       image_info[r] = (VkDescriptorImageInfo){
-        .imageView = mem[r].view,
-        .imageLayout = arg->kind == DT_SLANG_ARG_IMAGE_OUT ? VK_IMAGE_LAYOUT_GENERAL
-                                                           : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        .imageView = m->view,
+        .imageLayout = out ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
       writes[r].pImageInfo = &image_info[r];
     }
   }
 
-  const VkDescriptorPoolSize sizes[3] = { { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, DT_SLANG_MAX_PARAMS },
-                                          { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, DT_SLANG_MAX_PARAMS },
-                                          { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DT_SLANG_MAX_PARAMS } };
-  const VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                            .maxSets = 1,
-                                            .poolSizeCount = 3,
-                                            .pPoolSizes = sizes };
-  if(vkCreateDescriptorPool(_vk.dev, &dpci, NULL, &dpool) != VK_SUCCESS) goto done;
   const VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                             .descriptorPool = dpool,
+                                             .descriptorPool = b->dpool,
                                              .descriptorSetCount = 1,
                                              .pSetLayouts = &k->set_layout };
   VkDescriptorSet set;
@@ -1166,54 +1487,45 @@ static int _run(const char *program,
   for(int r = 0; r < nres; r++) writes[r].dstSet = set;
   vkUpdateDescriptorSets(_vk.dev, nres, writes, 0, NULL);
 
-  cb = _begin_commands();
-  if(!cb) goto done;
-  for(int r = 0; r < nres; r++)
-  {
-    const dt_slang_arg_t *arg = &args[res_arg[r]];
-    if(arg->kind == DT_SLANG_ARG_IMAGE_IN)
-    {
-      const VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                                       .imageExtent = { arg->width, arg->height, 1 } };
-      _barrier(cb, mem[r].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-      vkCmdCopyBufferToImage(cb, mem[r].buffer, mem[r].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-      _barrier(cb, mem[r].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
-    else if(arg->kind == DT_SLANG_ARG_IMAGE_OUT)
-      _barrier(cb, mem[r].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-  }
-  vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline);
-  vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->layout, 0, 1, &set, 0, NULL);
-  vkCmdPushConstants(cb, k->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, _vk.push_size, push);
-  vkCmdDispatch(cb, (width + k->local_size[0] - 1) / k->local_size[0],
+  // the uploads before the kernel
+  _memory_barrier(b->cb);
+  _batch_timestamp(b, 0);
+  vkCmdBindPipeline(b->cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline);
+  vkCmdBindDescriptorSets(b->cb, VK_PIPELINE_BIND_POINT_COMPUTE, k->layout, 0, 1, &set, 0, NULL);
+  vkCmdPushConstants(b->cb, k->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, _vk.push_size, push);
+  vkCmdDispatch(b->cb, (width + k->local_size[0] - 1) / k->local_size[0],
                 (height + k->local_size[1] - 1) / k->local_size[1], 1);
+  _batch_timestamp(b, 1);
   for(int r = 0; r < nres; r++)
   {
     const dt_slang_arg_t *arg = &args[res_arg[r]];
     if(arg->kind != DT_SLANG_ARG_IMAGE_OUT) continue;
     const VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                                      .imageExtent = { arg->width, arg->height, 1 } };
-    _barrier(cb, mem[r].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    vkCmdCopyImageToBuffer(cb, mem[r].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mem[r].buffer, 1, &copy);
+    _barrier(b->cb, images[r], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vkCmdCopyImageToBuffer(b->cb, images[r], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback[r]->mem.buffer,
+                           1, &copy);
   }
-  _host_read_barrier(cb);
-  const gboolean submitted = _submit_commands(cb);
-  cb = VK_NULL_HANDLE;
+  if(host_out) _host_read_barrier(b->cb);
+  // a kernel with host outputs waits for them; the others only queue
+  const gboolean submitted = _batch_submit(b, host_out);
+  b = NULL;
   if(!submitted) goto done;
 
   for(int r = 0; r < nres; r++)
   {
     const dt_slang_arg_t *arg = &args[res_arg[r]];
     if(arg->kind != DT_SLANG_ARG_IMAGE_OUT) continue;
-    _invalidate(&mem[r]);
-    memcpy((void *)arg->ptr, mem[r].map, sizeof(float) * arg->channels * arg->width * arg->height);
+    _invalidate(&readback[r]->mem);
+    memcpy((void *)arg->ptr, readback[r]->mem.map, sizeof(float) * arg->channels * arg->width * arg->height);
   }
   err = 0;
 
 done:
-  if(cb) vkFreeCommandBuffers(_vk.dev, _vk.pool, 1, &cb);
-  if(dpool) vkDestroyDescriptorPool(_vk.dev, dpool, NULL);
-  for(int r = 0; r < nres; r++) _free_mem(&mem[r]);
+  // a batch that failed while recording never runs, but hands back what it took
+  if(b) _batch_release(b);
+  for(int r = 0; r < nres; r++)
+    if(readback[r]) _staging_release(readback[r]);
   if(err) dt_print(DT_DEBUG_OPENCL, "[slang_gpu] running %s failed", entry);
   return err;
 
@@ -1232,13 +1544,10 @@ int dt_slang_gpu_run_2d(const char *program,
 {
   if(!dt_slang_gpu_enabled()) return 1;
 
-  const double start = dt_get_debug_wtime();
-  // one queue, one submission at a time: pipes running in parallel wait here
+  // one queue for all pipes: pipes running in parallel take turns here. The
+  // time of each kernel is logged from GPU timestamps once it has finished
   g_mutex_lock(&_vk_lock);
   const int err = _run(program, kernel, width, height, nargs, args);
   g_mutex_unlock(&_vk_lock);
-  if(!err)
-    dt_print(DT_DEBUG_PERF, "[slang_gpu] %s %dx%d took %.3f secs (Vulkan)",
-             kernel, width, height, dt_get_debug_wtime() - start);
   return err;
 }
