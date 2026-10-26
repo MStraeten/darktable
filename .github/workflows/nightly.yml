@@ -4,6 +4,16 @@ on:
   schedule:
     - cron: "0 0 * * *"
   workflow_dispatch:
+  # slang-benchmark is a fork-only integration branch: republish the tester
+  # builds on every merge into it. Schedule-only workflows never register on
+  # forks, so a push trigger is the only way the nightly runs there.
+  push:
+    branches: [slang-benchmark]
+
+# a second merge while packages are still building supersedes the first
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 permissions:
   contents: read
@@ -11,7 +21,7 @@ permissions:
 
 jobs:
   AppImage:
-    if: github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.repository != 'darktable-org/darktable' || github.event_name != 'push' && (github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch')
     name: Nightly darktable AppImage
     runs-on: ${{ matrix.os }}
     strategy:
@@ -200,7 +210,7 @@ jobs:
           retention-days: 1
 
   Windows:
-    if: github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.repository != 'darktable-org/darktable' || github.event_name != 'push' && (github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch')
     name: Nightly darktable Windows
     runs-on: ${{ matrix.os }}
     strategy:
@@ -356,7 +366,7 @@ jobs:
           retention-days: 1
 
   macOS:
-    if: github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' && github.repository != 'darktable-org/darktable' || github.event_name != 'push' && (github.repository == 'darktable-org/darktable' || github.event_name == 'workflow_dispatch')
     name: Nightly darktable macOS
     runs-on: ${{ matrix.build.os }}
     strategy:
@@ -470,6 +480,25 @@ jobs:
           git push origin --delete nightly
           git tag nightly
           git push origin nightly
+          popd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout slang-benchmark to update its nightly tag
+        if: github.event_name == 'push'
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+          path: src
+          fetch-depth: 1
+      - name: Force move 'nightly_slang-benchmark' tag
+        if: github.event_name == 'push'
+        run: |
+          pushd src
+          # same as for 'nightly' above: release-action leaves an existing tag
+          # where it is, so the release would keep pointing at the first push
+          git push origin --delete nightly_${{ github.ref_name }} || true
+          git tag nightly_${{ github.ref_name }}
+          git push origin nightly_${{ github.ref_name }}
           popd
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
