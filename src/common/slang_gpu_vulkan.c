@@ -91,6 +91,7 @@ typedef struct dt_slang_vulkan_t
   float timestamp_period; // ns per timestamp tick
   VkDeviceSize pool_budget; // bytes the image and buffer pools may keep together
   gboolean memory_budget;   // VK_EXT_memory_budget reports the free device memory
+  gboolean discrete;        // the device has memory of its own, which OpenCL shares
 } dt_slang_vulkan_t;
 
 static dt_slang_vulkan_t _vk = { 0 };
@@ -177,6 +178,7 @@ static gboolean _init_device(void)
   VkPhysicalDeviceProperties props;
   vkGetPhysicalDeviceProperties(_vk.pdev, &props);
   _vk.max_image_dim = props.limits.maxImageDimension2D;
+  _vk.discrete = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
   _vk.push_size = MIN(DT_SLANG_PUSH_SIZE, props.limits.maxPushConstantsSize);
   vkGetPhysicalDeviceMemoryProperties(_vk.pdev, &_vk.memprops);
   for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
@@ -1399,6 +1401,19 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_alias(const int width,
                                                void *host)
 {
   return NULL;
+}
+
+void dt_slang_gpu_release_pools(void)
+{
+  if(!_vk.usable || !_vk.discrete) return;
+  g_mutex_lock(&_vk_lock);
+  _retire_finished();
+  _vk.doomed_images = g_list_concat(_vk.doomed_images, _vk.images);
+  _vk.doomed_buffers = g_list_concat(_vk.doomed_buffers, _vk.buffers);
+  _vk.images = NULL;
+  _vk.buffers = NULL;
+  _free_doomed();
+  g_mutex_unlock(&_vk_lock);
 }
 
 void dt_slang_gpu_wait(void)

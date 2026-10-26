@@ -871,6 +871,12 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_alias(const int width,
   return (__bridge_retained dt_slang_gpu_image_t *)img;
 }
 
+// Apple GPUs share the system memory, so the pools take nothing from a
+// separate device heap that OpenCL would run out of
+void dt_slang_gpu_release_pools(void)
+{
+}
+
 void dt_slang_gpu_wait(void)
 {
   if(!dt_slang_gpu_enabled()) return;

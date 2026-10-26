@@ -117,6 +117,10 @@ int dt_slang_gpu_image_read(dt_slang_gpu_image_t *img, void *host);
 int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host);
 // waits for every kernel that has been started
 void dt_slang_gpu_wait(void);
+// frees the images and buffers kept for reuse, on a GPU with memory of its
+// own: OpenCL's check whether a module fits doesn't see them. Images still
+// in use by kernels are freed once those finish.
+void dt_slang_gpu_release_pools(void);
 
 // the device memory a module may use now, in bytes, counting the pooled
 // images and buffers that would be freed for it, and the largest image
@@ -167,6 +171,7 @@ G_BEGIN_DECLS
 static inline gboolean dt_slang_gpu_enabled(void) { return FALSE; }
 static inline void dt_slang_gpu_cleanup(void) {}
 static inline void dt_slang_gpu_prepare(void) {}
+static inline void dt_slang_gpu_release_pools(void) {}
 
 #endif
 
