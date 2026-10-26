@@ -17,15 +17,18 @@
 */
 
 // Runs each ported kernel twice on the same input, once from its .cl source
-// through OpenCL and once from the Slang-built SPIR-V through Vulkan, and
-// compares the output images. It needs no GPU: Mesa's lavapipe and PoCL are
-// enough, which is how it runs in CI.
+// through OpenCL and once from the Slang-built SPIR-V through Vulkan, or the
+// .metallib files through Metal on macOS (parity_metal.m), and compares the
+// output images. It needs no GPU: Mesa's lavapipe and PoCL are enough, which
+// is how it runs in CI. Without a device for either API it exits with SKIP.
 //
-// usage: darktable-test-slang-parity <dir with .cl files> <dir with .spv files>
+// usage: darktable-test-slang-parity <dir with .cl files> <dir with the Slang kernels> [program]
 
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
+#ifndef PARITY_METAL
 #include <vulkan/vulkan.h>
+#endif
 
 #include <math.h>
 #include <stdarg.h>
@@ -33,64 +36,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+
+#include "parity.h"
 
 #define W 517
 #define H 263
-#define MAX_ARGS 48
 
 // -------------------------------------------------------------------------------------------------
 // test cases
-
-typedef enum arg_kind_t
-{
-  ARG_IMAGE_IN,
-  ARG_IMAGE_OUT,
-  ARG_INT,
-  ARG_FLOAT,
-  ARG_FLOAT4,
-  ARG_INT2,
-  ARG_INT4,
-  ARG_STRUCT,     // passed by value, from data and size
-  ARG_FLOAT2,
-  ARG_BUFFER,
-  ARG_BUFFER_OUT, // read and written by the kernel, and compared
-  ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
-  ARG_RAW_U16,    // uint16 raw data: an unsigned integer image in OpenCL, a buffer of value pairs in Slang
-  ARG_FLOAT4_BUF, // a float4 value in OpenCL, a buffer holding it in Slang
-  ARG_CHAR2,      // a char2 in OpenCL, an int2 in Slang
-} arg_kind_t;
-
-typedef struct arg_t
-{
-  arg_kind_t kind;
-  const char *name;   // parameter name in the Slang entry point
-  int w, h, channels; // images
-  const float *pixels;
-  int i;
-  float f;
-  float v[4];
-  int iv[4];
-  const void *data; // buffers, and the initial contents of ARG_BUFFER_OUT (zeros if NULL)
-  size_t size;
-  int bytes;        // ARG_BUFFER_OUT holds bytes, compared exactly
-  int ints;         // ARG_BUFFER_OUT holds int counts, compared as numbers
-  int slang_only;   // a Slang parameter the OpenCL kernel does not have
-} arg_t;
-
-typedef struct test_t
-{
-  const char *label;
-  const char *program; // .cl file, also the .spv file name
-  const char *kernel;
-  const char *slang_kernel; // the Slang entry point, where it differs from the OpenCL kernel
-  double tolerance; // 0 for the default
-  int gw, gh;       // work items, W x H if 0
-  int clgw, clgh, cllx, clly; // OpenCL global and local sizes, if they differ from the above
-  int skip_alpha;   // the OpenCL kernel leaves the alpha of 4-channel outputs undefined
-  int outliers;     // values allowed past the tolerance, where the math is ill-conditioned
-  int nargs;
-  arg_t args[MAX_ARGS];
-} test_t;
 
 // must match dt_colorspaces_iccprofile_info_cl_t in src/common/iop_profile.h
 typedef struct profile_info_t
@@ -2182,8 +2136,10 @@ static int make_tests(test_t *t)
 // -------------------------------------------------------------------------------------------------
 // helpers
 
-static void die(const char *fmt, ...)
+void die(const char *fmt, ...)
 {
+  // after the device lines, which a pipe buffers
+  fflush(stdout);
   va_list ap;
   va_start(ap, fmt);
   vfprintf(stderr, fmt, ap);
@@ -2199,7 +2155,7 @@ static void die(const char *fmt, ...)
     if(_e) die("%s:%d: %s returned %d", __FILE__, __LINE__, #x, _e);                                 \
   } while(0)
 
-static char *slurp(const char *path, size_t *len)
+char *slurp(const char *path, size_t *len)
 {
   FILE *f = fopen(path, "rb");
   if(!f) die("cannot open %s", path);
@@ -2211,6 +2167,18 @@ static char *slurp(const char *path, size_t *len)
   buf[*len] = 0;
   fclose(f);
   return buf;
+}
+
+int device_wanted(const char *wanted, const int index, const char *name)
+{
+  if(!wanted || !*wanted) return 0;
+  char *end = NULL;
+  const long i = strtol(wanted, &end, 10);
+  if(*end == '\0') return i == index;
+  const size_t n = strlen(wanted);
+  for(const char *c = name; *c; c++)
+    if(!strncasecmp(c, wanted, n)) return 1;
+  return 0;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -2281,12 +2249,42 @@ static cl_mem cl_image_1ch(const cl_env_t *e, cl_mem_flags flags, cl_channel_typ
   return m;
 }
 
-static void cl_init(cl_env_t *e)
+// DT_PARITY_OPENCL_DEVICE picks the device by index, counted across all
+// platforms, or by part of its name. Without it the first one is used.
+static void cl_init(cl_env_t *e, char *name, const size_t size)
 {
-  cl_platform_id platform;
+  cl_platform_id platforms[16];
+  cl_uint nplatforms = 0;
   cl_int err;
-  CK(clGetPlatformIDs(1, &platform, NULL));
-  CK(clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 1, &e->dev, NULL));
+  // the ICD loader returns CL_PLATFORM_NOT_FOUND_KHR without a driver
+  if(clGetPlatformIDs(16, platforms, &nplatforms) != CL_SUCCESS) nplatforms = 0;
+  const char *wanted = getenv("DT_PARITY_OPENCL_DEVICE");
+  int index = 0, found = 0;
+  for(cl_uint p = 0; p < nplatforms && p < 16; p++)
+  {
+    cl_device_id devs[16];
+    cl_uint ndevs = 0;
+    if(clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, 16, devs, &ndevs) != CL_SUCCESS) continue;
+    for(cl_uint d = 0; d < ndevs && d < 16; d++, index++)
+    {
+      char dev_name[256] = { 0 };
+      clGetDeviceInfo(devs[d], CL_DEVICE_NAME, sizeof(dev_name) - 1, dev_name, NULL);
+      const int pick = !found && (wanted && *wanted ? device_wanted(wanted, index, dev_name) : 1);
+      printf("OpenCL device %d: %s%s\n", index, dev_name, pick ? ", used" : "");
+      if(pick)
+      {
+        e->dev = devs[d];
+        snprintf(name, size, "%s", dev_name);
+        found = 1;
+      }
+    }
+  }
+  if(!found && index > 0) die("no OpenCL device matches DT_PARITY_OPENCL_DEVICE '%s'", wanted);
+  if(!found)
+  {
+    printf("no OpenCL device, skipping\n");
+    exit(SKIP);
+  }
   e->ctx = clCreateContext(NULL, 1, &e->dev, NULL, NULL, &err);
   CK(err);
   e->queue = clCreateCommandQueue(e->ctx, e->dev, 0, &err);
@@ -2296,8 +2294,7 @@ static void cl_init(cl_env_t *e)
   if(e->no_r) printf("OpenCL device has no single channel images, using RGBA\n");
 }
 
-// bytes a kernel writes to an output argument, 0 for inputs
-static size_t out_size(const arg_t *arg)
+size_t out_size(const arg_t *arg)
 {
   if(arg->kind == ARG_IMAGE_OUT) return sizeof(float) * arg->w * arg->h * arg->channels;
   if(arg->kind == ARG_BUFFER_OUT) return arg->size;
@@ -2305,7 +2302,7 @@ static size_t out_size(const arg_t *arg)
 }
 
 // outputs start zeroed, as some kernels write only part of them
-static const void *initial_data(const arg_t *arg)
+const void *initial_data(const arg_t *arg)
 {
   static void *zeros = NULL;
   static size_t nzeros = 0;
@@ -2453,6 +2450,8 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
   clReleaseProgram(prog);
   free((void *)src);
 }
+
+#ifndef PARITY_METAL
 
 // -------------------------------------------------------------------------------------------------
 // SPIR-V: find each parameter's binding and push constant offset by name, so that
@@ -2626,14 +2625,50 @@ typedef struct vk_image_t
   VkImageView view;
 } vk_image_t;
 
-static void vk_init(vk_env_t *e)
+// DT_PARITY_VULKAN_DEVICE picks the device by index or by part of its name.
+// Without it a discrete GPU wins over an integrated one, which wins over the
+// rest, as in src/common/slang_gpu_vulkan.c
+static void vk_init(vk_env_t *e, char *name, const size_t size)
 {
   const VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2 };
   const VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
-  CK(vkCreateInstance(&ici, NULL, &e->instance));
-  uint32_t n = 1;
-  vkEnumeratePhysicalDevices(e->instance, &n, &e->pdev);
-  if(n == 0) die("no Vulkan device");
+  uint32_t n = 0;
+  if(vkCreateInstance(&ici, NULL, &e->instance) == VK_SUCCESS) vkEnumeratePhysicalDevices(e->instance, &n, NULL);
+  if(n == 0)
+  {
+    printf("no Vulkan device, skipping\n");
+    exit(SKIP);
+  }
+  VkPhysicalDevice *devs = calloc(n, sizeof(*devs));
+  vkEnumeratePhysicalDevices(e->instance, &n, devs);
+  const char *wanted = getenv("DT_PARITY_VULKAN_DEVICE");
+  int best = -1, best_rank = -1;
+  for(uint32_t d = 0; d < n; d++)
+  {
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(devs[d], &props);
+    const int rank = device_wanted(wanted, d, props.deviceName) ? 4
+      : wanted && *wanted ? -1
+      : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
+      : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
+      : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 1
+      : 0;
+    if(rank > best_rank)
+    {
+      best = d;
+      best_rank = rank;
+    }
+  }
+  if(best < 0) die("no Vulkan device matches DT_PARITY_VULKAN_DEVICE '%s'", wanted);
+  for(uint32_t d = 0; d < n; d++)
+  {
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(devs[d], &props);
+    printf("Vulkan device %u: %s%s\n", d, props.deviceName, (int)d == best ? ", used" : "");
+    if((int)d == best) snprintf(name, size, "%s", props.deviceName);
+  }
+  e->pdev = devs[best];
+  free(devs);
 
   uint32_t nf = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(e->pdev, &nf, NULL);
@@ -2932,24 +2967,38 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
   free(code);
 }
 
+#endif // !PARITY_METAL
+
 // -------------------------------------------------------------------------------------------------
 
 // relative error with an absolute floor, so values near zero do not dominate
 #define TOLERANCE 1e-4
 
+#ifdef PARITY_METAL
+#define GPU_API "metal"
+#else
+#define GPU_API "vulkan"
+#endif
+
 int main(int argc, char **argv)
 {
-  if(argc < 3) die("usage: %s <dir with .cl files> <dir with .spv files> [kernel]", argv[0]);
+  if(argc < 3) die("usage: %s <dir with .cl files> <dir with the Slang kernels> [program]", argv[0]);
   if(sizeof(profile_info_t) != 160) die("profile_info_t is %zu bytes, the kernels expect 160", sizeof(profile_info_t));
 
   make_inputs();
   static test_t tests[1024];
   const int ntests = make_tests(tests);
 
+  char cl_name[256], gpu_name[256];
   cl_env_t cl;
+  cl_init(&cl, cl_name, sizeof(cl_name));
+#ifdef PARITY_METAL
+  mtl_init(gpu_name, sizeof(gpu_name));
+#else
   vk_env_t vk;
-  cl_init(&cl);
-  vk_init(&vk);
+  vk_init(&vk, gpu_name, sizeof(gpu_name));
+#endif
+  printf("comparing OpenCL on %s with " GPU_API " on %s\n", cl_name, gpu_name);
 
   int failed = 0, ran = 0;
   for(int k = 0; k < ntests; k++)
@@ -2964,7 +3013,11 @@ int main(int argc, char **argv)
         out_vk[a] = calloc(1, out_size(&t->args[a]));
       }
     cl_run(&cl, argv[1], t, out_cl);
+#ifdef PARITY_METAL
+    mtl_run(argv[2], t, out_vk);
+#else
     vk_run(&vk, argv[2], t, out_vk);
+#endif
 
     // every output is compared, and the test fails on the worst of them
     const double tolerance = t->tolerance > 0.0 ? t->tolerance : TOLERANCE;
@@ -3023,13 +3076,13 @@ int main(int argc, char **argv)
     if(over) printf("  %zu past the tolerance", over);
     if(byte_mismatch) printf("  byte mismatches %zu", byte_mismatch);
     if(!ok && worst_arg >= 0 && t->args[worst_arg].ints)
-      printf("  (%s element %zu: opencl %d, vulkan %d)", t->args[worst_arg].name, worst,
+      printf("  (%s element %zu: opencl %d, " GPU_API " %d)", t->args[worst_arg].name, worst,
              ((int32_t *)out_cl[worst_arg])[worst], ((int32_t *)out_vk[worst_arg])[worst]);
     else if(!ok && worst_arg >= 0)
     {
       const arg_t *arg = &t->args[worst_arg];
       const int ch = arg->kind == ARG_IMAGE_OUT ? arg->channels : 1;
-      printf("  (%s element %zu channel %zu: opencl %g, vulkan %g)", arg->name, worst / ch, worst % ch,
+      printf("  (%s element %zu channel %zu: opencl %g, " GPU_API " %g)", arg->name, worst / ch, worst % ch,
              ((float *)out_cl[worst_arg])[worst], ((float *)out_vk[worst_arg])[worst]);
     }
     printf("\n");
