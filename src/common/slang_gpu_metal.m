@@ -40,6 +40,7 @@
 #define DT_SLANG_MAX_PARAMS 32
 #define DT_SLANG_POOL_SIZE 4
 #define DT_SLANG_BUFFER_POOL_SIZE 12
+#define DT_SLANG_STAGING_POOL_SIZE 4
 
 @interface DtSlangKernel : NSObject
 {
@@ -72,11 +73,15 @@ typedef struct dt_slang_metal_t
   __strong id<MTLCommandBuffer> pending; // committed without waiting
   __strong NSMutableArray *images;        // freed device images, most recent first
   __strong NSMutableArray *buffers;       // freed device buffers, most recent first
+  __strong NSMutableArray *staging;       // transfer buffers, see _staging_get()
   NSUInteger max_image_dim;
+  gboolean private_storage; // device images and buffers in private storage
 } dt_slang_metal_t;
 
 static dt_slang_metal_t _mtl = { 0 };
 static GMutex _mtl_lock;
+// guards _mtl.staging only, which command buffer completion handlers refill
+static GMutex _staging_lock;
 static GThread *_prepare_thread = NULL;
 
 // --------------------------------------------------------------------------------------------
@@ -103,8 +108,13 @@ static gboolean _init_device(void)
   _mtl.kernels = [NSMutableDictionary dictionary];
   _mtl.images = [NSMutableArray array];
   _mtl.buffers = [NSMutableArray array];
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] using Metal device %s%s", _mtl.dev.name.UTF8String,
-           _mtl.dev.hasUnifiedMemory ? " (unified memory)" : "");
+  _mtl.staging = [NSMutableArray array];
+  // shared storage is system memory on a discrete GPU, so kernels working
+  // there would read and write every pixel over PCIe
+  _mtl.private_storage = !_mtl.dev.hasUnifiedMemory || dt_conf_get_bool("slang_gpu_private_memory");
+  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] using Metal device %s%s%s", _mtl.dev.name.UTF8String,
+           _mtl.dev.hasUnifiedMemory ? " (unified memory)" : "",
+           _mtl.private_storage ? ", images in private storage" : "");
   return TRUE;
 }
 
@@ -135,6 +145,9 @@ void dt_slang_gpu_cleanup(void)
   _mtl.pending = nil;
   _mtl.images = nil;
   _mtl.buffers = nil;
+  g_mutex_lock(&_staging_lock);
+  _mtl.staging = nil;
+  g_mutex_unlock(&_staging_lock);
   _mtl.kernels = nil;
   _mtl.libraries = nil;
   _mtl.queue = nil;
@@ -323,14 +336,17 @@ void dt_slang_gpu_prepare(void)
 // --------------------------------------------------------------------------------------------
 // memory
 
-// Every image is a linear texture on an MTLBuffer in shared storage, which
-// the CPU reads and writes directly on unified memory. Host buffers that are
-// whole VM pages, as the large blocks from posix_memalign() are on macOS, are
-// wrapped without a copy; anything else is copied into a buffer of our own.
+// On unified memory every image is a linear texture on an MTLBuffer in
+// shared storage, which the CPU reads and writes directly. Host buffers that
+// are whole VM pages, as the large blocks from posix_memalign() are on macOS,
+// are wrapped without a copy; anything else is copied into a buffer of our
+// own. With private storage, device images are textures of their own with no
+// buffer, and blits copy them through staging buffers; host images passed to
+// a kernel stay in shared storage, as the kernel reads them once anyway.
 @interface DtSlangImage : NSObject
 {
 @public
-  id<MTLBuffer> buffer;
+  id<MTLBuffer> buffer; // nil for a private image
   id<MTLTexture> texture;
   int width, height, channels;
   size_t pitch;
@@ -401,19 +417,25 @@ static DtSlangImage *_image_new(const int width, const int height, const int cha
   return img;
 }
 
+// a shared buffer on the caller's memory, if it is whole VM pages
+static id<MTLBuffer> _host_buffer(const void *host, const size_t size)
+{
+  const size_t page = sysconf(_SC_PAGESIZE);
+  const size_t length = (size + page - 1) / page * page;
+  // malloc_size() is 0 for a pointer into the middle of a block
+  if((uintptr_t)host % page || malloc_size(host) < length || length > _mtl.dev.maxBufferLength)
+    return nil;
+  return [_mtl.dev newBufferWithBytesNoCopy:(void *)host
+                                     length:length
+                                    options:MTLResourceStorageModeShared
+                                deallocator:nil];
+}
+
 static DtSlangImage *_image_wrap(const void *host, const int width, const int height, const int channels)
 {
   const size_t row = sizeof(float) * channels * width;
-  const size_t page = sysconf(_SC_PAGESIZE);
-  const size_t length = (row * height + page - 1) / page * page;
-  // malloc_size() is 0 for a pointer into the middle of a block
-  if((uintptr_t)host % page || row != _linear_pitch(width, channels)
-     || malloc_size(host) < length || length > _mtl.dev.maxBufferLength)
-    return nil;
-  id<MTLBuffer> buffer = [_mtl.dev newBufferWithBytesNoCopy:(void *)host
-                                                     length:length
-                                                    options:MTLResourceStorageModeShared
-                                                deallocator:nil];
+  if(row != _linear_pitch(width, channels)) return nil;
+  id<MTLBuffer> buffer = _host_buffer(host, row * height);
   if(!buffer) return nil;
   DtSlangImage *img = _image_on(buffer, width, height, channels, row);
   if(img) img->wrapped = TRUE;
@@ -440,6 +462,157 @@ static void _finish(void)
     [_mtl.pending waitUntilCompleted];
     _mtl.pending = nil;
   }
+}
+
+// --------------------------------------------------------------------------------------------
+// private storage
+
+static DtSlangImage *_image_private(const int width, const int height, const int channels)
+{
+  MTLTextureDescriptor *d = [MTLTextureDescriptor
+    texture2DDescriptorWithPixelFormat:channels == 1 ? MTLPixelFormatR32Float : MTLPixelFormatRGBA32Float
+                                 width:width
+                                height:height
+                             mipmapped:NO];
+  d.storageMode = MTLStorageModePrivate;
+  d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+  id<MTLTexture> t = [_mtl.dev newTextureWithDescriptor:d];
+  if(!t) return nil;
+  DtSlangImage *img = [DtSlangImage new];
+  img->texture = t;
+  img->width = width;
+  img->height = height;
+  img->channels = channels;
+  img->pitch = sizeof(float) * channels * width;
+  return img;
+}
+
+static size_t _image_bytes(DtSlangImage *img)
+{
+  return img->buffer ? img->buffer.length : img->texture.allocatedSize;
+}
+
+// the smallest pooled transfer buffer that holds size bytes, or a new one.
+// Allocating them per transfer would cost about as much as the copy.
+static id<MTLBuffer> _staging_get(const size_t size)
+{
+  id<MTLBuffer> found = nil;
+  g_mutex_lock(&_staging_lock);
+  NSUInteger pick = NSNotFound;
+  for(NSUInteger i = 0; i < _mtl.staging.count; i++)
+  {
+    id<MTLBuffer> b = _mtl.staging[i];
+    if(b.length >= size && (pick == NSNotFound || b.length < ((id<MTLBuffer>)_mtl.staging[pick]).length))
+      pick = i;
+  }
+  if(pick != NSNotFound)
+  {
+    found = _mtl.staging[pick];
+    [_mtl.staging removeObjectAtIndex:pick];
+  }
+  g_mutex_unlock(&_staging_lock);
+  return found ? found
+               : size <= _mtl.dev.maxBufferLength
+                 ? [_mtl.dev newBufferWithLength:size options:MTLResourceStorageModeShared]
+                 : nil;
+}
+
+static void _staging_put(id<MTLBuffer> b)
+{
+  g_mutex_lock(&_staging_lock);
+  if(_mtl.staging)
+  {
+    [_mtl.staging insertObject:b atIndex:0];
+    while(_mtl.staging.count > DT_SLANG_STAGING_POOL_SIZE) [_mtl.staging removeLastObject];
+  }
+  g_mutex_unlock(&_staging_lock);
+}
+
+static size_t _staging_bytes(void)
+{
+  size_t bytes = 0;
+  g_mutex_lock(&_staging_lock);
+  for(id<MTLBuffer> b in _mtl.staging) bytes += b.length;
+  g_mutex_unlock(&_staging_lock);
+  return bytes;
+}
+
+// copies host memory into a private image (img) or buffer (dst) on the queue,
+// after the kernels already queued, without waiting. The host memory is
+// copied to a staging buffer first, as the caller may change it once we
+// return, and the staging buffer goes back to the pool when the blit is done.
+static gboolean _upload(DtSlangImage *img, id<MTLBuffer> dst, const void *host, const size_t size)
+{
+  id<MTLBuffer> staging = _staging_get(size);
+  id<MTLCommandBuffer> cb = staging ? [_mtl.queue commandBuffer] : nil;
+  id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+  if(!blit) return FALSE;
+  memcpy(staging.contents, host, size);
+  if(img)
+    [blit copyFromBuffer:staging
+            sourceOffset:0
+       sourceBytesPerRow:img->pitch
+     sourceBytesPerImage:size
+              sourceSize:MTLSizeMake(img->width, img->height, 1)
+               toTexture:img->texture
+        destinationSlice:0
+        destinationLevel:0
+       destinationOrigin:MTLOriginMake(0, 0, 0)];
+  else
+    [blit copyFromBuffer:staging sourceOffset:0 toBuffer:dst destinationOffset:0 size:size];
+  [blit endEncoding];
+  [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { _staging_put(staging); }];
+  [cb commit];
+  _mtl.pending = cb;
+  return TRUE;
+}
+
+// copies a private image or buffer to host memory once the queue is done,
+// straight into the host memory if it can be wrapped. Called with the lock held.
+static gboolean _download(DtSlangImage *img, id<MTLBuffer> src, void *host, const size_t size)
+{
+  id<MTLBuffer> wrapped = _host_buffer(host, size);
+  id<MTLBuffer> dst = wrapped ? wrapped : _staging_get(size);
+  id<MTLCommandBuffer> cb = dst ? [_mtl.queue commandBuffer] : nil;
+  id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+  if(!blit) return FALSE;
+  if(img)
+    [blit copyFromTexture:img->texture
+                   sourceSlice:0
+                   sourceLevel:0
+                  sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(img->width, img->height, 1)
+                      toBuffer:dst
+             destinationOffset:0
+        destinationBytesPerRow:img->pitch
+      destinationBytesPerImage:size];
+  else
+    [blit copyFromBuffer:src sourceOffset:0 toBuffer:dst destinationOffset:0 size:size];
+  [blit endEncoding];
+  id<MTLCommandBuffer> last = _mtl.pending;
+  _mtl.pending = nil;
+  [cb commit];
+  [cb waitUntilCompleted];
+  // done by now: the blit was queued after it, and hazard tracking orders the two
+  if(last) [last waitUntilCompleted];
+  if(last && last.status != MTLCommandBufferStatusCompleted)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this %s failed: %s", img ? "image" : "buffer",
+             last.error.localizedDescription.UTF8String);
+    return FALSE;
+  }
+  if(cb.status != MTLCommandBufferStatusCompleted)
+  {
+    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] copying from the device failed: %s",
+             cb.error.localizedDescription.UTF8String);
+    return FALSE;
+  }
+  if(!wrapped)
+  {
+    memcpy(host, dst.contents, size);
+    _staging_put(dst);
+  }
+  return TRUE;
 }
 
 // --------------------------------------------------------------------------------------------
@@ -635,12 +808,21 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
         break;
       }
     }
-    if(img && host)
+    if(img && host && !img->buffer)
+    {
+      if(!_upload(img, nil, host, img->pitch * height)) img = nil;
+    }
+    else if(img && host)
     {
       // the image may still be in use by a pending kernel
       _finish();
       const size_t row = sizeof(float) * channels * width;
       _copy_rows(img->buffer.contents, img->pitch, host, row, row, height);
+    }
+    else if(!img && _mtl.private_storage)
+    {
+      img = _image_private(width, height, channels);
+      if(img && host && !_upload(img, nil, host, img->pitch * height)) img = nil;
     }
     else if(!img)
       img = _image_new(width, height, channels, host);
@@ -658,10 +840,11 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_wrap(const int width,
   if(!host || !dt_slang_gpu_enabled() || !_image_fits(width, height, channels)) return NULL;
 
   g_mutex_lock(&_mtl_lock);
-  DtSlangImage *img;
+  DtSlangImage *img = nil;
   @autoreleasepool
   {
-    img = _image_wrap(host, width, height, channels);
+    // a private image takes a copy, so that kernels don't read the host memory over PCIe
+    if(!_mtl.private_storage) img = _image_wrap(host, width, height, channels);
   }
   g_mutex_unlock(&_mtl_lock);
   return img ? (__bridge_retained dt_slang_gpu_image_t *)img
@@ -674,6 +857,8 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_alias(const int width,
                                                void *host)
 {
   if(!dt_slang_gpu_enabled() || !host || !_image_fits(width, height, channels)) return NULL;
+  // the caller copies a private image back when it needs the host memory
+  if(_mtl.private_storage) return NULL;
   DtSlangImage *img;
   g_mutex_lock(&_mtl_lock);
   @autoreleasepool
@@ -703,8 +888,9 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
   // what the pools keep counts as allocated although it would be freed for
   // the module
   size_t pooled = 0;
-  for(DtSlangImage *img in _mtl.images) pooled += img->buffer.length;
+  for(DtSlangImage *img in _mtl.images) pooled += _image_bytes(img);
   for(DtSlangBuffer *buf in _mtl.buffers) pooled += buf->buffer.length;
+  pooled += _staging_bytes();
   const size_t limit = _mtl.dev.recommendedMaxWorkingSetSize;
   const size_t used = _mtl.dev.currentAllocatedSize > pooled ? _mtl.dev.currentAllocatedSize - pooled : 0;
   size_t best = limit > used ? limit - used : 0;
@@ -756,6 +942,19 @@ int dt_slang_gpu_image_read(dt_slang_gpu_image_t *image, void *host)
   if(!img || !host) return 1;
   const double start = dt_get_debug_wtime();
   g_mutex_lock(&_mtl_lock);
+  if(!img->buffer)
+  {
+    gboolean ok;
+    @autoreleasepool
+    {
+      ok = _download(img, nil, host, img->pitch * img->height);
+    }
+    g_mutex_unlock(&_mtl_lock);
+    if(!ok) return 1;
+    dt_print(DT_DEBUG_PERF, "[slang_gpu] reading %dx%d from the device took %.3f secs",
+             img->width, img->height, dt_get_debug_wtime() - start);
+    return 0;
+  }
   id<MTLCommandBuffer> last = _mtl.pending;
   _finish();
   g_mutex_unlock(&_mtl_lock);
@@ -778,8 +977,21 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *image, const void *host)
   DtSlangImage *img = (__bridge DtSlangImage *)image;
   if(!img || !host) return 1;
   const double start = dt_get_debug_wtime();
-  // a pending kernel may still read the image
   g_mutex_lock(&_mtl_lock);
+  if(!img->buffer)
+  {
+    gboolean ok;
+    @autoreleasepool
+    {
+      ok = _upload(img, nil, host, img->pitch * img->height);
+    }
+    g_mutex_unlock(&_mtl_lock);
+    if(!ok) return 1;
+    dt_print(DT_DEBUG_PERF, "[slang_gpu] writing %dx%d to the device took %.3f secs",
+             img->width, img->height, dt_get_debug_wtime() - start);
+    return 0;
+  }
+  // a pending kernel may still read the image
   _finish();
   g_mutex_unlock(&_mtl_lock);
   const size_t row = sizeof(float) * img->channels * img->width;
@@ -791,6 +1003,19 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *image, const void *host)
 
 // --------------------------------------------------------------------------------------------
 // device buffers
+
+// zeroes a buffer on the queue, after the kernels already queued
+static gboolean _clear(id<MTLBuffer> buffer)
+{
+  id<MTLCommandBuffer> cb = [_mtl.queue commandBuffer];
+  id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+  if(!blit) return FALSE;
+  [blit fillBuffer:buffer range:NSMakeRange(0, buffer.length) value:0];
+  [blit endEncoding];
+  [cb commit];
+  _mtl.pending = cb;
+  return TRUE;
+}
 
 static dt_slang_gpu_buffer_t *_buffer_new(const size_t size, const void *host, const gboolean zero)
 {
@@ -810,28 +1035,37 @@ static dt_slang_gpu_buffer_t *_buffer_new(const size_t size, const void *host, c
         break;
       }
     }
-    if(buf && (host || zero))
+    if(buf && host && _mtl.private_storage)
+    {
+      if(!_upload(nil, buf->buffer, host, size)) buf = nil;
+    }
+    else if(buf && (host || zero))
     {
       // the buffer may still be in use by a pending kernel. A new one starts
       // zeroed, a pooled one has to be cleared. Clearing it on the queue
       // orders the fill after those kernels without waiting for them: blurs
       // take and return temporaries per pass, and a wait here stalled every one
-      id<MTLCommandBuffer> cb = host ? nil : [_mtl.queue commandBuffer];
-      id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
-      if(blit)
-      {
-        [blit fillBuffer:buf->buffer range:NSMakeRange(0, size) value:0];
-        [blit endEncoding];
-        [cb commit];
-        _mtl.pending = cb;
-      }
-      else
+      const gboolean cleared = !host && _clear(buf->buffer);
+      if(!cleared && _mtl.private_storage)
+        buf = nil;
+      else if(!cleared)
       {
         _finish();
         if(host)
           memcpy(buf->buffer.contents, host, size);
         else
           memset(buf->buffer.contents, 0, size);
+      }
+    }
+    else if(!buf && size <= _mtl.dev.maxBufferLength && _mtl.private_storage)
+    {
+      id<MTLBuffer> mb = [_mtl.dev newBufferWithLength:size options:MTLResourceStorageModePrivate];
+      // private memory isn't guaranteed to start zeroed
+      if(mb && (host ? _upload(nil, mb, host, size) : !zero || _clear(mb)))
+      {
+        buf = [DtSlangBuffer new];
+        buf->buffer = mb;
+        buf->size = size;
       }
     }
     else if(!buf && size <= _mtl.dev.maxBufferLength)
@@ -882,6 +1116,16 @@ int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buffer, void *host, const si
   DtSlangBuffer *buf = (__bridge DtSlangBuffer *)buffer;
   if(!buf || !host || size > buf->size) return 1;
   g_mutex_lock(&_mtl_lock);
+  if(buf->buffer.storageMode == MTLStorageModePrivate)
+  {
+    gboolean ok;
+    @autoreleasepool
+    {
+      ok = _download(nil, buf->buffer, host, size);
+    }
+    g_mutex_unlock(&_mtl_lock);
+    return ok ? 0 : 1;
+  }
   id<MTLCommandBuffer> last = _mtl.pending;
   _finish();
   g_mutex_unlock(&_mtl_lock);

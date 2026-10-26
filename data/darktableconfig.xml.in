@@ -583,6 +583,13 @@
     <shortdescription>device memory for the Slang GPU kernels (MB)</shortdescription>
     <longdescription>experimental: the most device memory, in MB, a module may use on the Slang GPU path before it is processed in tiles. 0 uses what the device reports as free</longdescription>
   </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_private_memory</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>keep Slang GPU images in private Metal memory</shortdescription>
+    <longdescription>experimental: on Metal, keep the images of the Slang GPU path in memory only the GPU can access, as is always done on GPUs without unified memory</longdescription>
+  </dtconfig>
   <dtconfig prefs="processing" section="opencl" capability="opencl">
     <name>opencl_scheduling_profile</name>
     <type>
