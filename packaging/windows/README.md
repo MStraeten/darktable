@@ -58,7 +58,7 @@ The steps to build the darktable Windows executable and make the installer are a
     git submodule update
     ```
 
-* Optional, for the experimental Slang GPU kernels (currently x64 only): install the Vulkan headers and loader, and the Slang compiler, which MSYS2 does not package. The script prints the path of `slangc.exe`:
+* Optional, for the experimental Slang GPU kernels: install the Vulkan headers and loader, and the Slang compiler, which MSYS2 does not package. The script prints the path of `slangc.exe`:
     ```bash
     pacman -S --needed mingw-w64-ucrt-x86_64-{vulkan-headers,vulkan-loader} unzip
     SLANGC=$(cygpath -m "$(.ci/install-slangc.sh ~/slang)")

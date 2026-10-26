@@ -27,7 +27,12 @@ set -e
 
 SLANG_VERSION=2026.20
 
-case "$(uname -s)-$(uname -m)" in
+# the MSYS2 runtime reports x86_64 on Windows on Arm too, so the CLANGARM64
+# environment is recognized by its name
+arch=$(uname -m)
+[ "$MSYSTEM" = CLANGARM64 ] && arch=aarch64
+
+case "$(uname -s)-$arch" in
   Linux-x86_64)
     asset=linux-x86_64.tar.gz
     sha256=e863e568c204810d6e8bc31852f056aef6763c55ea9925db2db7affa060347c9
@@ -43,6 +48,10 @@ case "$(uname -s)-$(uname -m)" in
   *_NT-*-x86_64)
     asset=windows-x86_64.zip
     sha256=e6dd32bbddf1720ebb4e679d55e9635ce792865a5bd84f3d2cd9af28647c0174
+    exe=slangc.exe ;;
+  *_NT-*-aarch64)
+    asset=windows-aarch64.zip
+    sha256=4f18a7e76a59969bc9bf6ea596bd9e496a3c689af173990ae028b18f03e1ac1a
     exe=slangc.exe ;;
   *)
     echo "no Slang release for $(uname -s) $(uname -m)" >&2

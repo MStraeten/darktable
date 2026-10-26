@@ -329,8 +329,6 @@ jobs:
         run: |
           lensfun-update-data
       - name: Install the Slang compiler
-        # Slang publishes no Windows on Arm build
-        if: matrix.msystem == 'UCRT64'
         run: |
           slangc=$($(cygpath ${SRC_DIR})/.ci/install-slangc.sh "$(cygpath '${{ github.workspace }}')/slang")
           echo "ECO=${ECO} -DUSE_SLANG=ON -DSLANGC_EXECUTABLE=$(cygpath -m "${slangc}")" >> "$GITHUB_ENV"
