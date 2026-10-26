@@ -45,6 +45,10 @@ case "$(uname -s)-$arch" in
     asset=macos-aarch64.zip
     sha256=ede1865bf086442c8786c5b7c0470ce5f4fd4f032eefe881356726ff9c445f40
     exe=slangc ;;
+  Darwin-x86_64)
+    asset=macos-x86_64.zip
+    sha256=a71d4a499d08b6178325a697a5a5c9fddc9eee5914daaf195451b283189e96ce
+    exe=slangc ;;
   *_NT-*-x86_64)
     asset=windows-x86_64.zip
     sha256=e6dd32bbddf1720ebb4e679d55e9635ce792865a5bd84f3d2cd9af28647c0174
