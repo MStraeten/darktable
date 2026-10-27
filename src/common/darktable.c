@@ -2692,6 +2692,10 @@ int dt_init(int argc,
   dt_capabilities_add("nonapple");
 #endif
 
+#ifdef HAVE_SLANG_GPU
+  dt_capabilities_add("slang");
+#endif
+
 #ifdef HAVE_OPENCV
   // gates the HDR alignment preferences: without OpenCV the whole merge
   // auto-alignment path is compiled out, so those prefs are shown greyed out

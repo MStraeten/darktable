@@ -19,6 +19,7 @@
     <section name="opencl" title="OpenCL GPU acceleration"/>
     <section name="platform" title="OpenCL drivers"/>
     <section name="cldevices" title="OpenCL devices"/>
+    <section name="slang" title="Slang GPU acceleration"/>
   </dttab>
   <dttab name="security" title="security">
     <section title="general"/>
@@ -562,12 +563,12 @@
     <shortdescription>OpenCL fast mode</shortdescription>
     <longdescription>if set the OpenCL compiler uses aggressive optimizing for better performance with reduced precision so more differences between CPU and OpenCL are expected.</longdescription>
   </dtconfig>
-  <dtconfig>
+  <dtconfig prefs="processing" section="slang" capability="slang">
     <name>slang_gpu</name>
     <type>bool</type>
     <default>false</default>
-    <shortdescription>run ported modules through the Slang GPU kernels</shortdescription>
-    <longdescription>experimental: modules with a Slang port run their CPU path on a Vulkan or Metal device instead</longdescription>
+    <shortdescription>activate Slang support</shortdescription>
+    <longdescription>experimental: run the modules ported to Slang on your graphics card through Vulkan or Metal.\nwith OpenCL also active, OpenCL runs the other modules.\ncan be switched on and off at any time.</longdescription>
   </dtconfig>
   <dtconfig>
     <name>slang_gpu_device</name>
