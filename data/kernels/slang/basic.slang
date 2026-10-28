@@ -975,6 +975,59 @@ float4 _lens_filter(ImageIn in, const float rx, const float ry, const int kwidth
   return sum / weight;
 }
 
+// clip_rotate_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl in
+// one kernel: kwidth 0 is bilinear, otherwise lanczos selects the filter, 0
+// for bicubic. Sampling follows the CPU process() of src/iop/clipping.c,
+// which keeps pixels up to one outside the input, as _lens_bilinear does.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void clip_rotate(uint3 gid : SV_DispatchThreadID,
+                 uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                 uniform int in_width, uniform int in_height,
+                 uniform int2 roi_in, uniform float2 roi_out, uniform float scale_in, uniform float scale_out,
+                 uniform int flip, uniform float2 t, uniform float2 k, uniform float4 mat,
+                 uniform float4 k_space, uniform float2 ka, uniform float4 ma, uniform float2 mb,
+                 uniform int kwidth, uniform int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float2 pi = roi_out + float2(x, y) + 0.5f;
+  pi -= (flip != 0 ? t.yx : t) * scale_out;
+  pi /= scale_out;
+
+  // backtransform() of ../basic.cl
+  pi.y /= 1.0f + pi.x * k.x;
+  pi.x /= 1.0f + pi.y * k.y;
+  float2 po = float2(pi.x * mat.x + pi.y * mat.y, pi.x * mat.z + pi.y * mat.w);
+
+  po = po * scale_in + t * scale_in;
+
+  if(k_space.z > 0.0f)
+  {
+    const float xx = po.x - k_space.x;
+    const float yy = po.y - k_space.y;
+    const float div = (ma.z * xx - ma.x * yy) * mb.y + (ma.y * yy - ma.w * xx) * mb.x + ma.x * ma.w - ma.y * ma.z;
+    po.x = (ma.w * xx - ma.y * yy) / div + ka.x;
+    po.y = -(ma.z * xx - ma.x * yy) / div + ka.y;
+  }
+
+  po -= float2(roi_in) + 0.5f;
+
+  float4 pixel = float4(0.0f);
+  if(kwidth == 0)
+    pixel = _lens_bilinear(in, po.x, po.y, in_width, in_height);
+  else
+  {
+    const int tx = int(floor(po.x));
+    const int ty = int(floor(po.y));
+    if(tx >= -1 && ty >= -1 && tx < in_width && ty < in_height)
+      pixel = _lens_filter(in, po.x, po.y, kwidth, lanczos, false, in_width, in_height);
+  }
+  out.write(int2(x, y), pixel);
+}
+
 // lens_distort_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl:
 // mode 0 is bilinear, otherwise kwidth and lanczos select the filter
 void _lens_distort(const uint3 gid, ImageIn in, ImageOut out, const int width, const int height,
