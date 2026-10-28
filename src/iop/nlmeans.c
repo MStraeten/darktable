@@ -18,6 +18,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/nlmeans_core.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
@@ -328,6 +329,75 @@ error:
 }
 #endif
 
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_nlmeans_params_t *d = piece->data;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t npixels = (size_t)width * height;
+  const float scale = fminf(roi_in->scale, 2.0f) / fmaxf(piece->iscale, 1.0f);
+  const int P = ceilf(d->radius * scale); // pixel filter size
+  const int K = ceilf(7 * scale);         // nbhood
+  const float sharpness = 3000.0f / (1.0f + d->strength);
+
+  // adjust to Lab, make L more important
+  const float max_L = 120.0f;
+  const float max_C = 512.0f;
+  const float nL2 = 1.0f / (max_L * max_L);
+  const float nC2 = 1.0f / (max_C * max_C);
+  const float weight[4] = { d->luma, d->chroma, d->chroma, 1.0f };
+
+  // the steps of the old process_cl() code; dt_slang_gpu_buffer_new() zeroes
+  // the accumulator. Each pass adds the patches at q and -q, so the passes
+  // cover the half of the search window with j < 0, and of the row j = 0 the
+  // part with i <= 0, so that every patch counts once, as in
+  // nlmeans_denoise(). process_cl() runs all of row 0 and counts its patches
+  // twice.
+  dt_slang_gpu_buffer_t *dev_U2 = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npixels, NULL);
+  dt_slang_gpu_buffer_t *dev_U4 = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
+  dt_slang_gpu_buffer_t *dev_U4_t = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
+  dt_slang_gpu_buffer_t *dev_U4_tt = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
+
+  int err = !dev_U2 || !dev_U4 || !dev_U4_t || !dev_U4_tt;
+
+  for(int j = -K; j <= 0 && !err; j++)
+    for(int i = -K; i <= (j < 0 ? K : 0) && !err; i++)
+    {
+      const int q[2] = { i, j };
+      err = dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_dist", width, height,
+                                     SLIMG_DEV(dev_in), SLBUF_DEV(dev_U4), SLARG(width), SLARG(height),
+                                     SLARG(q), SLARG(nL2), SLARG(nC2))
+        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_horiz", width, height,
+                                    SLBUF_DEV(dev_U4), SLBUF_DEV(dev_U4_t), SLARG(width), SLARG(height),
+                                    SLARG(P))
+        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_vert", width, height,
+                                    SLBUF_DEV(dev_U4_t), SLBUF_DEV(dev_U4_tt), SLARG(width), SLARG(height),
+                                    SLARG(P), SLARG(sharpness))
+        || dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_accu", width, height,
+                                    SLIMG_DEV(dev_in), SLBUF_DEV(dev_U2), SLBUF_DEV(dev_U4_tt),
+                                    SLARG(width), SLARG(height), SLARG(q));
+    }
+
+  // normalize and blend
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_finish", width, height,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(dev_U2), SLIMG_DEV(dev_out),
+                                   SLARG(width), SLARG(height), SLARG(weight));
+
+  dt_slang_gpu_buffer_free(dev_U2);
+  dt_slang_gpu_buffer_free(dev_U4);
+  dt_slang_gpu_buffer_free(dev_U4_t);
+  dt_slang_gpu_buffer_free(dev_U4_tt);
+  return !err;
+}
+#endif
 
 void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in, const dt_iop_roi_t *roi_out,
