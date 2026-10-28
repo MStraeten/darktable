@@ -905,3 +905,81 @@ void restore_ratios(uint3 gid : SV_DispatchThreadID,
   const float4 o = clip4(ratio) * norm;
   out.write(int2(x, y), o);
 }
+
+// the legacy filmic module, the first kernel of ../filmic.cl. It takes no
+// contrast argument, which the OpenCL kernel has but does not read
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void filmic(uint3 gid : SV_DispatchThreadID,
+            uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+            uniform float dynamic_range, uniform float shadows_range, uniform float grey,
+            uniform ImageIn table, uniform ImageIn diff,
+            uniform float power, uniform int preserve_color, uniform float saturation)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 i = in.readpixel(x, y);
+  const float4 xyz = Lab_to_XYZ(i);
+  float4 o = XYZ_to_prophotorgb(xyz);
+
+  const float noise = 1.0f / 65536.0f;
+  float derivative, luma;
+
+  // global desaturation
+  if(saturation != 1.0f)
+    o = float4(xyz.y) + saturation * (o - float4(xyz.y));
+
+  if(preserve_color != 0)
+  {
+    // save the ratios
+    float maxRGB = fmax3(o);
+    const float4 ratios = o / maxRGB;
+
+    // log profile
+    maxRGB = maxRGB / grey;
+    maxRGB = (maxRGB < noise) ? noise : maxRGB;
+    maxRGB = (dtcl_log2(maxRGB) - shadows_range) / dynamic_range;
+    maxRGB = clipf(maxRGB);
+
+    const float index = maxRGB;
+
+    // curve S LUT
+    maxRGB = lookup(table, maxRGB);
+
+    // re-apply the ratios
+    o = maxRGB * ratios;
+
+    derivative = lookup(diff, index);
+    luma = maxRGB;
+  }
+  else
+  {
+    // log profile
+    o = o / grey;
+    o = select(o < float4(noise), float4(noise), o);
+    o = (dtcl_log2(o) - shadows_range) / dynamic_range;
+    o = clip4(o);
+
+    const float index = prophotorgb_to_XYZ(o).y;
+
+    // curve S LUT
+    o.x = lookup(table, o.x);
+    o.y = lookup(table, o.y);
+    o.z = lookup(table, o.z);
+
+    derivative = lookup(diff, index);
+    luma = prophotorgb_to_XYZ(o).y;
+  }
+
+  // desaturate selectively
+  o = float4(luma) + derivative * (o - float4(luma));
+  o = clip4(o);
+
+  // apply the transfer function of the display
+  o = dtcl_pow(o, power);
+
+  i.xyz = prophotorgb_to_Lab(o).xyz;
+  out.write(int2(x, y), i);
+}
