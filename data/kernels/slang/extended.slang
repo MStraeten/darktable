@@ -389,3 +389,398 @@ void vignette(uint3 gid : SV_DispatchThreadID,
 
   out.write(int2(x, y), pixel);
 }
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorcontrast(uint3 gid : SV_DispatchThreadID,
+                   uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                   uniform float4 scale, uniform float4 offset, uniform int unbound)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  pixel.xyz = (pixel * scale + offset).xyz;
+  pixel.y = unbound != 0 ? pixel.y : clamp(pixel.y, -128.0f, 128.0f);
+  pixel.z = unbound != 0 ? pixel.z : clamp(pixel.z, -128.0f, 128.0f);
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorize(uint3 gid : SV_DispatchThreadID,
+              uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+              uniform float mix, uniform float L, uniform float a, uniform float b)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  pixel.x = pixel.x * mix + L - 50.0f * mix;
+  pixel.y = a;
+  pixel.z = b;
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void velvia(uint3 gid : SV_DispatchThreadID,
+            uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+            uniform float strength, uniform float bias)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float4 pixel = in.Areadpixel(x, y);
+
+  // calculate vibrance, and apply boost velvia saturation at least saturated pixels
+  const float pmax = max(pixel.x, max(pixel.y, pixel.z));
+  const float pmin = min(pixel.x, min(pixel.y, pixel.z));
+  const float plum = (pmax + pmin) / 2.0f;
+  const float psat = (plum <= 0.5f) ? (pmax - pmin) / (1e-5f + pmax + pmin)
+                                    : (pmax - pmin) / (1e-5f + max(0.0f, 2.0f - pmax - pmin));
+
+  const float pweight = clipf(((1.0f - (1.5f * psat)) + ((1.0f + (abs(plum - 0.5f) * 2.0f)) * (1.0f - bias)))
+                              / (1.0f + (1.0f - bias)));
+  const float saturation = strength * pweight;
+
+  float4 opixel;
+  opixel.x = clipf(pixel.x + saturation * (pixel.x - 0.5f * (pixel.y + pixel.z)));
+  opixel.y = clipf(pixel.y + saturation * (pixel.y - 0.5f * (pixel.z + pixel.x)));
+  opixel.z = clipf(pixel.z + saturation * (pixel.z - 0.5f * (pixel.x + pixel.y)));
+  opixel.w = pixel.w;
+  out.write(int2(x, y), opixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void vibrance(uint3 gid : SV_DispatchThreadID,
+              uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+              uniform float amount)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  const float sw = dt_fast_hypot(pixel.y, pixel.z) / 256.0f;
+  const float ls = 1.0f - amount * sw * 0.25f;
+  const float ss = 1.0f + amount * sw;
+  pixel.x *= ls;
+  pixel.y *= ss;
+  pixel.z *= ss;
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void splittoning(uint3 gid : SV_DispatchThreadID,
+                 uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                 uniform float compress, uniform float balance, uniform float shadow_hue,
+                 uniform float shadow_saturation, uniform float highlight_hue, uniform float highlight_saturation)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  float4 hsl = RGB_2_HSL(pixel);
+
+  if(hsl.z < balance - compress || hsl.z > balance + compress)
+  {
+    const bool shadow = hsl.z < balance;
+    const float ra = shadow ? clipf(2.0f * abs(-balance + compress + hsl.z))
+                            : clipf(2.0f * abs(-balance - compress + hsl.z));
+    hsl.x = shadow ? shadow_hue : highlight_hue;
+    hsl.y = shadow ? shadow_saturation : highlight_saturation;
+
+    const float4 mixrgb = HSL_2_RGB(hsl);
+    pixel.xyz = clamp(pixel * (1.0f - ra) + mixrgb * ra, float4(0.0f), float4(1.0f)).xyz;
+  }
+  out.write(int2(x, y), pixel);
+}
+
+float GAUSS(float center, float wings, float x)
+{
+  const float b = -1.0f + center * 2.0f;
+  const float c = (wings / 10.0f) / 2.0f;
+  return exp(-(x - b) * (x - b) / (c * c));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void relight(uint3 gid : SV_DispatchThreadID,
+             uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+             uniform float center, uniform float wings, uniform float ev)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  const float lightness = pixel.x / 100.0f;
+  const float value = -1.0f + (lightness * 2.0f);
+  float gauss = GAUSS(center, wings, value);
+  if(isnan(gauss) || isinf(gauss)) gauss = 0.0f;
+
+  float relight = 1.0f / exp2(-ev * clipf(gauss));
+  if(isnan(relight) || isinf(relight)) relight = 1.0f;
+
+  pixel.x = 100.0f * clipf(lightness * relight);
+  out.write(int2(x, y), pixel);
+}
+
+float fastlog2(float x)
+{
+  const uint vx = asuint(x);
+  const float mx = asfloat((vx & 0x007FFFFFu) | 0x3f000000u);
+  const float y = float(vx) * 1.1920928955078125e-7f;
+  return y - 124.22551499f - 1.498030302f * mx - 1.72587999f / (0.3520887068f + mx);
+}
+
+float thinplate(float4 x, float4 y)
+{
+  const float r2 = (x.x - y.x) * (x.x - y.x) + (x.y - y.y) * (x.y - y.y) + (x.z - y.z) * (x.z - y.z);
+  return r2 * 0.69314718f * fastlog2(max(1e-8f, r2));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorchecker(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                  uniform int num_patches, uniform StructuredBuffer<float4> params)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  // params holds the source patches, their coefficients and the 4 polynomial coefficients
+  const int coeff = num_patches;
+  const int poly = 2 * num_patches;
+
+  const float4 ipixel = in.readpixel(x, y);
+  float4 opixel = params[poly] + params[poly + 1] * ipixel.x + params[poly + 2] * ipixel.y
+                  + params[poly + 3] * ipixel.z;
+
+  for(int k = 0; k < num_patches; k++)
+    opixel += params[coeff + k] * thinplate(ipixel, params[k]);
+
+  opixel.w = ipixel.w;
+  out.write(int2(x, y), opixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void primaries(uint3 gid : SV_DispatchThreadID,
+               uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+               uniform StructuredBuffer<float> matrix)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float4 ipixel = in.Areadpixel(x, y);
+  float4 opixel = matrix_product_float4(ipixel, matrix);
+  opixel.w = ipixel.w;
+  out.write(int2(x, y), opixel);
+}
+
+// one kernel for both signs of the density, which the OpenCL code splits in
+// graduatedndp and graduatedndm
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void graduatednd(uint3 gid : SV_DispatchThreadID,
+                 uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                 uniform float4 color, uniform float density, uniform float length_base,
+                 uniform float length_inc_x, uniform float length_inc_y)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  const float len = length_base + y * length_inc_y + x * length_inc_x;
+  if(density > 0.0f)
+  {
+    const float dens = dtcl_exp2(density * clipf(0.5f + len));
+    pixel = pixel / (color + (float4(1.0f) - color) * float4(dens));
+  }
+  else
+  {
+    const float dens = dtcl_exp2(-density * clipf(0.5f - len));
+    pixel = pixel * (color + (float4(1.0f) - color) * float4(dens));
+  }
+  out.write(int2(x, y), pixel);
+}
+
+// _channelmixer_operation_mode_t
+static const int OPERATION_MODE_RGB = 0;
+static const int OPERATION_MODE_GRAY = 1;
+static const int OPERATION_MODE_HSL_V1 = 2;
+static const int OPERATION_MODE_HSL_V2 = 3;
+
+float3 _mix3(float4 p, StructuredBuffer<float> m)
+{
+  return float3(p.x * m[0] + p.y * m[1] + p.z * m[2],
+                p.x * m[3] + p.y * m[4] + p.z * m[5],
+                p.x * m[6] + p.y * m[7] + p.z * m[8]);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void channelmixer(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                  uniform int operation_mode, uniform StructuredBuffer<float> hsl_matrix,
+                  uniform StructuredBuffer<float> rgb_matrix)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  float4 opixel = float4(0.0f, 0.0f, 0.0f, pixel.w);
+
+  if(operation_mode == OPERATION_MODE_RGB)
+  {
+    opixel.xyz = max(_mix3(pixel, rgb_matrix), float3(0.0f));
+  }
+  else if(operation_mode == OPERATION_MODE_GRAY)
+  {
+    const float gray = max(pixel.x * rgb_matrix[0] + pixel.y * rgb_matrix[1] + pixel.z * rgb_matrix[2], 0.0f);
+    opixel = float4(gray, gray, gray, pixel.w);
+  }
+  else if(operation_mode == OPERATION_MODE_HSL_V1)
+  {
+    const float hmix = clipf(pixel.x * hsl_matrix[0]) + pixel.y * hsl_matrix[1] + pixel.z * hsl_matrix[2];
+    const float smix = clipf(pixel.x * hsl_matrix[3]) + pixel.y * hsl_matrix[4] + pixel.z * hsl_matrix[5];
+    const float lmix = clipf(pixel.x * hsl_matrix[6]) + pixel.y * hsl_matrix[7] + pixel.z * hsl_matrix[8];
+    if(hmix != 0.0f || smix != 0.0f || lmix != 0.0f)
+    {
+      float4 hsl = RGB_2_HSL(pixel);
+      hsl.x = (hmix != 0.0f) ? hmix : hsl.x;
+      hsl.y = (smix != 0.0f) ? smix : hsl.y;
+      hsl.z = (lmix != 0.0f) ? lmix : hsl.z;
+      pixel = HSL_2_RGB(hsl);
+    }
+    const float3 o = _mix3(pixel, rgb_matrix);
+    opixel.xyz = float3(clipf(o.x), clipf(o.y), clipf(o.z));
+  }
+  else if(operation_mode == OPERATION_MODE_HSL_V2)
+  {
+    const float3 m = _mix3(pixel, hsl_matrix);
+    const float hmix = clipf(m.x);
+    const float smix = clipf(m.y);
+    const float lmix = clipf(m.z);
+    if(hmix != 0.0f || smix != 0.0f || lmix != 0.0f)
+    {
+      pixel = float4(clipf(pixel.x), clipf(pixel.y), clipf(pixel.z), pixel.w);
+      float4 hsl = RGB_2_HSL(pixel);
+      hsl.x = (hmix != 0.0f) ? hmix : hsl.x;
+      hsl.y = (smix != 0.0f) ? smix : hsl.y;
+      hsl.z = (lmix != 0.0f) ? lmix : hsl.z;
+      pixel = HSL_2_RGB(hsl);
+    }
+    opixel.xyz = max(_mix3(pixel, rgb_matrix), float3(0.0f));
+  }
+  out.write(int2(x, y), opixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorbalance(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                  uniform float4 lift, uniform float4 gain, uniform float4 gamma_inv)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 Lab = in.Areadpixel(x, y);
+  float4 sRGB = XYZ_to_sRGB(Lab_to_XYZ(Lab));
+
+  // lift gamma gain
+  sRGB = select(sRGB <= float4(0.0031308f), 12.92f * sRGB,
+                (1.0f + 0.055f) * dtcl_pow(sRGB, float4(1.0f / 2.4f)) - float4(0.055f));
+  sRGB = dtcl_pow(max(((sRGB - float4(1.0f)) * lift + float4(1.0f)) * gain, float4(0.0f)), gamma_inv);
+  sRGB = select(sRGB <= float4(0.04045f), sRGB / 12.92f,
+                dtcl_pow((sRGB + float4(0.055f)) / (1.0f + 0.055f), float4(2.4f)));
+  Lab.xyz = XYZ_to_Lab(sRGB_to_XYZ(sRGB)).xyz;
+  out.write(int2(x, y), Lab);
+}
+
+float4 _colorbalance_saturation(float4 RGB, float luma, float saturation)
+{
+  return float4(luma) + float4(saturation) * (RGB - float4(luma));
+}
+
+float4 _colorbalance_finish(float4 RGB, float contrast, float grey, float saturation_out)
+{
+  // saturation output
+  if(saturation_out != 1.0f)
+    RGB = _colorbalance_saturation(RGB, prophotorgb_to_XYZ(RGB).y, saturation_out);
+
+  // fulcrum contrast
+  if(contrast != 1.0f)
+    RGB = select(RGB <= float4(0.0f), float4(0.0f), dtcl_pow(RGB / float4(grey), float4(contrast)) * float4(grey));
+  return RGB;
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorbalance_lgg(uint3 gid : SV_DispatchThreadID,
+                      uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                      uniform float4 lift, uniform float4 gain, uniform float4 gamma_inv,
+                      uniform float saturation, uniform float contrast, uniform float grey,
+                      uniform float saturation_out)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 Lab = in.Areadpixel(x, y);
+  const float4 XYZ = Lab_to_XYZ(Lab);
+  float4 RGB = XYZ_to_prophotorgb(XYZ);
+
+  // saturation input
+  if(saturation != 1.0f) RGB = _colorbalance_saturation(RGB, XYZ.y, saturation);
+
+  // lift gamma gain
+  RGB = select(RGB <= float4(0.0f), float4(0.0f), dtcl_pow(RGB, float4(1.0f / 2.2f)));
+  RGB = ((RGB - float4(1.0f)) * lift + float4(1.0f)) * gain;
+  RGB = select(RGB <= float4(0.0f), float4(0.0f), dtcl_pow(RGB, gamma_inv * float4(2.2f)));
+
+  RGB = _colorbalance_finish(RGB, contrast, grey, saturation_out);
+  Lab.xyz = prophotorgb_to_Lab(RGB).xyz;
+  out.write(int2(x, y), Lab);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorbalance_cdl(uint3 gid : SV_DispatchThreadID,
+                      uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                      uniform float4 lift, uniform float4 gain, uniform float4 gamma,
+                      uniform float saturation, uniform float contrast, uniform float grey,
+                      uniform float saturation_out)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 Lab = in.Areadpixel(x, y);
+  const float4 XYZ = Lab_to_XYZ(Lab);
+  float4 RGB = XYZ_to_prophotorgb(XYZ);
+
+  // saturation input
+  if(saturation != 1.0f) RGB = _colorbalance_saturation(RGB, XYZ.y, saturation);
+
+  // lift power slope
+  RGB = RGB * gain + lift;
+  RGB = select(RGB <= float4(0.0f), float4(0.0f), dtcl_pow(RGB, gamma));
+
+  RGB = _colorbalance_finish(RGB, contrast, grey, saturation_out);
+  Lab.xyz = prophotorgb_to_Lab(RGB).xyz;
+  out.write(int2(x, y), Lab);
+}

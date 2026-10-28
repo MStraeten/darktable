@@ -21,6 +21,7 @@
 #include "common/debug.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -231,6 +232,29 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
     CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(compress), CLARG(balance), CLARG(shadow_hue),
     CLARG(shadow_saturation), CLARG(highlight_hue), CLARG(highlight_saturation));
  }
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_splittoning_data_t *d = piece->data;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  const float compress = (d->compress / 110.0) / 2.0; // Don't allow 100% compression..
+
+  return !dt_slang_gpu_run_2d_args("extended", "splittoning", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(compress), SLARG(d->balance), SLARG(d->shadow_hue),
+                                   SLARG(d->shadow_saturation), SLARG(d->highlight_hue),
+                                   SLARG(d->highlight_saturation));
+}
 #endif
 
 

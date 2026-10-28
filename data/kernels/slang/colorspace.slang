@@ -821,3 +821,99 @@ public float lookup_gamut(StructuredBuffer<float> gamut_lut, float x)
   // y_prev on an integer LUT element, a linear interpolation otherwise
   return y_prev + ((xi != xii) ? (x_test - x_prev) * (gamut_lut[xii] - y_prev) : 0.0f);
 }
+
+public float4 RGB_2_HSL(float4 RGB)
+{
+  float H = 0.0f;
+  float S = 0.0f;
+
+  // assumes that each channel is scaled to [0; 1]
+  const float R = RGB.x;
+  const float G = RGB.y;
+  const float B = RGB.z;
+
+  const float var_Min = min(R, min(G, B));
+  const float var_Max = max(R, max(G, B));
+  const float del_Max = var_Max - var_Min;
+
+  const float L = (var_Max + var_Min) / 2.0f;
+
+  if(abs(var_Max) > 1e-6f && abs(del_Max) > 1e-6f)
+  {
+    if(L < 0.5f) S = del_Max / (var_Max + var_Min);
+    else         S = del_Max / (2.0f - var_Max - var_Min);
+
+    const float del_R = (((var_Max - R) / 6.0f) + (del_Max / 2.0f)) / del_Max;
+    const float del_G = (((var_Max - G) / 6.0f) + (del_Max / 2.0f)) / del_Max;
+    const float del_B = (((var_Max - B) / 6.0f) + (del_Max / 2.0f)) / del_Max;
+
+    if     (R == var_Max) H = del_B - del_G;
+    else if(G == var_Max) H = (1.0f / 3.0f) + del_R - del_B;
+    else if(B == var_Max) H = (2.0f / 3.0f) + del_G - del_R;
+
+    H -= floor(H);
+  }
+
+  return float4(H, S, L, RGB.w);
+}
+
+float Hue_2_RGB(float v1, float v2, float vH)
+{
+  vH = vH - floor(vH);
+  if((6.0f * vH) < 1.0f) return (v1 + (v2 - v1) * 6.0f * vH);
+  if((2.0f * vH) < 1.0f) return (v2);
+  if((3.0f * vH) < 2.0f) return (v1 + (v2 - v1) * ((2.0f / 3.0f) - vH) * 6.0f);
+  return (v1);
+}
+
+public float4 HSL_2_RGB(float4 HSL)
+{
+  float R, G, B;
+
+  const float H = HSL.x;
+  const float S = HSL.y;
+  const float L = HSL.z;
+
+  if(S < 1e-6f)
+  {
+    R = B = G = L;
+  }
+  else
+  {
+    const float var_2 = L < 0.5f ? L * (1.0f + S) : (L + S) - (S * L);
+    const float var_1 = 2.0f * L - var_2;
+
+    R = Hue_2_RGB(var_1, var_2, H + (1.0f / 3.0f));
+    G = Hue_2_RGB(var_1, var_2, H);
+    B = Hue_2_RGB(var_1, var_2, H - (1.0f / 3.0f));
+  }
+
+  // returns RGB scaled to [0; 1] for each channel
+  return float4(R, G, B, HSL.w);
+}
+
+// XYZ -> sRGB matrix, D65
+public float4 XYZ_to_sRGB(float4 XYZ)
+{
+  float4 sRGB;
+
+  sRGB.x =  3.1338561f * XYZ.x - 1.6168667f * XYZ.y - 0.4906146f * XYZ.z;
+  sRGB.y = -0.9787684f * XYZ.x + 1.9161415f * XYZ.y + 0.0334540f * XYZ.z;
+  sRGB.z =  0.0719453f * XYZ.x - 0.2289914f * XYZ.y + 1.4052427f * XYZ.z;
+  sRGB.w = XYZ.w;
+
+  return sRGB;
+}
+
+// sRGB -> XYZ matrix, D65
+public float4 sRGB_to_XYZ(float4 sRGB)
+{
+  float4 XYZ;
+
+  XYZ.x = 0.4360747f * sRGB.x + 0.3850649f * sRGB.y + 0.1430804f * sRGB.z;
+  XYZ.y = 0.2225045f * sRGB.x + 0.7168786f * sRGB.y + 0.0606169f * sRGB.z;
+  XYZ.z = 0.0139322f * sRGB.x + 0.0971045f * sRGB.y + 0.7141733f * sRGB.z;
+  XYZ.w = sRGB.w;
+
+  return XYZ;
+}
