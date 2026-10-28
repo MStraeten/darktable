@@ -25,6 +25,7 @@
 #include "common/gaussian.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -326,6 +327,38 @@ error:
   dt_opencl_release_mem_object(dev_zmo);
   dt_opencl_release_mem_object(dev_zms);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_zonesystem_data_t *data = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  /* calculate zonemap */
+  const int size = data->params.size;
+  float zonemap[MAX_ZONE_SYSTEM_SIZE] = { -1 };
+  float zonemap_offset[ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16)] = { -1 };
+  float zonemap_scale[ROUNDUP(MAX_ZONE_SYSTEM_SIZE, 16)] = { -1 };
+
+  _iop_zonesystem_calculate_zonemap(&(data->params), zonemap);
+
+  /* precompute scale and offset */
+  for(int k = 0; k < size - 1; k++) zonemap_scale[k] = (zonemap[k + 1] - zonemap[k]) * (size - 1);
+  for(int k = 0; k < size - 1; k++) zonemap_offset[k] = 100.0f * ((k + 1) * zonemap[k] - k * zonemap[k + 1]);
+
+  return !dt_slang_gpu_run_2d_args("basic", "zonesystem", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(size), SLBUF(zonemap_offset, sizeof(zonemap_offset)),
+                                   SLBUF(zonemap_scale, sizeof(zonemap_scale)));
 }
 #endif
 

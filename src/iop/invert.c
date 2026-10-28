@@ -19,6 +19,7 @@
 #include <gtk/gtk.h>
 #include <stdlib.h>
 #include "common/colorspaces.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
@@ -394,6 +395,44 @@ finish:
   dt_opencl_release_mem_object(dev_color);
   for(int k = 0; k < 4; k++) piece->pipe->dsc.processed_maximum[k] = 1.0f;
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_invert_data_t *d = piece->data;
+
+  const uint32_t filters = piece->pipe->dsc.filters;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  dt_aligned_pixel_t film_rgb_f = { d->color[0], d->color[1], d->color[2], d->color[3] };
+
+  int err;
+  if(filters)
+  {
+    const float *const m = piece->pipe->dsc.processed_maximum;
+    for(int c = 0; c < 4; c++) film_rgb_f[c] *= m[c];
+
+    // X-Trans stays on the CPU, see commit_params()
+    err = dt_slang_gpu_run_2d_args("basic", "invert_1f", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLBUF(film_rgb_f, sizeof(film_rgb_f)), SLARG(filters),
+                                   SLARG(roi_out->x), SLARG(roi_out->y));
+  }
+  else
+    err = dt_slang_gpu_run_2d_args("basic", "invert_4f", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLBUF(film_rgb_f, sizeof(film_rgb_f)));
+
+  for(int k = 0; k < 4; k++) piece->pipe->dsc.processed_maximum[k] = 1.0f;
+  return !err;
 }
 #endif
 

@@ -1596,3 +1596,284 @@ void ashift_lanczos3(uint3 gid : SV_DispatchThreadID,
   _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
           homograph, 3, 3);
 }
+
+// the Lab and display-referred modules that have no scene-referred successor
+// in the default pipe
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colisa(uint3 gid : SV_DispatchThreadID,
+            uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+            uniform float saturation, uniform ImageIn ctable, uniform StructuredBuffer<float> ca,
+            uniform ImageIn ltable, uniform StructuredBuffer<float> la)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float4 i = in.readpixel(x, y);
+  float4 o;
+  o.x = _lookup_unbounded_buf(ctable, i.x / 100.0f, ca);
+  o.x = _lookup_unbounded_buf(ltable, o.x / 100.0f, la);
+  o.y = i.y * saturation;
+  o.z = i.z * saturation;
+  o.w = i.w;
+  out.write(int2(x, y), o);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorcorrection(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform float saturation, uniform float a_scale, uniform float a_base,
+                     uniform float b_scale, uniform float b_base)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.readpixel(x, y);
+  pixel.y = saturation * (pixel.y + pixel.x * a_scale + a_base);
+  pixel.z = saturation * (pixel.z + pixel.x * b_scale + b_base);
+  out.write(int2(x, y), pixel);
+}
+
+// dt_iop_colorzones_channel_t
+static const int DT_IOP_COLORZONES_L = 0;
+static const int DT_IOP_COLORZONES_C = 1;
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorzones(uint3 gid : SV_DispatchThreadID,
+                uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                uniform int channel, uniform ImageIn table_L, uniform ImageIn table_C, uniform ImageIn table_h)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.readpixel(x, y);
+  const float normalize_C = 1.f / (128.0f * M_SQRT2_F);
+  float4 LCh = Lab_2_LCH(pixel);
+
+  float select = channel == DT_IOP_COLORZONES_L ? LCh.x * 0.01f
+               : channel == DT_IOP_COLORZONES_C ? LCh.y * normalize_C
+               : LCh.z;
+  select = clipf(select);
+
+  LCh.x *= dtcl_pow(2.0f, 4.0f * (lookup(table_L, select) - .5f));
+  LCh.y *= 2.f * lookup(table_C, select);
+  LCh.z += lookup(table_h, select) - .5f;
+
+  pixel.xyz = LCH_2_Lab(LCh).xyz;
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorzones_v3(uint3 gid : SV_DispatchThreadID,
+                   uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                   uniform int channel, uniform ImageIn table_L, uniform ImageIn table_a, uniform ImageIn table_b)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.readpixel(x, y);
+
+  const float a = pixel.y;
+  const float b = pixel.z;
+  const float h = fmod(atan2(b, a) + DT_2PI_F, DT_2PI_F) / DT_2PI_F;
+  const float C = dt_fast_hypot(b, a);
+
+  float select = h;
+  float blend = 0.0f;
+  if(channel == DT_IOP_COLORZONES_L)
+    select = min(1.0f, pixel.x / 100.0f);
+  else if(channel == DT_IOP_COLORZONES_C)
+    select = min(1.0f, C / 128.0f);
+  else
+    blend = fsquare(1.0f - C / 128.0f);
+
+  const float Lm = (blend * 0.5f + (1.0f - blend) * lookup(table_L, select)) - 0.5f;
+  const float hm = (blend * 0.5f + (1.0f - blend) * lookup(table_b, select)) - 0.5f;
+  const float Cm = 2.0f * lookup(table_a, select);
+  const float L = pixel.x * dtcl_pow(2.0f, 4.0f * Lm);
+
+  pixel.x = L;
+  pixel.y = dtcl_cos(DT_2PI_F * (h + hm)) * Cm * C;
+  pixel.z = dtcl_sin(DT_2PI_F * (h + hm)) * Cm * C;
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void invert_1f(uint3 gid : SV_DispatchThreadID,
+               uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+               uniform StructuredBuffer<float> color, uniform uint filters, uniform int rx, uniform int ry)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float pixel = in.readsingle(x, y);
+  out.write(int2(x, y), float4(clipf(color[FC(ry + y, rx + x, filters)] - pixel), 0.0f, 0.0f, 0.0f));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void invert_4f(uint3 gid : SV_DispatchThreadID,
+               uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+               uniform StructuredBuffer<float> color)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.readpixel(x, y);
+  pixel.xyz = clamp(float3(color[0], color[1], color[2]) - pixel.xyz, 0.0f, 1.0f);
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void levels(uint3 gid : SV_DispatchThreadID,
+            uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+            uniform ImageIn lut, uniform float in_low, uniform float in_high, uniform float in_inv_gamma)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  const float L = pixel.x;
+  const float L_in = pixel.x / 100.0f;
+  const float percentage = (L_in - in_low) / (in_high - in_low);
+
+  if(L_in <= in_low)
+    pixel.x = 0.0f;
+  else if(L_in >= in_high)
+    pixel.x = 100.0f * dtcl_pow(percentage, in_inv_gamma);
+  else
+    pixel.x = lookup(lut, percentage);
+
+  const float f = L_in > 0.01f ? pixel.x / L : pixel.x;
+  pixel.y *= f;
+  pixel.z *= f;
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lowlight(uint3 gid : SV_DispatchThreadID,
+              uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+              uniform float4 XYZ_sw, uniform ImageIn lut)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float c = 0.5f;
+  const float threshold = 0.01f;
+
+  float4 pixel = in.readpixel(x, y);
+  float4 XYZ = Lab_to_XYZ(pixel);
+
+  // scotopic luminance, with a floor on red that avoids "snow" in dark noisy areas
+  float V = XYZ.y * (1.33f * (1.0f + (XYZ.y + XYZ.z) / (XYZ.x > threshold ? XYZ.x : threshold)) - 1.68f);
+
+  // scale using empiric coefficient and fit inside limits
+  V = clipf(c * V);
+
+  // blending coefficient from curve
+  const float w = lookup(lut, pixel.x / 100.0f);
+
+  XYZ = w * XYZ + (1.0f - w) * V * XYZ_sw;
+  out.write(int2(x, y), XYZ_to_Lab(XYZ));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void profilegamma(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                  uniform ImageIn table, uniform StructuredBuffer<float> ta)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float4 i = in.readpixel(x, y);
+  float4 o;
+  o.x = _lookup_unbounded_buf(table, i.x, ta);
+  o.y = _lookup_unbounded_buf(table, i.y, ta);
+  o.z = _lookup_unbounded_buf(table, i.z, ta);
+  o.w = i.w;
+  out.write(int2(x, y), o);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void profilegamma_log(uint3 gid : SV_DispatchThreadID,
+                      uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                      uniform float dynamic_range, uniform float shadows_range, uniform float grey)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 i = in.readpixel(x, y);
+  const float4 noise = float4(1.0f / 65536.0f);
+
+  float4 o = select(i < noise, noise, i / grey);
+  o = (dtcl_log2(o) - shadows_range) / dynamic_range;
+  o = select(o < noise, noise, o);
+  i.xyz = o.xyz;
+  out.write(int2(x, y), i);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void zonesystem(uint3 gid : SV_DispatchThreadID,
+                uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                uniform int size, uniform StructuredBuffer<float> zonemap_offset,
+                uniform StructuredBuffer<float> zonemap_scale)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.readpixel(x, y);
+
+  const float rzscale = float(size - 1) / 100.0f;
+  const int rz = clamp(int(pixel.x * rzscale), 0, size - 2);
+  const float zs = ((rz > 0) ? (zonemap_offset[rz] / pixel.x) : 0.0f) + zonemap_scale[rz];
+
+  pixel.xyz *= zs;
+  out.write(int2(x, y), pixel);
+}
+
+// the OpenCL path fills the border color, the frame and its inside one after
+// the other and then copies the image in: here every pixel takes the last of
+// them that covers it
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void borders(uint3 gid : SV_DispatchThreadID,
+             uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+             uniform int in_x, uniform int in_y, uniform int in_width, uniform int in_height,
+             uniform int frame, uniform int4 frame_out, uniform int4 frame_in,
+             uniform float4 color, uniform float4 frame_color)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  // frame_out and frame_in are top left x and y, and bottom right x and y
+  float4 pixel = color;
+  if(frame != 0 && x >= frame_out.x && y >= frame_out.y && x < frame_out.z && y < frame_out.w)
+    pixel = frame_color;
+  if(frame != 0 && x >= frame_in.x && y >= frame_in.y && x < frame_in.z && y < frame_in.w)
+    pixel = color;
+  if(x >= in_x && y >= in_y && x < in_x + in_width && y < in_y + in_height)
+    pixel = in.Areadpixel(x - in_x, y - in_y);
+  out.write(int2(x, y), pixel);
+}
