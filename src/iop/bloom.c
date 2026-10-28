@@ -21,6 +21,7 @@
 #include "common/imagebuf.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -299,6 +300,45 @@ error:
   for(int i = 0; i < NUM_BUCKETS; i++)
     dt_opencl_release_mem_object(dev_tmp[i]);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_bloom_data_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // the parameters of process()
+  const float threshold = d->threshold;
+  const int rad = 256.0f * (fmin(100.0f, d->size + 1.0f) / 100.0f);
+  const float _r = ceilf(rad * roi_in->scale / piece->iscale);
+  const int radius = MIN(256.0f, _r);
+  const int hr = (2 * radius + 1) / 2;
+  const float scale = 1.0f / exp2f(-1.0f * (fmin(100.0f, d->strength + 1.0f) / 100.0f));
+
+  // the light above the threshold, box blurred, then screen blended over
+  // the input
+  dt_slang_gpu_image_t *light = dt_slang_gpu_image_new(width, height, 1, NULL);
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 1, NULL);
+  const int err = !light || !tmp
+    || dt_slang_gpu_run_2d_args("bloom", "bloom_threshold", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(light), SLARG(width), SLARG(height), SLARG(scale), SLARG(threshold))
+    || dt_box_mean_slang(light, tmp, width, height, 1, hr, BOX_ITERATIONS)
+    || dt_slang_gpu_run_2d_args("bloom", "bloom_mix", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(light), SLIMG_DEV(dev_out), SLARG(width), SLARG(height));
+
+  dt_slang_gpu_image_free(light);
+  dt_slang_gpu_image_free(tmp);
+  return !err;
 }
 #endif
 

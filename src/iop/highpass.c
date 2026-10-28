@@ -25,6 +25,7 @@
 #include "common/box_filters.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -229,6 +230,44 @@ error:
   dt_opencl_release_mem_object(dev_tmp);
   free(mat);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_highpass_data_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // the box mean of process(), not the gaussian of process_cl()
+  const int rad = MAX_RADIUS * (fmin(100.0, d->sharpness + 1) / 100.0);
+  const int radius = MIN(MAX_RADIUS, ceilf(rad * roi_in->scale / piece->iscale));
+  const int hr = (2 * radius + 1) / 2;
+  const float contrast_scale = ((d->contrast / 100.0f) * 7.5f) * 0.5f;
+
+  // the inverted L goes to a single channel image, which is blurred and
+  // then mixed with the input
+  dt_slang_gpu_image_t *L = dt_slang_gpu_image_new(width, height, 1, NULL);
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 1, NULL);
+  const int err = !L || !tmp
+    || dt_slang_gpu_run_2d_args("highpass", "highpass_invert", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(L), SLARG(width), SLARG(height))
+    || dt_box_mean_slang(L, tmp, width, height, 1, hr, BOX_ITERATIONS)
+    || dt_slang_gpu_run_2d_args("highpass", "highpass_mix", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(L), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+         SLARG(contrast_scale));
+
+  dt_slang_gpu_image_free(L);
+  dt_slang_gpu_image_free(tmp);
+  return !err;
 }
 #endif
 

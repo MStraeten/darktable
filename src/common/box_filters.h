@@ -49,6 +49,18 @@ void dt_box_max(float *const buf, const size_t height, const size_t width, const
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+
+// dt_box_mean() with 1 or 4 channels on an image of the Slang kernels, in
+// place, with tmp as a scratch image of the same size. Returns 0 on success.
+#ifdef __cplusplus
+extern "C"
+#endif
+int dt_box_mean_slang(dt_slang_gpu_image_t *buf, dt_slang_gpu_image_t *tmp, const int width,
+                      const int height, const int ch, const int radius, const int iterations);
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
