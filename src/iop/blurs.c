@@ -709,6 +709,83 @@ void process(dt_iop_module_t *self,
 }
 
 
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_blurs_params_t *p = piece->data;
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const int radius = MAX(roundf(p->radius / scale), 2);
+
+  // Gaussian fast path, as in process()
+  if(p->type == DT_BLUR_GAUSSIAN)
+  {
+    const float sigma = (float)(radius - 1) / (2.0f * sqrtf(2.0f));
+    const float range = 1.0e9f;
+    const dt_aligned_pixel_t maxv = { range, range, range, range };
+    const dt_aligned_pixel_t minv = { -range, -range, -range, -range };
+
+    dt_slang_gpu_image_t *blurred = dt_slang_gpu_image_new(width, height, 4, NULL);
+    const gboolean ok = blurred
+      && !dt_gaussian_blur_4c_slang(dev_in, blurred, width, height, sigma, DT_IOP_GAUSSIAN_ZERO, maxv, minv)
+      && !dt_slang_gpu_run_2d_args("blurs", "blurs_restore_alpha", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(blurred), SLIMG_DEV(dev_out),
+                                   SLARG(width), SLARG(height));
+    dt_slang_gpu_image_free(blurred);
+    return ok;
+  }
+
+  // lens and motion: the sparse convolution of process_cl()
+  const size_t kernel_width = 2 * radius + 1;
+  const size_t max_entries = kernel_width * kernel_width;
+
+  float *const kernel = dt_alloc_align_float(max_entries);
+  int *const offsets_x = dt_alloc_aligned(max_entries * sizeof(int));
+  int *const offsets_y = dt_alloc_aligned(max_entries * sizeof(int));
+  float *const values = dt_alloc_align_float(max_entries);
+
+  gboolean ok = FALSE;
+  if(kernel && offsets_x && offsets_y && values)
+  {
+    _build_pixel_kernel(kernel, kernel_width, kernel_width, p);
+
+    int n_nonzero = 0;
+    for(int l = -radius; l <= radius; l++)
+      for(int m = -radius; m <= radius; m++)
+      {
+        const float k = kernel[(l + radius) * kernel_width + (m + radius)];
+        if(k > 1e-6f)
+        {
+          offsets_x[n_nonzero] = m;
+          offsets_y[n_nonzero] = l;
+          values[n_nonzero] = k;
+          n_nonzero++;
+        }
+      }
+
+    ok = n_nonzero > 0
+      && !dt_slang_gpu_run_2d_args("blurs", "blurs_convolve_sparse", width, height,
+                                   SLIMG_DEV(dev_in), SLBUF(offsets_x, n_nonzero * sizeof(int)),
+                                   SLBUF(offsets_y, n_nonzero * sizeof(int)),
+                                   SLBUF(values, n_nonzero * sizeof(float)), SLIMG_DEV(dev_out),
+                                   SLARG(width), SLARG(height), SLARG(n_nonzero));
+  }
+
+  dt_free_align(kernel);
+  dt_free_align(offsets_x);
+  dt_free_align(offsets_y);
+  dt_free_align(values);
+  return ok;
+}
+#endif
+
 #if HAVE_OPENCL
 int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_in, cl_mem dev_out,
                const dt_iop_roi_t *const roi_in, const dt_iop_roi_t *const roi_out)
