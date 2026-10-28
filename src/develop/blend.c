@@ -2565,7 +2565,7 @@ error:
   dt_slang_gpu_image_free(dev_mask);
   dt_slang_gpu_image_free(dev_mask_2);
   free(profile_lut);
-  dt_print_pipe(DT_DEBUG_PIPE, "blend slang failure", piece->pipe, self, DT_DEVICE_NONE, roi_in, roi_out,
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "blend slang failure", piece->pipe, self, DT_DEVICE_NONE, roi_in, roi_out,
                 "blending on the CPU");
   return FALSE;
 }

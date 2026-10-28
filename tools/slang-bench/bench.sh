@@ -39,7 +39,7 @@ run() { # <name> [extra args]
     --conf plugins/lighttable/export/force_lcms2=FALSE \
     --conf plugins/lighttable/export/pixel_interpolator=lanczos3 \
     --conf plugins/lighttable/export/pixel_interpolator_warp=bicubic \
-    --conf plugins/lighttable/export/iccintent=0 -d perf -d pipe -d opencl ${BENCH_ARGS:-} "$@" > "$OUT/$name.log" 2>&1
+    --conf plugins/lighttable/export/iccintent=0 -d perf -d pipe -d opencl -d slang ${BENCH_ARGS:-} "$@" > "$OUT/$name.log" 2>&1
   echo "$name exit $?"
 }
 run cpu    --disable-opencl --conf slang_gpu=FALSE

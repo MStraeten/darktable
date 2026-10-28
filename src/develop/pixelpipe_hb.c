@@ -1885,7 +1885,7 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
 #ifdef HAVE_SLANG_GPU
   if(pipe->slang_tiling && !bcaching)
   {
-    dt_print_pipe(DT_DEBUG_PIPE,
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG,
                   "process tiles slang",
                   pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "%s%s%s",
                   dt_iop_colorspace_to_name(cst_to),
@@ -1893,7 +1893,7 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                   cst_to != cst_out ? dt_iop_colorspace_to_name(cst_out) : "");
     tiled_on_slang = !default_process_tiling_slang(module, piece, tmp, *output, roi_in, roi_out, in_bpp);
     if(!tiled_on_slang)
-      dt_print_pipe(DT_DEBUG_PIPE, "slang fallback",
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "slang fallback",
                     pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "running on the CPU");
   }
   pipe->slang_tiling = FALSE;
@@ -2086,7 +2086,7 @@ static gboolean _slang_sync_host(dt_dev_pixelpipe_t *pipe)
   if(!pipe->slang_image || pipe->slang_host_valid) return TRUE;
   if(dt_slang_gpu_image_read(pipe->slang_image, pipe->slang_host))
   {
-    dt_print_pipe(DT_DEBUG_OPENCL | DT_DEBUG_PIPE, "slang read failure",
+    dt_print_pipe(DT_DEBUG_SLANG | DT_DEBUG_PIPE, "slang read failure",
                   pipe, NULL, DT_DEVICE_NONE, NULL, NULL, "can't copy an image back to the host");
     return FALSE;
   }
@@ -2254,7 +2254,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     if(resident && !_slang_sync_host(pipe)) return -1;
     _slang_release(pipe);
     pipe->slang_tiling = !raw_u16 && _piece_may_tile(piece);
-    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_TILING,
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG | DT_DEBUG_TILING,
                   pipe->slang_tiling ? "slang tiling" : "slang too large",
                   pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "needs %zuMB of %zuMB",
                   (size_t)needed / DT_MEGA, available / DT_MEGA);
@@ -2362,7 +2362,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   if(blending) dt_slang_gpu_image_free(dev_module);
   if(!ok)
   {
-    dt_print_pipe(DT_DEBUG_PIPE, "slang fallback",
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "slang fallback",
                   pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "running on OpenCL or the CPU");
     // kernels the module started may still write to an output in the cacheline
     dt_slang_gpu_wait();

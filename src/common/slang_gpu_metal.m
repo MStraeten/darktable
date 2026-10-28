@@ -92,13 +92,13 @@ static gboolean _init_device(void)
   _mtl.dev = MTLCreateSystemDefaultDevice();
   if(!_mtl.dev)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] no Metal device");
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Metal device");
     return FALSE;
   }
   _mtl.queue = [_mtl.dev newCommandQueue];
   if(!_mtl.queue)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't create a command queue on %s", _mtl.dev.name.UTF8String);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't create a command queue on %s", _mtl.dev.name.UTF8String);
     return FALSE;
   }
   // the 2D texture limit of the Metal feature set tables
@@ -112,7 +112,7 @@ static gboolean _init_device(void)
   // shared storage is system memory on a discrete GPU, so kernels working
   // there would read and write every pixel over PCIe
   _mtl.private_storage = !_mtl.dev.hasUnifiedMemory || dt_conf_get_bool("slang_gpu_private_memory");
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] using Metal device %s%s%s", _mtl.dev.name.UTF8String,
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] using Metal device %s%s%s", _mtl.dev.name.UTF8String,
            _mtl.dev.hasUnifiedMemory ? " (unified memory)" : "",
            _mtl.private_storage ? ", images in private storage" : "");
   return TRUE;
@@ -253,7 +253,7 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
     lib = [_mtl.dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
     if(!lib)
     {
-      dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't load %s: %s", path.UTF8String,
+      dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't load %s: %s", path.UTF8String,
                error.localizedDescription.UTF8String);
       return nil;
     }
@@ -263,7 +263,7 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
   id<MTLFunction> fn = [lib newFunctionWithName:@(entry)];
   if(!fn)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] no kernel %s in %s.metallib", entry, name.UTF8String);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no kernel %s in %s.metallib", entry, name.UTF8String);
     return nil;
   }
   MTLComputePipelineReflection *refl = nil;
@@ -274,13 +274,13 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
                                                         error:&error];
   if(!k->pipeline)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't create the pipeline for %s: %s", entry,
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't create the pipeline for %s: %s", entry,
              error.localizedDescription.UTF8String);
     return nil;
   }
   if(!_reflect(refl, k))
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't find the parameters of %s in %s.metallib", entry,
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't find the parameters of %s in %s.metallib", entry,
              name.UTF8String);
     return nil;
   }
@@ -626,7 +626,7 @@ static gboolean _download(DtSlangImage *img, id<MTLBuffer> src, void *host, cons
   _commit(cb);
   if(!_finish())
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this %s or the copy from the device failed",
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] a kernel writing this %s or the copy from the device failed",
              img ? "image" : "buffer");
     if(!wrapped) _staging_put(dst);
     return FALSE;
@@ -687,7 +687,7 @@ static int _run(const char *program,
       {
         if(!_image_fits(arg->width, arg->height, arg->channels))
         {
-          dt_print(DT_DEBUG_OPENCL, "[slang_gpu] %dx%d image too large for %s", arg->width, arg->height, entry);
+          dt_print(DT_DEBUG_SLANG, "[slang_gpu] %dx%d image too large for %s", arg->width, arg->height, entry);
           return 1;
         }
         host_out |= arg->kind == DT_SLANG_ARG_IMAGE_OUT;
@@ -753,7 +753,7 @@ static int _run(const char *program,
 
   if(!_finish())
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] running %s failed", entry);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] running %s failed", entry);
     return 1;
   }
   for(int t = 0; t < ntex; t++)
@@ -767,11 +767,11 @@ static int _run(const char *program,
 
 failed:
   if(enc) [enc endEncoding];
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] running %s failed", entry);
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] running %s failed", entry);
   return 1;
 
 mismatch:
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] arguments don't match the parameters of %s:"
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] arguments don't match the parameters of %s:"
            " %d images, %d buffers and %d values expected", entry, k->ntex, k->nbuf, k->nvals);
   return 1;
 }
@@ -846,7 +846,7 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
       img = _image_new(width, height, channels, host);
   }
   g_mutex_unlock(&_mtl_lock);
-  if(!img) dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a %dx%d device image", width, height);
+  if(!img) dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't allocate a %dx%d device image", width, height);
   return img ? (__bridge_retained dt_slang_gpu_image_t *)img : NULL;
 }
 
@@ -984,7 +984,7 @@ int dt_slang_gpu_image_read(dt_slang_gpu_image_t *image, void *host)
   g_mutex_unlock(&_mtl_lock);
   if(!ok)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this image failed");
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] a kernel writing this image failed");
     return 1;
   }
   const size_t row = sizeof(float) * img->channels * img->width;
@@ -1104,7 +1104,7 @@ static dt_slang_gpu_buffer_t *_buffer_new(const size_t size, const void *host, c
     }
   }
   g_mutex_unlock(&_mtl_lock);
-  if(!buf) dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
+  if(!buf) dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
   return buf ? (__bridge_retained dt_slang_gpu_buffer_t *)buf : NULL;
 }
 
@@ -1152,7 +1152,7 @@ int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buffer, void *host, const si
   g_mutex_unlock(&_mtl_lock);
   if(!ok)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] a kernel writing this buffer failed");
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] a kernel writing this buffer failed");
     return 1;
   }
   memcpy(host, buf->buffer.contents, size);

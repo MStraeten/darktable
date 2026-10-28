@@ -37,7 +37,7 @@ static void _stop(void)
 void dt_slang_gpu_report_error(const char *what, const gboolean fatal)
 {
   const int count = g_atomic_int_add(&_errors, 1) + 1;
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] device error %d: %s%s", count, what,
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] device error %d: %s%s", count, what,
            fatal ? ", the device can't be used any more" : "");
   if(fatal) _stop();
 }

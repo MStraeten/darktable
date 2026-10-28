@@ -493,12 +493,12 @@ static int usage(const char *argv0)
          "    act_on, ai, cache, camctl, camsupport, control, dev, expose,\n"
          "    hdr_merge, imageio, input, ioporder, lighttable, lua, masks,\n"
          "    memory, nan, opencl, params, perf, pipe, print, pwstorage,\n"
-         "    signal, sql, tiling, picker, undo\n"
+         "    signal, slang, sql, tiling, picker, undo\n"
          "\n"
          "    It is also possible to specify names that activate all channels\n"
          "    or a certain subset, as well as increase verbosity:\n"
          "    all     -> to debug all channels\n"
-         "    common  -> to debug imageio, opencl, params, pipe, lua and ai\n"
+         "    common  -> to debug imageio, opencl, slang, params, pipe, lua and ai\n"
          "    verbose -> when combined with debug options like '-d opencl'\n"
          "               provides more detailed output. To activate verbosity,\n"
          "               use the additional option '-d verbose'\n"
@@ -1550,6 +1550,7 @@ int dt_init(int argc,
           !strcmp(darg, "picker") ? DT_DEBUG_PICKER :
           !strcmp(darg, "ai") ? DT_DEBUG_AI : // AI related stuff.
           !strcmp(darg, "hdr_merge") ? DT_DEBUG_HDR_MERGE : // HDR bracket merge + auto-alignment
+          !strcmp(darg, "slang") ? DT_DEBUG_SLANG : // gpu accel via the Slang kernels
           0;
         if(dadd)
           darktable.unmuted |= dadd;

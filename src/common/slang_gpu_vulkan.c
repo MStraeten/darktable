@@ -121,7 +121,7 @@ static gboolean _init_device(void)
                                      .pApplicationInfo = &app };
   if(vkCreateInstance(&ici, NULL, &_vk.instance) != VK_SUCCESS)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] no Vulkan instance");
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Vulkan instance");
     return FALSE;
   }
 
@@ -129,7 +129,7 @@ static gboolean _init_device(void)
   vkEnumeratePhysicalDevices(_vk.instance, &ndev, NULL);
   if(ndev == 0)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] no Vulkan device");
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Vulkan device");
     return FALSE;
   }
   VkPhysicalDevice *devs = g_new(VkPhysicalDevice, ndev);
@@ -158,7 +158,7 @@ static gboolean _init_device(void)
       : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
       : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 1
       : 0;
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] Vulkan device %u: %s, %s, vendor 0x%04x%s", d, props.deviceName,
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] Vulkan device %u: %s, %s, vendor 0x%04x%s", d, props.deviceName,
              props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
              : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
              : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? "virtual"
@@ -171,7 +171,7 @@ static gboolean _init_device(void)
     }
   }
   if((wanted_name || by_index) && best_rank < 4)
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] no Vulkan device matches slang_gpu_device '%s'", wanted);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Vulkan device matches slang_gpu_device '%s'", wanted);
   g_free(wanted_name);
   _vk.pdev = devs[best];
   g_free(devs);
@@ -183,7 +183,7 @@ static gboolean _init_device(void)
   _vk.push_size = MIN(DT_SLANG_PUSH_SIZE, props.limits.maxPushConstantsSize);
   vkGetPhysicalDeviceMemoryProperties(_vk.pdev, &_vk.memprops);
   for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] memory heap %u: %" PRIu64 " MB%s", h,
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] memory heap %u: %" PRIu64 " MB%s", h,
              (uint64_t)(_vk.memprops.memoryHeaps[h].size >> 20),
              _vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? ", device local" : "");
   for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
@@ -202,7 +202,7 @@ static gboolean _init_device(void)
   vkGetPhysicalDeviceFeatures(_vk.pdev, &features);
   if(!features.shaderStorageImageWriteWithoutFormat)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] %s can't write images without a format", props.deviceName);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] %s can't write images without a format", props.deviceName);
     return FALSE;
   }
 
@@ -219,7 +219,7 @@ static gboolean _init_device(void)
   g_free(fam);
   if(family == UINT32_MAX)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] %s has no compute queue", props.deviceName);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] %s has no compute queue", props.deviceName);
     return FALSE;
   }
 
@@ -237,7 +237,7 @@ static gboolean _init_device(void)
                                    .pEnabledFeatures = &enable };
   if(vkCreateDevice(_vk.pdev, &dci, NULL, &_vk.dev) != VK_SUCCESS)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't create a device on %s", props.deviceName);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't create a device on %s", props.deviceName);
     return FALSE;
   }
   vkGetDeviceQueue(_vk.dev, family, 0, &_vk.queue);
@@ -249,7 +249,7 @@ static gboolean _init_device(void)
   if(vkCreateCommandPool(_vk.dev, &cpci, NULL, &_vk.pool) != VK_SUCCESS) return FALSE;
 
   _vk.kernels = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, _destroy_kernel);
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] using Vulkan device %s", props.deviceName);
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] using Vulkan device %s", props.deviceName);
   return TRUE;
 }
 
@@ -434,7 +434,7 @@ static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry)
   gsize len = 0;
   if(!g_file_get_contents(spv, &code, &len, NULL) || len % 4)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't read %s", spv);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't read %s", spv);
     g_free(spv);
     g_free(key);
     g_free(code);
@@ -444,7 +444,7 @@ static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry)
   k = g_new0(dt_slang_kernel_t, 1);
   if(!_reflect((const uint32_t *)code, len / 4, entry, k))
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't find the parameters of %s in %s", entry, spv);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't find the parameters of %s in %s", entry, spv);
     goto error;
   }
 
@@ -480,7 +480,7 @@ static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry)
   };
   if(vkCreateComputePipelines(_vk.dev, VK_NULL_HANDLE, 1, &cpci, NULL, &k->pipeline) != VK_SUCCESS)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't create the pipeline for %s", entry);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't create the pipeline for %s", entry);
     goto error;
   }
 
@@ -1073,7 +1073,7 @@ static void _wait_until(const uint64_t serial)
 static gboolean _reclaim(void)
 {
   if(!_vk.images && !_vk.buffers && !_vk.doomed_images && !_vk.doomed_buffers) return FALSE;
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] out of device memory, freeing the pooled images and buffers");
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] out of device memory, freeing the pooled images and buffers");
   _wait_all();
   _vk.doomed_images = g_list_concat(_vk.doomed_images, _vk.images);
   _vk.doomed_buffers = g_list_concat(_vk.doomed_buffers, _vk.buffers);
@@ -1140,7 +1140,7 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
   while(found < need && (evicted = _evict_oldest(&until))) found += evicted;
   if(found == 0) return;
 
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] freeing %" PRIu64 " MB of pooled memory for %" PRIu64 " MB,"
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] freeing %" PRIu64 " MB of pooled memory for %" PRIu64 " MB,"
            " %" PRIu64 " of %" PRIu64 " MB used", (uint64_t)(found >> 20), (uint64_t)(size >> 20),
            (uint64_t)(budget.heapUsage[heap] >> 20), (uint64_t)(budget.heapBudget[heap] >> 20));
   _wait_until(until);
@@ -1284,7 +1284,7 @@ static dt_slang_gpu_buffer_t *_buffer_acquire(const size_t size)
   buf->size = size;
   if(!_alloc_device(&buf->mem, size))
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't allocate a device buffer of %zu bytes", size);
     _buffer_free(buf);
     return NULL;
   }
@@ -1415,7 +1415,7 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
   if(ok && host) ok = _image_transfer(img, (void *)host, TRUE) == 0;
   if(!ok)
   {
-    dt_print(DT_DEBUG_OPENCL, "[slang_gpu] can't allocate a %dx%d device image", width, height);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't allocate a %dx%d device image", width, height);
     _wait_all();
     _image_free(img);
     img = NULL;
@@ -1628,7 +1628,7 @@ static int _run(const char *program,
        && (arg->width > _vk.max_image_dim || arg->height > _vk.max_image_dim
            || (arg->channels != 1 && arg->channels != 4)))
     {
-      dt_print(DT_DEBUG_OPENCL, "[slang_gpu] %dx%d image too large for %s", arg->width, arg->height, entry);
+      dt_print(DT_DEBUG_SLANG, "[slang_gpu] %dx%d image too large for %s", arg->width, arg->height, entry);
       return 1;
     }
     if(arg->kind == DT_SLANG_ARG_IMAGE_OUT) host_out = TRUE;
@@ -1773,11 +1773,11 @@ done:
   if(b) _batch_release(b);
   for(int r = 0; r < nres; r++)
     if(readback[r]) _staging_release(readback[r]);
-  if(err) dt_print(DT_DEBUG_OPENCL, "[slang_gpu] running %s failed", entry);
+  if(err) dt_print(DT_DEBUG_SLANG, "[slang_gpu] running %s failed", entry);
   return err;
 
 mismatch:
-  dt_print(DT_DEBUG_OPENCL, "[slang_gpu] arguments don't match the parameters of %s:"
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] arguments don't match the parameters of %s:"
            " %d resources and %d values expected", entry, k->nres, k->nvals);
   return 1;
 }
