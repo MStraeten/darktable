@@ -153,10 +153,9 @@ void denoiseprofile_horiz(uint3 gid : SV_DispatchThreadID,
   _keep_q(U4_out, q, width);
   if(x >= width || y >= height) return;
 
-  // the same sum as the OpenCL kernel takes from its local buffer
   float distacc = 0.0f;
-  for(int pi = -P; pi <= P; pi++)
-    distacc += U4_in[y * width + clamp(x + pi, 0, width - 1)];
+  for(int pi = max(-P, -x); pi <= min(P, width - 1 - x); pi++)
+    distacc += U4_in[y * width + x + pi];
 
   U4_out[y * width + x] = distacc;
 }
@@ -177,8 +176,8 @@ void denoiseprofile_vert(uint3 gid : SV_DispatchThreadID,
   const int gidx = y * width + x;
 
   float distacc = 0.0f;
-  for(int pj = -P; pj <= P; pj++)
-    distacc += U4_in[clamp(y + pj, 0, height - 1) * width + x];
+  for(int pj = max(-P, -y); pj <= min(P, height - 1 - y); pj++)
+    distacc += U4_in[(y + pj) * width + x];
 
   distacc += U4_single_pixel[gidx] * (2 * P + 1) * (2 * P + 1) * central_pixel_weight;
   distacc /= (1.0f + central_pixel_weight);

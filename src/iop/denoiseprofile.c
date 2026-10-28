@@ -2681,9 +2681,12 @@ static int process_nlmeans_slang(dt_iop_module_t *self,
                                    SLARG(aa), SLARG(p), SLARG(bb), SLARG(wb));
   if(err) goto error;
 
+  // each pass adds the patches at q and -q, so of the row kj_index = 0 only
+  // the half with ki_index <= 0 runs, and every patch counts once as in
+  // nlmeans_denoise(); process_nlmeans_cl() counts that row twice
   for(int kj_index = -K; kj_index <= 0 && !err; kj_index++)
   {
-    for(int ki_index = -K; ki_index <= K && !err; ki_index++)
+    for(int ki_index = -K; ki_index <= (kj_index < 0 ? K : 0) && !err; ki_index++)
     {
       // see process_nlmeans_cl() for the choice of offsets
       const int abs_kj = abs(kj_index);
