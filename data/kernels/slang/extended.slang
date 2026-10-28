@@ -784,3 +784,126 @@ void colorbalance_cdl(uint3 gid : SV_DispatchThreadID,
   Lab.xyz = prophotorgb_to_Lab(RGB).xyz;
   out.write(int2(x, y), Lab);
 }
+
+#define COLORMAPPING_HISTN (1 << 11)
+#define COLORMAPPING_MAXN 5
+
+// inverse distance weighting according to D. Shepard's method, with power
+// parameter 2.0
+void _colormapping_clusters(const float4 col, const int n, StructuredBuffer<float2> mean,
+                            inout float weight[COLORMAPPING_MAXN])
+{
+  float mdist = float.maxValue;
+  for(int k = 0; k < n; k++)
+  {
+    const float dist2 = (col.y - mean[k].x) * (col.y - mean[k].x) + (col.z - mean[k].y) * (col.z - mean[k].y);
+    weight[k] = dist2 > 1.0e-6f ? 1.0f / dist2 : -1.0f; // direct hits marked as -1
+    if(dist2 < mdist) mdist = dist2;
+  }
+  // correction in case of direct hits
+  if(mdist < 1.0e-6f)
+    for(int k = 0; k < n; k++) weight[k] = weight[k] < 0.0f ? 1.0f : 0.0f;
+  float sum = 0.0f;
+  for(int k = 0; k < n; k++) sum += weight[k];
+  if(sum > 0.0f)
+    for(int k = 0; k < n; k++) weight[k] /= sum;
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colormapping_histogram(uint3 gid : SV_DispatchThreadID,
+                            uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                            uniform float equalization, uniform StructuredBuffer<int> target_hist,
+                            uniform StructuredBuffer<float> source_ihist)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float L = in.Areadpixel(x, y).x;
+  const int bin = int(clamp(COLORMAPPING_HISTN * L / 100.0f, 0.0f, COLORMAPPING_HISTN - 1.0f));
+  float dL = 0.5f * ((L * (1.0f - equalization) + source_ihist[target_hist[bin]] * equalization) - L) + 50.0f;
+  dL = clamp(dL, 0.0f, 100.0f);
+  out.write(int2(x, y), float4(dL, 0.0f, 0.0f, 0.0f));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colormapping_mapping(uint3 gid : SV_DispatchThreadID,
+                          uniform ImageIn in, uniform ImageIn tmp, uniform ImageOut out,
+                          uniform int width, uniform int height, uniform int clusters,
+                          uniform StructuredBuffer<float2> target_mean, uniform StructuredBuffer<float2> source_mean,
+                          uniform StructuredBuffer<float2> var_ratio, uniform StructuredBuffer<int> mapio)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float4 ipixel = in.Areadpixel(x, y);
+  const float dL = tmp.Areadpixel(x, y).x;
+  float weight[COLORMAPPING_MAXN];
+  float4 opixel = float4(0.0f);
+
+  opixel.x = 2.0f * (dL - 50.0f) + ipixel.x;
+  opixel.x = clamp(opixel.x, 0.0f, 100.0f);
+
+  _colormapping_clusters(ipixel, clusters, target_mean, weight);
+
+  for(int c = 0; c < clusters; c++)
+  {
+    opixel.y += weight[c] * ((ipixel.y - target_mean[c].x) * var_ratio[c].x + source_mean[mapio[c]].x);
+    opixel.z += weight[c] * ((ipixel.z - target_mean[c].y) * var_ratio[c].y + source_mean[mapio[c]].y);
+  }
+  opixel.w = ipixel.w;
+  out.write(int2(x, y), opixel);
+}
+
+// the three OpenCL kernels of global tonemap in one, as only drago reads the
+// parameters: 0 is reinhard, 1 filmic, 2 drago, as in the module's enum
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void global_tonemap(uint3 gid : SV_DispatchThreadID,
+                    uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                    uniform int op, uniform float4 parameters)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  const float l = pixel.x * 0.01f;
+
+  if(op == 2)
+  {
+    const float eps = parameters.x;
+    const float ldc = parameters.y;
+    const float bl = parameters.z;
+    const float lwmax = parameters.w;
+    pixel.x = 100.0f * (ldc * log(max(eps, l + 1.0f)) / log(max(eps, 2.0f + (dtcl_pow(l / lwmax, bl)) * 8.0f)));
+  }
+  else if(op == 1)
+  {
+    const float m = max(0.0f, l - 0.004f);
+    pixel.x = 100.0f * ((m * (6.2f * m + 0.5f)) / (m * (6.2f * m + 1.7f) + 0.06f));
+  }
+  else
+    pixel.x = 100.0f * (l / (1.0f + l));
+
+  out.write(int2(x, y), pixel);
+}
+
+// the largest L of each row, for drago's white point; the host takes the
+// largest of them. pixelmax_first and pixelmax_second do this in OpenCL.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void global_tonemap_rowmax(uint3 gid : SV_DispatchThreadID,
+                           uniform ImageIn in, uniform RWStructuredBuffer<float> rowmax,
+                           uniform int width, uniform int height)
+{
+  const int y = gid.y * 16 + gid.x;
+  if(y >= height) return;
+
+  float m = -float.maxValue;
+  for(int x = 0; x < width; x++) m = max(m, in.Areadpixel(x, y).x);
+  rowmax[y] = m;
+}

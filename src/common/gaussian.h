@@ -171,6 +171,19 @@ int dt_gaussian_blur_slang(dt_slang_gpu_image_t *dev_in,
                            const float max,
                            const float min);
 
+/** Like dt_gaussian_blur_cl() on a 4 channel device image of the Slang
+ *  kernels, clamping the input to min and max (4 floats each). Returns 0 on
+ *  success.
+ */
+int dt_gaussian_blur_4c_slang(dt_slang_gpu_image_t *dev_in,
+                              dt_slang_gpu_image_t *dev_out,
+                              const int width,
+                              const int height,
+                              const float sigma,
+                              const dt_gaussian_order_t order,
+                              const float *const max,
+                              const float *const min);
+
 /** Like dt_gaussian_mean_blur_cl(), in place on a device buffer of the Slang
  *  kernels holding 1, 2 or 4 floats per pixel. Returns 0 on success.
  */

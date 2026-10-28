@@ -22,6 +22,7 @@
 #include "common/debug.h"
 #include "common/gaussian.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -579,6 +580,75 @@ error:
   dt_bilateral_free_cl(b);
   dt_opencl_release_mem_object(dev_tmp);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_shadhi_data_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // the parameters of process_cl()
+  const float radius = fmaxf(0.1f, d->radius);
+  const float sigma = radius * roi_in->scale / piece->iscale;
+  const float shadows = 2.0f * fmin(fmax(-1.0f, (d->shadows / 100.0f)), 1.0f);
+  const float highlights = 2.0f * fmin(fmax(-1.0f, (d->highlights / 100.0f)), 1.0f);
+  const float whitepoint = fmax(1.0f - d->whitepoint / 100.0f, 0.01f);
+  const float compress = fmin(fmax(0.0f, (d->compress / 100.0f)), 0.99f);
+  const float shadows_ccorrect = (fmin(fmax(0.0f, (d->shadows_ccorrect / 100.0f)), 1.0f) - 0.5f) * sign(shadows)
+                                 + 0.5f;
+  const float highlights_ccorrect = (fmin(fmax(0.0f, (d->highlights_ccorrect / 100.0f)), 1.0f) - 0.5f)
+                                    * sign(-highlights) + 0.5f;
+  const float low_approximation = d->low_approximation;
+  const unsigned int flags = d->flags;
+  const int unbound_mask = ((d->shadhi_algo == SHADHI_ALGO_BILATERAL) && (flags & UNBOUND_BILATERAL))
+                           || ((d->shadhi_algo == SHADHI_ALGO_GAUSSIAN) && (flags & UNBOUND_GAUSSIAN));
+
+  // the blurred image goes to tmp, which the mix then reads with dev_in
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  int err = !tmp;
+
+  if(!err && d->shadhi_algo == SHADHI_ALGO_GAUSSIAN)
+  {
+    dt_aligned_pixel_t Labmax = { 100.0f, 128.0f, 128.0f, 1.0f };
+    dt_aligned_pixel_t Labmin = { 0.0f, -128.0f, -128.0f, 0.0f };
+    if(unbound_mask)
+    {
+      for(int k = 0; k < 4; k++) Labmax[k] = FLT_MAX;
+      for(int k = 0; k < 4; k++) Labmin[k] = -FLT_MAX;
+    }
+    err = dt_gaussian_blur_4c_slang(dev_in, tmp, width, height, sigma, d->order, Labmax, Labmin);
+  }
+  else if(!err)
+  {
+    const float sigma_r = 100.0f; // does not depend on scale
+    const float detail = -1.0f;   // we want the bilateral base layer
+    dt_bilateral_slang_t *b = dt_bilateral_init_slang(width, height, sigma, sigma_r);
+    err = !b
+      || dt_bilateral_splat_slang(b, dev_in)
+      || dt_bilateral_blur_slang(b)
+      || dt_bilateral_slice_slang(b, dev_in, tmp, detail);
+    dt_bilateral_free_slang(b);
+  }
+
+  err = err
+    || dt_slang_gpu_run_2d_args("gaussian", "shadows_highlights_mix", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+         SLARG(shadows), SLARG(highlights), SLARG(compress), SLARG(shadows_ccorrect),
+         SLARG(highlights_ccorrect), SLARG(flags), SLARG(unbound_mask), SLARG(low_approximation),
+         SLARG(whitepoint));
+
+  dt_slang_gpu_image_free(tmp);
+  return !err;
 }
 #endif
 

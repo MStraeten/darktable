@@ -362,8 +362,24 @@ gboolean process_slang(dt_iop_module_t *self,
 {
   const dt_iop_bilat_data_t *d = piece->data;
 
-  // the bilateral grid mode runs on the CPU
-  if(d->mode != s_mode_local_laplacian || roi_in->width < 2 || roi_in->height < 2) return FALSE;
+  if(d->mode == s_mode_bilateral)
+  {
+    // the total scale is composed of scale before input to the pipeline (iscale),
+    // and the scale of the roi.
+    const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+    const float sigma_r = d->sigma_r; // does not depend on scale
+    const float sigma_s = d->sigma_s / scale;
+
+    dt_bilateral_slang_t *b = dt_bilateral_init_slang(roi_in->width, roi_in->height, sigma_s, sigma_r);
+    const int err = !b
+      || dt_bilateral_splat_slang(b, dev_in)
+      || dt_bilateral_blur_slang(b)
+      || dt_bilateral_slice_slang(b, dev_in, dev_out, d->detail);
+    dt_bilateral_free_slang(b);
+    return !err;
+  }
+
+  if(roi_in->width < 2 || roi_in->height < 2) return FALSE;
 
   return !_local_laplacian_slang(dev_in, dev_out, roi_in->width, roi_in->height,
                                  d->midtone, d->sigma_s, d->sigma_r, d->detail);

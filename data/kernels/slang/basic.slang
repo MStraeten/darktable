@@ -1877,3 +1877,57 @@ void borders(uint3 gid : SV_DispatchThreadID,
     pixel = in.Areadpixel(x - in_x, y - in_y);
   out.write(int2(x, y), pixel);
 }
+
+float _monochrome_envelope(const float L)
+{
+  const float x = clipf(L / 100.0f);
+  const float beta = 0.6f;
+  if(x < beta)
+  {
+    const float tmp = abs(x / beta - 1.0f);
+    return 1.0f - tmp * tmp;
+  }
+  else
+  {
+    const float tmp1 = (1.0f - x) / (1.0f - beta);
+    const float tmp2 = tmp1 * tmp1;
+    const float tmp3 = tmp2 * tmp1;
+    return 3.0f * tmp2 - 2.0f * tmp3;
+  }
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void monochrome_filter(uint3 gid : SV_DispatchThreadID,
+                       uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                       uniform float a, uniform float b, uniform float size)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  pixel.x = 100.0f * dt_fast_expf(-clipf((fsquare(pixel.y - a) + fsquare(pixel.z - b)) / (2.0f * size)));
+  out.write(int2(x, y), pixel);
+}
+
+// the OpenCL kernel also takes the a, b and size of the filter, which it
+// never uses
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void monochrome(uint3 gid : SV_DispatchThreadID,
+                uniform ImageIn in, uniform ImageIn base, uniform ImageOut out,
+                uniform int width, uniform int height, uniform float highlights)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  const float4 basep = base.Areadpixel(x, y);
+  const float tt = _monochrome_envelope(pixel.x);
+  const float t = tt + (1.0f - tt) * (1.0f - highlights);
+  pixel.x = lerp(pixel.x, pixel.x * basep.x / 100.0f, t);
+  pixel.y = pixel.z = 0.0f;
+  out.write(int2(x, y), pixel);
+}

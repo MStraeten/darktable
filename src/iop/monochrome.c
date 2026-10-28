@@ -24,6 +24,7 @@
 #include "common/colorspaces.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -301,6 +302,46 @@ error:
   dt_opencl_release_mem_object(dev_tmp);
   if(b) dt_bilateral_free_cl(b);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_monochrome_data_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const float sigma2 = (d->size * 128.0) * (d->size * 128.0f);
+
+  const float scale = piece->iscale / roi_in->scale;
+  const float sigma_r = 250.0f; // does not depend on scale
+  const float sigma_s = 20.0f / scale;
+  const float detail = -1.0f; // bilateral base layer
+
+  // as in process_cl(): the filtered image in dev_out is the base layer's
+  // source, and tmp holds the base layer
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, NULL);
+  dt_bilateral_slang_t *b = dt_bilateral_init_slang(roi_in->width, roi_in->height, sigma_s, sigma_r);
+  const int err = !tmp || !b
+    || dt_slang_gpu_run_2d_args("basic", "monochrome_filter", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(d->a), SLARG(d->b),
+         SLARG(sigma2))
+    || dt_bilateral_splat_slang(b, dev_out)
+    || dt_bilateral_blur_slang(b)
+    || dt_bilateral_slice_slang(b, dev_out, tmp, detail)
+    || dt_slang_gpu_run_2d_args("basic", "monochrome", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+         SLARG(d->highlights));
+  dt_bilateral_free_slang(b);
+  dt_slang_gpu_image_free(tmp);
+  return !err;
 }
 #endif
 

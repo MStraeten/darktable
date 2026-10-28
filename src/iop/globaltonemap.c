@@ -21,6 +21,7 @@
 #include "common/bilateralcl.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -519,6 +520,111 @@ finally:
   dt_opencl_release_mem_object(dev_r);
   dt_free_align(maximum);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_global_tonemap_data_t *d = piece->data;
+  dt_iop_global_tonemap_gui_data_t *g = self->gui_data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const int op = d->operator;
+  float parameters[4] = { 0.0f };
+
+  if(d->operator == OPERATOR_DRAGO)
+  {
+    const float eps = 0.0001f;
+    float tmp_lwmax = -FLT_MAX;
+
+    // see comments in process() about lwmax value
+    if(self->dev->gui_attached && g && dt_pipe_is_full(piece->pipe))
+    {
+      dt_iop_gui_enter_critical_section(self);
+      const dt_hash_t hash = g->hash;
+      dt_iop_gui_leave_critical_section(self);
+      if(hash != DT_INVALID_HASH && !dt_dev_sync_pixelpipe_hash(self->dev, piece->pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL, &self->gui_lock, &g->hash))
+        dt_control_log(_("inconsistent output"));
+
+      dt_iop_gui_enter_critical_section(self);
+      tmp_lwmax = g->lwmax;
+      dt_iop_gui_leave_critical_section(self);
+    }
+
+    if(tmp_lwmax == -FLT_MAX)
+    {
+      const int rows = roi_in->height;
+      float *rowmax = dt_alloc_align_float(rows);
+      dt_slang_gpu_buffer_t *dev_rowmax = dt_slang_gpu_buffer_new_uninit(sizeof(float) * rows);
+      const int err = !rowmax || !dev_rowmax
+        || dt_slang_gpu_run_1d_args("extended", "global_tonemap_rowmax", rows,
+             SLIMG_DEV(dev_in), SLBUF_DEV(dev_rowmax), SLARG(roi_in->width), SLARG(rows))
+        || dt_slang_gpu_buffer_read(dev_rowmax, rowmax, sizeof(float) * rows);
+      dt_slang_gpu_buffer_free(dev_rowmax);
+      if(err)
+      {
+        dt_free_align(rowmax);
+        return FALSE;
+      }
+      float maximum = -FLT_MAX;
+      for(int k = 0; k < rows; k++) maximum = fmaxf(maximum, rowmax[k]);
+      dt_free_align(rowmax);
+      tmp_lwmax = MAX(eps, (maximum * 0.01f));
+    }
+
+    const float lwmax = tmp_lwmax;
+    const float ldc = d->drago.max_light * 0.01f / log10f(lwmax + 1.0f);
+    const float bl = logf(MAX(eps, d->drago.bias)) / logf(0.5f);
+
+    parameters[0] = eps;
+    parameters[1] = ldc;
+    parameters[2] = bl;
+    parameters[3] = lwmax;
+
+    if(self->dev->gui_attached && g && dt_pipe_is_preview(piece->pipe))
+    {
+      dt_hash_t hash = dt_dev_hash_plus(self->dev, piece->pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL);
+      dt_iop_gui_enter_critical_section(self);
+      g->lwmax = lwmax;
+      g->hash = hash;
+      dt_iop_gui_leave_critical_section(self);
+    }
+  }
+
+  const float scale = piece->iscale / roi_in->scale;
+  const float sigma_r = 8.0f; // does not depend on scale
+  const float iw = piece->buf_in.width / scale;
+  const float ih = piece->buf_in.height / scale;
+  const float sigma_s = fminf(iw, ih) * 0.03f;
+
+  // the detail comes from the unchanged input, and is added to the output
+  // after the tone mapping
+  dt_bilateral_slang_t *b = NULL;
+  int err = 0;
+  if(d->detail != 0.0f)
+  {
+    b = dt_bilateral_init_slang(roi_in->width, roi_in->height, sigma_s, sigma_r);
+    err = !b || dt_bilateral_splat_slang(b, dev_in);
+  }
+
+  err = err
+    || dt_slang_gpu_run_2d_args("extended", "global_tonemap", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(op), SLARG(parameters));
+
+  if(!err && d->detail != 0.0f)
+    err = dt_bilateral_blur_slang(b)
+      || dt_bilateral_slice_to_output_slang(b, dev_in, dev_out, d->detail);
+
+  dt_bilateral_free_slang(b);
+  return !err;
 }
 #endif
 

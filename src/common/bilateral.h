@@ -69,6 +69,40 @@ void dt_bilateral_slice_to_output(const dt_bilateral_t *const b, const float *co
 
 void dt_bilateral_free(dt_bilateral_t *b);
 
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+
+// the bilateral grid on the device of the Slang kernels, as
+// src/common/bilateralcl.c does it for OpenCL. The int functions return 0
+// on success.
+typedef struct dt_bilateral_slang_t
+{
+  int width, height;
+  int size_x, size_y, size_z;
+  float sigma_s, sigma_r;
+  float sigma_s_inv, sigma_r_inv;
+  dt_slang_gpu_buffer_t *grid, *grid_tmp;
+} dt_bilateral_slang_t;
+
+dt_bilateral_slang_t *dt_bilateral_init_slang(const int width,      // width of input image
+                                              const int height,     // height of input image
+                                              const float sigma_s,  // spatial sigma (blur pixel coords)
+                                              const float sigma_r); // range sigma (blur luma values)
+
+int dt_bilateral_splat_slang(dt_bilateral_slang_t *b, dt_slang_gpu_image_t *in);
+
+int dt_bilateral_blur_slang(dt_bilateral_slang_t *b);
+
+int dt_bilateral_slice_slang(dt_bilateral_slang_t *b, dt_slang_gpu_image_t *in,
+                             dt_slang_gpu_image_t *out, const float detail);
+
+// out already holds the image the detail is added to
+int dt_bilateral_slice_to_output_slang(dt_bilateral_slang_t *b, dt_slang_gpu_image_t *in,
+                                       dt_slang_gpu_image_t *out, const float detail);
+
+void dt_bilateral_free_slang(dt_bilateral_slang_t *b);
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent
