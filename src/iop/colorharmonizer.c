@@ -582,6 +582,77 @@ void cleanup_global(dt_iop_module_so_t *self)
   self->data = NULL;
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorharmonizer_data_t *const d = piece->data;
+  const dt_iop_colorharmonizer_params_t *const p = &d->params;
+
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  if(!work_profile) return FALSE;
+
+  dt_colormatrix_t input_matrix, output_matrix;
+  dt_colormatrix_mul(input_matrix, XYZ_D50_to_D65_CAT16, work_profile->matrix_in);
+  dt_colormatrix_mul(output_matrix, work_profile->matrix_out, XYZ_D65_to_D50_CAT16);
+
+  float node_saturation[COLORHARMONIZER_MAX_NODES];
+  for(int i = 0; i < COLORHARMONIZER_MAX_NODES; i++) node_saturation[i] = p->node_saturation[i];
+
+  const int num_nodes = d->num_nodes;
+  const float pull_width = p->pull_width;
+  const float pull_strength = p->pull_strength;
+  const float neutral_protection = p->neutral_protection;
+  const float L_white = Y_to_dt_UCS_L_star(1.0f);
+
+  // the passes of process_cl(), with the corrections as 2 floats per pixel
+  dt_slang_gpu_buffer_t *corrections = dt_slang_gpu_buffer_new_uninit((size_t)width * height * 2 * sizeof(float));
+  dt_slang_gpu_buffer_t *jch = dt_slang_gpu_buffer_new_uninit((size_t)width * height * 4 * sizeof(float));
+
+  gboolean ok = corrections && jch
+    && !dt_slang_gpu_run_2d_args("colorharmonizer", "colorharmonizer_map", width, height,
+                                 SLIMG_DEV(dev_in), SLBUF_DEV(corrections), SLBUF_DEV(jch),
+                                 SLARG(width), SLARG(height), SLBUF(input_matrix, sizeof(input_matrix)),
+                                 SLBUF(d->nodes, sizeof(d->nodes)), SLARG(num_nodes), SLARG(pull_width),
+                                 SLBUF(node_saturation, sizeof(node_saturation)), SLARG(L_white));
+
+  if(ok && p->smoothing > 0.0f)
+  {
+    const float sigma = p->smoothing * fmaxf(1.5f, 8.0f * roi_in->scale / piece->iscale)
+                        * fmaxf(1.0f, pull_width);
+    ok = !dt_gaussian_mean_blur_slang(corrections, width, height, 2, sigma);
+  }
+
+  ok = ok
+    && !dt_slang_gpu_run_2d_args("colorharmonizer", "colorharmonizer_apply", width, height,
+                                 SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLBUF(output_matrix, sizeof(output_matrix)), SLBUF_DEV(jch),
+                                 SLBUF_DEV(corrections), SLARG(pull_strength), SLARG(neutral_protection),
+                                 SLARG(L_white));
+
+  dt_slang_gpu_buffer_free(corrections);
+  dt_slang_gpu_buffer_free(jch);
+
+  if(ok && self->gui_data && dt_pipe_is_preview(piece->pipe))
+  {
+    float *host_in = dt_alloc_align_float((size_t)width * height * 4);
+    if(host_in && !dt_slang_gpu_image_read(dev_in, host_in))
+      _update_histogram(self, piece, host_in, roi_in);
+    dt_free_align(host_in);
+  }
+  return ok;
+}
+#endif
+
 #ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
