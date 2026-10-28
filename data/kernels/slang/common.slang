@@ -264,8 +264,13 @@ public struct ImageOut
 // near zero that the callers need
 public float dt_log1p(float x)
 {
+  // Vulkan only bounds the absolute error of log() near 1, to 2^-21, which
+  // is a large relative error for a small x: use the series there instead
+  if(abs(x) < 0.0625f)
+    return x * (1.0f - x * (1.0f / 2.0f - x * (1.0f / 3.0f - x * (1.0f / 4.0f - x * (1.0f / 5.0f
+             - x * (1.0f / 6.0f - x * (1.0f / 7.0f - x * (1.0f / 8.0f))))))));
   const float u = 1.0f + x;
-  return u == 1.0f ? x : log(u) * x / (u - 1.0f);
+  return log(u) * x / (u - 1.0f);
 }
 
 public float dt_expm1(float x)
