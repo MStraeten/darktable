@@ -768,7 +768,8 @@ gboolean process_slang(dt_iop_module_t *self,
 
   if(!filters
      || (dmode != DT_IOP_HIGHLIGHTS_OPPOSED && dmode != DT_IOP_HIGHLIGHTS_CLIP
-         && dmode != DT_IOP_HIGHLIGHTS_LCH)
+         && dmode != DT_IOP_HIGHLIGHTS_LCH && dmode != DT_IOP_HIGHLIGHTS_LAPLACIAN)
+     || (dmode == DT_IOP_HIGHLIGHTS_LAPLACIAN && filters == 9u)
      // process_lch_bayer() reads its input with the output's size
      || (dmode == DT_IOP_HIGHLIGHTS_LCH
          && (roi_in->width != roi_out->width || roi_in->height != roi_out->height))
@@ -787,6 +788,14 @@ gboolean process_slang(dt_iop_module_t *self,
   gboolean ok;
   if(dmode == DT_IOP_HIGHLIGHTS_OPPOSED)
     ok = process_opposed_slang(self, piece, dev_in, dev_out, roi_in, roi_out);
+  else if(dmode == DT_IOP_HIGHLIGHTS_LAPLACIAN)
+  {
+    const float clipper = d->clip * highlights_clip_magics[dmode];
+    const dt_aligned_pixel_t clips = { clipper * pipe->dsc.processed_maximum[0],
+                                       clipper * pipe->dsc.processed_maximum[1],
+                                       clipper * pipe->dsc.processed_maximum[2], clipper };
+    ok = process_laplacian_bayer_slang(self, piece, dev_in, dev_out, roi_in, clips);
+  }
   else if(dmode == DT_IOP_HIGHLIGHTS_LCH)
   {
     const float clipper = d->clip * highlights_clip_magics[dmode];
