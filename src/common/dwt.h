@@ -141,6 +141,38 @@ cl_int dwt_decompose_cl(dwt_params_cl_t *p, _dwt_layer_func_cl layer_func);
 
 #endif
 
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+
+/* the dwt_params_cl_t counterpart for 4-channel images of the Slang kernels */
+typedef struct dwt_params_slang_t
+{
+  dt_slang_gpu_image_t *image;
+  int width;
+  int height;
+  int scales;
+  int return_layer;
+  int merge_from_scale;
+  void *user_data;
+  float preview_scale;
+} dwt_params_slang_t;
+
+/* layer_func may change layer in place, and returns 0 on success */
+typedef int(_dwt_layer_func_slang)(dt_slang_gpu_image_t *layer, dwt_params_slang_t *const p, const int scale);
+
+dwt_params_slang_t *dt_dwt_init_slang(dt_slang_gpu_image_t *image, const int width, const int height,
+                                      const int scales, const int return_layer, const int merge_from_scale,
+                                      void *user_data, const float preview_scale);
+void dt_dwt_free_slang(dwt_params_slang_t *p);
+
+int dwt_get_max_scale_slang(dwt_params_slang_t *p);
+
+int dt_dwt_first_scale_visible_slang(dwt_params_slang_t *p);
+
+/* dwt_decompose() on the device. Returns 0 on success. */
+int dwt_decompose_slang(dwt_params_slang_t *p, _dwt_layer_func_slang layer_func);
+#endif
+
 #endif
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
