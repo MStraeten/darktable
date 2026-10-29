@@ -1028,6 +1028,48 @@ void clip_rotate(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), pixel);
 }
 
+// the copy and the warp of liquify in one, as process() of src/iop/liquify.c
+// does them: pixels of the map extent that the map moves are sampled at
+// their warped position, the rest copied. kwidth and lanczos are those of
+// clip_rotate.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void liquify_warp(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                  uniform int in_width, uniform int in_height, uniform int2 roi_in, uniform int2 roi_out,
+                  uniform StructuredBuffer<float2> map, uniform int4 extent,
+                  uniform int kwidth, uniform int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int2 pos = roi_out + int2(x, y);
+  const int2 mp = pos - extent.xy;
+  const float2 warp = (mp.x >= 0 && mp.y >= 0 && mp.x < extent.z && mp.y < extent.w)
+    ? map[mp.y * extent.z + mp.x] : float2(0.0f);
+
+  const int2 ipos = pos - roi_in;
+  float4 pixel;
+  if(warp.x == 0.0f && warp.y == 0.0f)
+    pixel = in.Areadpixel(ipos.x, ipos.y);
+  else
+  {
+    const float2 p = float2(ipos) + warp;
+    pixel = float4(0.0f);
+    if(kwidth == 0)
+      pixel = _lens_bilinear(in, p.x, p.y, in_width, in_height);
+    else
+    {
+      const int tx = int(floor(p.x));
+      const int ty = int(floor(p.y));
+      if(tx >= -1 && ty >= -1 && tx < in_width && ty < in_height)
+        pixel = _lens_filter(in, p.x, p.y, kwidth, lanczos, false, in_width, in_height);
+    }
+  }
+  out.write(int2(x, y), pixel);
+}
+
 // lens_distort_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl:
 // mode 0 is bilinear, otherwise kwidth and lanczos select the filter
 void _lens_distort(const uint3 gid, ImageIn in, ImageOut out, const int width, const int height,

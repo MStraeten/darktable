@@ -1584,6 +1584,68 @@ int process_cl(dt_iop_module_t *self,
 
 #endif
 
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  int kwidth, lanczos;
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+  switch(interpolation->id)
+  {
+    case DT_INTERPOLATION_BILINEAR:
+      kwidth = 0;
+      lanczos = 0;
+      break;
+    case DT_INTERPOLATION_BICUBIC:
+      kwidth = 2;
+      lanczos = 0;
+      break;
+    case DT_INTERPOLATION_LANCZOS2:
+      kwidth = 2;
+      lanczos = 2;
+      break;
+    case DT_INTERPOLATION_LANCZOS3:
+      kwidth = 3;
+      lanczos = 3;
+      break;
+    default:
+      return FALSE;
+  }
+
+  cairo_rectangle_int_t map_extent = { 0, 0, 0, 0 };
+  float complex *map = NULL;
+  _build_global_distortion_map(self, piece, roi_in->scale, roi_out, &map_extent, FALSE, &map);
+
+  // no map is a copy, as in process(); the kernel then never reads the
+  // one value it is given
+  const float complex none = 0.0f;
+  if(!map || map_extent.width == 0 || map_extent.height == 0)
+    map_extent = (cairo_rectangle_int_t){ 0, 0, 0, 0 };
+  const size_t map_size = map_extent.width
+    ? sizeof(float complex) * map_extent.width * map_extent.height : sizeof(none);
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const int iwidth = roi_in->width;
+  const int iheight = roi_in->height;
+  const int iroi[2] = { roi_in->x, roi_in->y };
+  const int oroi[2] = { roi_out->x, roi_out->y };
+  const int extent[4] = { map_extent.x, map_extent.y, map_extent.width, map_extent.height };
+
+  const int err = dt_slang_gpu_run_2d_args("basic", "liquify_warp", width, height,
+                                           SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                           SLARG(iwidth), SLARG(iheight), SLARG(iroi), SLARG(oroi),
+                                           SLBUF(map_extent.width ? (void *)map : (void *)&none, map_size),
+                                           SLARG(extent), SLARG(kwidth), SLARG(lanczos));
+  dt_free_align((void *)map);
+  return !err;
+}
+#endif
+
 void init_global(dt_iop_module_so_t *self)
 {
   // called once at startup
