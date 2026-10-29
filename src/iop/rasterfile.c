@@ -650,6 +650,56 @@ int process_cl(dt_iop_module_t *self,
 }
 #endif  // OpenCL
 
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const ssize_t ch = pipe->dsc.filters ? 1 : 4;
+
+  // the mask display with the module focused is left to process()
+  if(dt_pipe_is_full(pipe) && dt_iop_has_focus(self)) return FALSE;
+
+  int err;
+  if(roi_out->scale != roi_in->scale && ch == 4)
+  {
+    const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+    err = dt_interpolation_resample_slang(itor, dev_out, roi_out, dev_in, roi_in);
+  }
+  else
+  {
+    // roi_in is the whole image at scale 1, see modify_roi_in()
+    const int width = roi_out->width;
+    const int height = roi_out->height;
+    const int iwidth = roi_in->width;
+    const int iheight = roi_in->height;
+    const int dx = roi_out->x - roi_in->x;
+    const int dy = roi_out->y - roi_in->y;
+    err = dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(iwidth), SLARG(iheight), SLARG(dx), SLARG(dy));
+  }
+  if(err) return FALSE;
+
+  if(dt_iop_is_raster_mask_used(piece->module, BLEND_RASTER_ID))
+  {
+    float *mask = _get_rasterfile_mask(piece, roi_in, roi_out);
+    if(mask)
+      dt_iop_piece_set_raster(piece, mask, roi_in, roi_out);
+    else
+      dt_iop_piece_clear_raster(piece, NULL);
+  }
+  else
+    dt_iop_piece_clear_raster(piece, NULL);
+
+  return TRUE;
+}
+#endif
+
 void init_pipe(dt_iop_module_t *self,
                dt_dev_pixelpipe_t *pipe,
                dt_dev_pixelpipe_iop_t *piece)
