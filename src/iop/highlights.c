@@ -750,7 +750,7 @@ int process_cl(dt_iop_module_t *self,
 #endif
 
 #ifdef HAVE_SLANG_GPU
-// the opposed and clip methods on raw data, as in process_cl(). The mask
+// the opposed, clip and LCh methods on raw data, as in process_cl(). The mask
 // displays and a raster mask for other modules need the output on the host,
 // and are left to the CPU.
 gboolean process_slang(dt_iop_module_t *self,
@@ -767,7 +767,11 @@ gboolean process_slang(dt_iop_module_t *self,
   const dt_iop_highlights_mode_t dmode = d->mode;
 
   if(!filters
-     || (dmode != DT_IOP_HIGHLIGHTS_OPPOSED && dmode != DT_IOP_HIGHLIGHTS_CLIP)
+     || (dmode != DT_IOP_HIGHLIGHTS_OPPOSED && dmode != DT_IOP_HIGHLIGHTS_CLIP
+         && dmode != DT_IOP_HIGHLIGHTS_LCH)
+     // process_lch_bayer() reads its input with the output's size
+     || (dmode == DT_IOP_HIGHLIGHTS_LCH
+         && (roi_in->width != roi_out->width || roi_in->height != roi_out->height))
      || pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU
      || dt_iop_is_raster_mask_used(self, BLEND_RASTER_ID))
     return FALSE;
@@ -783,6 +787,25 @@ gboolean process_slang(dt_iop_module_t *self,
   gboolean ok;
   if(dmode == DT_IOP_HIGHLIGHTS_OPPOSED)
     ok = process_opposed_slang(self, piece, dev_in, dev_out, roi_in, roi_out);
+  else if(dmode == DT_IOP_HIGHLIGHTS_LCH)
+  {
+    const float clipper = d->clip * highlights_clip_magics[dmode];
+    const int width = roi_out->width;
+    const int height = roi_out->height;
+    if(filters == 9u)
+      ok = !dt_slang_gpu_run_2d_args("basic", "highlights_1f_lch_xtrans", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(clipper), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+    else
+      ok = !dt_slang_gpu_run_2d_args("basic", "highlights_1f_lch_bayer", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(clipper), SLARG(filters));
+    if(ok)
+    {
+      const float m = dt_iop_get_processed_maximum(piece);
+      for_three_channels(k) pipe->dsc.processed_maximum[k] = m;
+    }
+  }
   else
   {
     const float clipper = d->clip * highlights_clip_magics[dmode];
