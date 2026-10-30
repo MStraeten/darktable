@@ -673,6 +673,10 @@ static int make_tests(test_t *t)
   TEST("ppg_demosaic_redblue", "demosaic_ppg", "ppg_demosaic_redblue",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
        LOCAL("buffer", 4 * sizeof(float) * (16 + 2) * (16 + 2)), INT("border", 16));
+  // the threshold lets about half the neighbors into the median
+  TEST("pre_median", "demosaic_ppg", "pre_median",
+       RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
+       FLOAT("threshold", 0.25f), LOCAL("buffer", sizeof(float) * (16 + 4) * (16 + 4)));
 
   // green equilibration and color smoothing. The full average reduces to one
   // partial sum per 16x16 work group first; the Slang apply step takes the two

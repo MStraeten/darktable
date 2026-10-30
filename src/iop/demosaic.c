@@ -1563,7 +1563,7 @@ gboolean process_slang(dt_iop_module_t *self,
   const gboolean supported =
     ((is_bayer
       && (method == DT_IOP_DEMOSAIC_RCD || method == DT_IOP_DEMOSAIC_VNG4
-          || (method == DT_IOP_DEMOSAIC_PPG && d->median_thrs <= 0.0f)))
+          || method == DT_IOP_DEMOSAIC_PPG))
      || (is_xtrans
          && (method == DT_IOP_DEMOSAIC_VNG || method == DT_IOP_DEMOSAIC_MARKESTEIJN
              || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3)))
@@ -1638,7 +1638,7 @@ gboolean process_slang(dt_iop_module_t *self,
         ok = process_rcd_slang(piece, in_image, high, iwidth, iheight, filters);
         break;
       case DT_IOP_DEMOSAIC_PPG:
-        ok = process_ppg_slang(in_image, high, iwidth, iheight, filters);
+        ok = process_ppg_slang(in_image, high, iwidth, iheight, filters, d->median_thrs);
         break;
       case DT_IOP_DEMOSAIC_VNG4:
       case DT_IOP_DEMOSAIC_VNG:

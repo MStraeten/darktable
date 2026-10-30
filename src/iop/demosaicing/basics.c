@@ -591,27 +591,34 @@ static int demosaic_box3_cl(dt_iop_module_t *self,
 #endif
 
 #ifdef HAVE_SLANG_GPU
-// PPG as in process_default_cl(), without the median prefilter. Returns TRUE
-// on success.
+// PPG as in process_default_cl(). Returns TRUE on success.
 static gboolean process_ppg_slang(dt_slang_gpu_image_t *dev_in,
                                   dt_slang_gpu_image_t *dev_out,
                                   const int width,
                                   const int height,
-                                  const uint32_t filters)
+                                  const uint32_t filters,
+                                  const float median_thrs)
 {
   // a border wider than any image: the PPG kernels cover all of it
   const int border = 100000;
+  const gboolean median = median_thrs > 0.0f;
   dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *dev_med = median ? dt_slang_gpu_image_new(width, height, 1, NULL) : dev_in;
   const gboolean ok =
-    dev_tmp
+    dev_tmp && dev_med
     && !dt_slang_gpu_run_2d_args("demosaic_ppg", "border_interpolate", width, height,
                                  SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height), SLARG(filters))
+    && (!median
+        || !dt_slang_gpu_run_2d_args("demosaic_ppg", "pre_median", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_med), SLARG(width), SLARG(height),
+                                     SLARG(filters), SLARG(median_thrs)))
     && !dt_slang_gpu_run_2d_args("demosaic_ppg", "ppg_demosaic_green", width, height,
-                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height),
+                                 SLIMG_DEV(dev_med), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height),
                                  SLARG(filters), SLARG(border))
     && !dt_slang_gpu_run_2d_args("demosaic_ppg", "ppg_demosaic_redblue", width, height,
                                  SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
                                  SLARG(filters), SLARG(border));
+  if(median) dt_slang_gpu_image_free(dev_med);
   dt_slang_gpu_image_free(dev_tmp);
   return ok;
 }

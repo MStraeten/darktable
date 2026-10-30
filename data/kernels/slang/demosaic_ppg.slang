@@ -433,3 +433,56 @@ void color_smoothing(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThread
 
   out.write(int2(x, y), o);
 }
+
+// the median prefilter of PPG on the green pixels, as pre_median_b() in
+// src/iop/demosaicing/basics.c: unlike the OpenCL kernel it leaves the
+// 3 pixel border unfiltered
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void pre_median(uint3 gid : SV_DispatchThreadID,
+                uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                uniform uint filters, uniform float threshold)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float pc = in.readsingle(x, y);
+  const int c = FC(y, x, filters);
+  if(x < 3 || x >= width - 3 || y < 3 || y >= height - 3 || (c & 1) == 0)
+  {
+    out.write(int2(x, y), float4(pc));
+    return;
+  }
+
+  const int lim[5] = { 0, 1, 2, 1, 0 };
+  float med[9];
+  int cnt = 0;
+  int k = 0;
+  for(int i = 0; i < 5; i++)
+  {
+    for(int j = -lim[i]; j <= lim[i]; j += 2)
+    {
+      const float v = in.readsingle(x + j, y + i - 2);
+      if(abs(v - pc) < threshold)
+      {
+        med[k++] = v;
+        cnt++;
+      }
+      else
+        med[k++] = 64.0f + v;
+    }
+  }
+
+  for(int i = 0; i < 8; i++)
+    for(int ii = i + 1; ii < 9; ii++)
+      if(med[i] > med[ii])
+      {
+        const float tmp = med[ii];
+        med[ii] = med[i];
+        med[i] = tmp;
+      }
+
+  out.write(int2(x, y), float4(cnt == 1 ? med[4] - 64.0f : med[(cnt - 1) / 2]));
+}
+
