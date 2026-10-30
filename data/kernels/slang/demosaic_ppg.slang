@@ -16,8 +16,8 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Slang port of the kernels in ../demosaic_ppg.cl that RCD uses for the image
-// borders. The OpenCL kernels stage their neighborhood in local memory; these
+// Slang port of the kernels in ../demosaic_ppg.cl, which PPG, the borders of
+// RCD and the low quality thumbnails use. The OpenCL kernels stage their neighborhood in local memory; these
 // read it from the image, through the same clamped sampler, which gives the
 // same values and leaves the caching to the texture units.
 
@@ -486,3 +486,59 @@ void pre_median(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), float4(cnt == 1 ? med[4] - 64.0f : med[(cnt - 1) / 2]));
 }
 
+// downscales a Bayer mosaic to the output size, demosaicing each 2x2 block
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void clip_and_zoom_demosaic_half_size(uint3 gid : SV_DispatchThreadID,
+                                      uniform ImageIn in, uniform ImageOut out,
+                                      uniform int width, uniform int height,
+                                      uniform int rin_wd, uniform int rin_ht, uniform float r_scale,
+                                      uniform uint filters)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 color = float4(0.0f);
+  float weight = 0.0f;
+
+  // pixel footprint on input buffer, and how many 2x2 blocks fit in it
+  const float px_footprint = 1.0f / r_scale;
+  const int samples = cl_round(px_footprint / 2.0f);
+
+  int trggbx = 0, trggby = 0;
+  if(FC(trggby, trggbx + 1, filters) != 1) trggbx++;
+  if(FC(trggby, trggbx, filters) != 0)
+  {
+    trggbx = (trggbx + 1) & 1;
+    trggby++;
+  }
+  const int2 rggb = int2(trggbx, trggby);
+
+  // upper left corner, moved to an rggb block
+  const float2 f = float2(x * px_footprint, y * px_footprint);
+  int2 p = int2(int(f.x) & ~1, int(f.y) & ~1);
+  const float2 d = float2((f.x - p.x) / 2.0f, (f.y - p.y) / 2.0f);
+  p += rggb;
+
+  for(int j = 0; j <= samples + 1; j++)
+    for(int i = 0; i <= samples + 1; i++)
+    {
+      const int xx = p.x + 2 * i;
+      const int yy = p.y + 2 * j;
+
+      if(xx + 1 >= rin_wd || yy + 1 >= rin_ht) continue;
+
+      const float xfilter = (i == 0) ? 1.0f - d.x : ((i == samples + 1) ? d.x : 1.0f);
+      const float yfilter = (j == 0) ? 1.0f - d.y : ((j == samples + 1) ? d.y : 1.0f);
+
+      const float p1 = max(0.0f, in.readsingle(xx, yy));
+      const float p2 = max(0.0f, in.readsingle(xx + 1, yy));
+      const float p3 = max(0.0f, in.readsingle(xx, yy + 1));
+      const float p4 = max(0.0f, in.readsingle(xx + 1, yy + 1));
+      color += yfilter * xfilter * float4(p1, (p2 + p3) * 0.5f, p4, 0.0f);
+      weight += yfilter * xfilter;
+    }
+  color = (weight > 0.0f) ? color / weight : float4(0.0f);
+  out.write(int2(x, y), color);
+}

@@ -302,3 +302,45 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThread
   out.write(int2(x, y), max(float4(0.0f), float4(o[0], o[1], o[2], 0.0f)));
 #undef PX
 }
+
+// downscales an X-Trans mosaic to the output size by 3x3 cells
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void clip_and_zoom_demosaic_third_size_xtrans(uint3 gid : SV_DispatchThreadID,
+                                              uniform ImageIn in, uniform ImageOut out,
+                                              uniform int width, uniform int height,
+                                              uniform int rin_wd, uniform int rin_ht, uniform float r_scale,
+                                              uniform StructuredBuffer<uint> xtrans)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float col[3] = { 0.0f, 0.0f, 0.0f };
+  int num = 0;
+
+  const float px_footprint = 1.0f / r_scale;
+  const int samples = max(1, int(floor(px_footprint / 3.0f)));
+
+  const int px = clamp(cl_round((x - 0.5f) * px_footprint), 0, rin_wd - 3);
+  const int py = clamp(cl_round((y - 0.5f) * px_footprint), 0, rin_ht - 3);
+
+  const int xmax = min(rin_wd - 3, px + 3 * samples);
+  const int ymax = min(rin_ht - 3, py + 3 * samples);
+
+  for(int yy = py; yy <= ymax; yy += 3)
+    for(int xx = px; xx <= xmax; xx += 3)
+    {
+      for(int j = 0; j < 3; j++)
+        for(int i = 0; i < 3; i++)
+          col[FCxtrans(yy + j, xx + i, xtrans)] += max(0.0f, in.readsingle(xx + i, yy + j));
+      num++;
+    }
+
+  // X-Trans RGB weighting averages to 2:5:2 for each 3x3 cell
+  col[0] = col[0] / (num * 2);
+  col[1] = col[1] / (num * 5);
+  col[2] = col[2] / (num * 2);
+
+  out.write(int2(x, y), float4(col[0], col[1], col[2], 0.0f));
+}

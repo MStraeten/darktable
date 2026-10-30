@@ -673,6 +673,41 @@ static int make_tests(test_t *t)
   TEST("ppg_demosaic_redblue", "demosaic_ppg", "ppg_demosaic_redblue",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
        LOCAL("buffer", 4 * sizeof(float) * (16 + 2) * (16 + 2)), INT("border", 16));
+  // the passthroughs, and the downscaling demosaic of low quality thumbnails
+  // at a quarter and a fifth of the size
+  TEST("passthrough_monochrome", "demosaic_other", "passthrough_monochrome",
+       RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H));
+  TEST("passthrough_color rggb", "demosaic_other", "passthrough_color",
+       RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),
+       BUFFER("xtrans", xtrans, sizeof(xtrans)));
+  TEST("passthrough_color xtrans", "demosaic_other", "passthrough_color",
+       RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", 9),
+       BUFFER("xtrans", xtrans, sizeof(xtrans)));
+  {
+    static const int zw[2] = { W / 4, W / 5 }, zh[2] = { H / 4, H / 5 };
+    static const float zs[2] = { 0.25f, 0.2f };
+    static const char *zlabels[2][3] = {
+      { "zoom_passthrough_monochrome 1/4", "zoom_half_size 1/4", "zoom_third_size_xtrans 1/4" },
+      { "zoom_passthrough_monochrome 1/5", "zoom_half_size 1/5", "zoom_third_size_xtrans 1/5" } };
+    for(int k = 0; k < 2; k++)
+    {
+      TEST_GRID(zlabels[k][0], "demosaic_other", "clip_and_zoom_demosaic_passthrough_monochrome", 0.0, zw[k], zh[k],
+                RAW_IN("in", image_raw),
+                { .kind = ARG_IMAGE_OUT, .name = "out", .w = zw[k], .h = zh[k], .channels = 4 },
+                INT("width", zw[k]), INT("height", zh[k]), INT("rin_wd", W), INT("rin_ht", H),
+                FLOAT("r_scale", zs[k]));
+      TEST_GRID(zlabels[k][1], "demosaic_ppg", "clip_and_zoom_demosaic_half_size", 0.0, zw[k], zh[k],
+                RAW_IN("in", image_raw),
+                { .kind = ARG_IMAGE_OUT, .name = "out", .w = zw[k], .h = zh[k], .channels = 4 },
+                INT("width", zw[k]), INT("height", zh[k]), INT("rin_wd", W), INT("rin_ht", H),
+                FLOAT("r_scale", zs[k]), INT("filters", bayer[0]));
+      TEST_GRID(zlabels[k][2], "demosaic_vng", "clip_and_zoom_demosaic_third_size_xtrans", 0.0, zw[k], zh[k],
+                RAW_IN("in", image_raw),
+                { .kind = ARG_IMAGE_OUT, .name = "out", .w = zw[k], .h = zh[k], .channels = 4 },
+                INT("width", zw[k]), INT("height", zh[k]), INT("rin_wd", W), INT("rin_ht", H),
+                FLOAT("r_scale", zs[k]), BUFFER("xtrans", xtrans, sizeof(xtrans)));
+    }
+  }
   // the threshold lets about half the neighbors into the median
   TEST("pre_median", "demosaic_ppg", "pre_median",
        RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[0]),

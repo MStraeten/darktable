@@ -204,6 +204,10 @@ public float dt_fast_expf(float x)
 public float fsquare(float a) { return a * a; }
 public float fcube(float a) { return a * a * a; }
 public float clipf(float a) { return clamp(a, 0.0f, 1.0f); }
+
+// OpenCL round(): halfway cases away from zero, which Slang's round() does not
+// promise on every target
+public int cl_round(float x) { return int(x >= 0.0f ? floor(x + 0.5f) : ceil(x - 0.5f)); }
 public float4 clip4(float4 a) { return clamp(a, float4(0.0f), float4(1.0f)); }
 public float fmax3(float4 o) { return max(max(o.x, o.y), o.z); }
 

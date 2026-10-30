@@ -1534,10 +1534,10 @@ finish:
 #endif
 
 #ifdef HAVE_SLANG_GPU
-// RCD, PPG and VNG4 on full scale Bayer data and VNG and Markesteijn on
-// X-Trans, with green equilibration, color smoothing, capture sharpening and
-// dual demosaic, but without the options that need more kernels: the masks
-// and details and the scaled darkroom views
+// RCD, PPG, VNG4 and the passthroughs on Bayer data and VNG, Markesteijn and
+// the passthroughs on X-Trans, with green equilibration, color smoothing,
+// capture sharpening, dual demosaic and the low quality thumbnails, but
+// without the options that need more kernels: the masks and details
 gboolean process_slang(dt_iop_module_t *self,
                        dt_dev_pixelpipe_iop_t *piece,
                        dt_slang_gpu_image_t *dev_in,
@@ -1560,14 +1560,42 @@ gboolean process_slang(dt_iop_module_t *self,
   const gboolean is_xtrans = filters == 9u;
   const gboolean is_bayer = filters != 0 && !is_xtrans && !(img->flags & DT_IMAGE_4BAYER)
                             && !dt_image_is_mono_sraw(img);
+  const gboolean passthru = method == DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME
+                            || method == DT_IOP_DEMOSAIC_PASSTHROUGH_COLOR;
+
+  // low quality thumbnails are demosaiced while downscaling, as in process_cl()
+  if(!_demosaic_full(pipe, img))
+  {
+    if(!is_bayer && !is_xtrans) return FALSE;
+    dt_dev_clear_scharr_mask(pipe);
+    const int owidth = roi_out->width;
+    const int oheight = roi_out->height;
+    const float scale = roi_out->scale;
+    int err;
+    if(is_xtrans)
+      err = dt_slang_gpu_run_2d_args("demosaic_vng", "clip_and_zoom_demosaic_third_size_xtrans", owidth, oheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(scale),
+                                     SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+    else if(method == DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME)
+      err = dt_slang_gpu_run_2d_args("demosaic_other", "clip_and_zoom_demosaic_passthrough_monochrome",
+                                     owidth, oheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(scale));
+    else
+      err = dt_slang_gpu_run_2d_args("demosaic_ppg", "clip_and_zoom_demosaic_half_size", owidth, oheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(scale), SLARG(filters));
+    return !err;
+  }
+
   const gboolean supported =
     ((is_bayer
       && (method == DT_IOP_DEMOSAIC_RCD || method == DT_IOP_DEMOSAIC_VNG4
-          || method == DT_IOP_DEMOSAIC_PPG))
+          || method == DT_IOP_DEMOSAIC_PPG || passthru))
      || (is_xtrans
          && (method == DT_IOP_DEMOSAIC_VNG || method == DT_IOP_DEMOSAIC_MARKESTEIJN
-             || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3)))
-    && _demosaic_full(pipe, img)
+             || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3 || passthru)))
     && direct
     && iwidth >= 16 && iheight >= 16
     && dt_pipe_no_mask_display(pipe)
@@ -1586,7 +1614,7 @@ gboolean process_slang(dt_iop_module_t *self,
   dt_dev_clear_scharr_mask(pipe);
 
   // the autotuning of capture sharpening, as in process_cl()
-  const gboolean do_capture = !run_fast && d->cs_enabled;
+  const gboolean do_capture = !run_fast && !passthru && d->cs_enabled;
   if(do_capture)
   {
     dt_iop_demosaic_data_t *dw = piece->data;
@@ -1636,6 +1664,15 @@ gboolean process_slang(dt_iop_module_t *self,
     {
       case DT_IOP_DEMOSAIC_RCD:
         ok = process_rcd_slang(piece, in_image, high, iwidth, iheight, filters);
+        break;
+      case DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME:
+        ok = !dt_slang_gpu_run_2d_args("demosaic_other", "passthrough_monochrome", iwidth, iheight,
+                                       SLIMG_DEV(in_image), SLIMG_DEV(high), SLARG(iwidth), SLARG(iheight));
+        break;
+      case DT_IOP_DEMOSAIC_PASSTHROUGH_COLOR:
+        ok = !dt_slang_gpu_run_2d_args("demosaic_other", "passthrough_color", iwidth, iheight,
+                                       SLIMG_DEV(in_image), SLIMG_DEV(high), SLARG(iwidth), SLARG(iheight),
+                                       SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
         break;
       case DT_IOP_DEMOSAIC_PPG:
         ok = process_ppg_slang(in_image, high, iwidth, iheight, filters, d->median_thrs);
