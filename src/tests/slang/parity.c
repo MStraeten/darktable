@@ -2045,18 +2045,24 @@ static int make_tests(test_t *t)
     // non-local means on preconditioned data, which is around 2 sqrt(x / a)
     static float dp_pre[4 * W * H];
     for(int k = 0; k < 4 * W * H; k++) dp_pre[k] = (k % 4 == 3) ? 1.0f : 2.0f * sqrtf(fmaxf(image_in[k], 0.0f) / 0.012f);
-    static float dp_u4[W * H], dp_u4b[W * H];
+    enum { DP_P = 3, DP_BS = 16 };
+    // the box sums of the OpenCL kernels repeat the edge pixel, where the
+    // Slang ones skip what lies outside the image as nlmeans_denoise() does
+    // on the CPU. Inputs that are 0 within P of the edges they sum across
+    // give the same sums either way.
+    static float dp_u4[W * H], dp_u4h[W * H], dp_u4b[W * H];
     for(int k = 0; k < W * H; k++)
     {
+      const int x = k % W, y = k / W;
       dp_u4[k] = 4.0f * image_in[4 * k];
-      dp_u4b[k] = 30.0f * image_in[4 * k + 1] * image_in[4 * k + 2];
+      dp_u4h[k] = (x < DP_P || x >= W - DP_P) ? 0.0f : dp_u4[k];
+      dp_u4b[k] = (y < DP_P || y >= H - DP_P) ? 0.0f : 30.0f * image_in[4 * k + 1] * image_in[4 * k + 2];
     }
     TEST("denoiseprofile_dist", "denoiseprofile", "denoiseprofile_dist",
          IMG_IN("in", dp_pre), BUFFER_OUT("U4", NULL, sizeof(float) * W * H), INT("width", W), INT("height", H),
          INT2("q", 3, -2));
-    enum { DP_P = 3, DP_BS = 16 };
     TEST("denoiseprofile_horiz", "denoiseprofile", "denoiseprofile_horiz",
-         BUFFER("U4_in", dp_u4, sizeof(dp_u4)), BUFFER_OUT("U4_out", NULL, sizeof(float) * W * H),
+         BUFFER("U4_in", dp_u4h, sizeof(dp_u4h)), BUFFER_OUT("U4_out", NULL, sizeof(float) * W * H),
          INT("width", W), INT("height", H), INT2("q", 3, -2), INT("P", DP_P),
          LOCAL("buffer", sizeof(float) * (DP_BS + 2 * DP_P)));
     t[n - 1].clgw = (W + DP_BS - 1) / DP_BS * DP_BS;
