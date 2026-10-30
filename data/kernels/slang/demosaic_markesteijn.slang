@@ -31,7 +31,6 @@
 import common;
 
 static const float HOMOGENITY_EPS = 1e-10f;
-static const float SOLITARY_EPS = 1e-12f;
 
 // directions along the both axes and both diagonals
 static const int2 dir[4] = { int2(1, 0), int2(0, 1), int2(1, 1), int2(-1, 1) };
@@ -128,7 +127,7 @@ void markesteijn_green_minmax(uint3 gid : SV_DispatchThreadID,
 
   // get min/max of *this* pixel
   float gmin = 3.402823466e+38f;
-  float gmax = 1.175494351e-38f;
+  float gmax = 0.0f;
   for(int c = 0; c < 6; c++)
   {
     const int2 hex = _hex(allhex, y % 3, x % 3, c);
@@ -278,7 +277,7 @@ void markesteijn_solitary_green(uint3 gid : SV_DispatchThreadID,
   color[3] = diff;
 
   if((d > 1) && (d & 1) != 0)
-    for(int c = 0; c < 2; c++) color[c * 2] = (ocolor[3] + SOLITARY_EPS < diff) ? ocolor[c * 2] : color[c * 2];
+    for(int c = 0; c < 2; c++) color[c * 2] = (ocolor[3] < diff) ? ocolor[c * 2] : color[c * 2];
 
   if((d < 2) || (d & 1) != 0)
   {
@@ -335,7 +334,7 @@ void markesteijn_recalculate_green(uint3 gid : SV_DispatchThreadID,
       default: c0 = rgb_3[glidx]; cp = rgb_3[ip]; cm = rgb_3[im]; break;
     }
     const float val = cm.y + 2.0f * cp.y - cm[f] - 2.0f * cp[f] + 3.0f * c0[f];
-    const float g = clamp(val / 3.0f, mm.x, mm.y);
+    const float g = clamp(fp32_div(val, 3.0f), mm.x, mm.y);
     switch(id)
     {
       case 0: rgb_0[glidx].y = g; break;

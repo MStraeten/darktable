@@ -99,7 +99,7 @@ void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupTh
     for(int c = 0; c < colors; c++)
     {
       if(c != f && count[c] != 0)
-        o[c] = sum[c] / count[c];
+        o[c] = fp32_div(sum[c], float(count[c]));
       else
         o[c] = max(0.0f, in.readsingle(x, y));
     }
@@ -126,7 +126,7 @@ void vng_lin_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupTh
     for(int i = 0; i < colors - 1; i++, ip += 2)
     {
       const int c = lookup[ip];
-      out4 = _with_channel(out4, c, sums[c] / lookup[ip + 1]);
+      out4 = _with_channel(out4, c, fp32_div(sums[c], float(lookup[ip + 1])));
     }
     out4 = _with_channel(out4, lookup[ip], max(0.0f, vng_lin_tile[(int(lid.y) + 1) * 18 + int(lid.x) + 1]));
     o[0] = out4.x;
@@ -293,7 +293,7 @@ void vng_interpolate(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThread
   {
     if(c >= colors) continue;
     float tot = center[color];
-    if(c != color) tot += (sum[c] - sum[color]) / num;
+    if(c != color) tot += fp32_div(sum[c] - sum[color], float(num));
     o[c] = tot;
   }
 

@@ -178,15 +178,15 @@ void border_interpolate(uint3 gid : SV_DispatchThreadID,
     if(j>=0 && i>=0 && j<height && i<width)
     {
       const int f = FC(j,i,filters);
-      sum[f] += in.readsingle(i, j);
+      sum[f] += in.Areadsingle(i, j);
       count[f]++;
     }
   }
 
-  const float i = max(0.0f, in.readsingle(x, y));
-  o.x = count[0] > 0 ? sum[0]/count[0] : i;
-  o.y = count[1]+count[3] > 0 ? (sum[1]+sum[3])/(count[1]+count[3]) : i;
-  o.z = count[2] > 0 ? sum[2]/count[2] : i;
+  const float i = max(0.0f, in.Areadsingle(x, y));
+  o.x = count[0] > 0 ? fp32_div(sum[0], float(count[0])) : i;
+  o.y = count[1]+count[3] > 0 ? fp32_div(sum[1]+sum[3], float(count[1]+count[3])) : i;
+  o.z = count[2] > 0 ? fp32_div(sum[2], float(count[2])) : i;
 
   const int f = FC(y,x,filters);
 
