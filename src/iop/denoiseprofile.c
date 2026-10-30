@@ -2659,6 +2659,16 @@ static int process_nlmeans_slang(dt_iop_module_t *self,
                                       (bb[2] / aa[2]) * (bb[2] / aa[2]),
                                       0.0f };
 
+  // the patch distances are computed over the image extended by mirroring, as on the CPU
+  const dt_nlmeans_param_t border_params = { .scattering = scattering,
+                                             .scale = scale,
+                                             .patch_radius = P,
+                                             .search_radius = K };
+  const int border = nlmeans_border(&border_params);
+  const int pwidth = width + 2 * border;
+  const int pheight = height + 2 * border;
+  const size_t ppixels = (size_t)pwidth * pheight;
+
   int err = 1;
   // the patch distances, their horizontal and then vertical box sums
   dt_slang_gpu_buffer_t *dev_U4 = NULL, *dev_U4_t = NULL, *dev_U4_tt = NULL;
@@ -2666,9 +2676,9 @@ static int process_nlmeans_slang(dt_iop_module_t *self,
   dt_slang_gpu_buffer_t *dev_U2 = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npixels, NULL);
   dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
   if(!dev_U2 || !dev_tmp) goto error;
-  dev_U4 = dt_slang_gpu_buffer_new(sizeof(float) * npixels, NULL);
-  dev_U4_t = dt_slang_gpu_buffer_new(sizeof(float) * npixels, NULL);
-  dev_U4_tt = dt_slang_gpu_buffer_new(sizeof(float) * npixels, NULL);
+  dev_U4 = dt_slang_gpu_buffer_new(sizeof(float) * ppixels, NULL);
+  dev_U4_t = dt_slang_gpu_buffer_new(sizeof(float) * ppixels, NULL);
+  dev_U4_tt = dt_slang_gpu_buffer_new(sizeof(float) * ppixels, NULL);
   if(!dev_U4 || !dev_U4_t || !dev_U4_tt) goto error;
 
   if(!d->use_new_vst)
@@ -2683,7 +2693,7 @@ static int process_nlmeans_slang(dt_iop_module_t *self,
 
   // each pass adds the patches at q and -q, so of the row kj_index = 0 only
   // the half with ki_index <= 0 runs, and every patch counts once as in
-  // nlmeans_denoise(); process_nlmeans_cl() counts that row twice
+  // nlmeans_denoise() and process_nlmeans_cl()
   for(int kj_index = -K; kj_index <= 0 && !err; kj_index++)
   {
     for(int ki_index = -K; ki_index <= (kj_index < 0 ? K : 0) && !err; ki_index++)
@@ -2699,21 +2709,22 @@ static int process_nlmeans_slang(dt_iop_module_t *self,
                              * scattering / 6.0 + ki_index);
       const int q[2] = { i, j };
 
-      err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_dist", width, height,
-                                     SLIMG_DEV(dev_tmp), SLBUF_DEV(dev_U4), SLARG(width), SLARG(height), SLARG(q));
+      err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_dist", pwidth, pheight,
+                                     SLIMG_DEV(dev_tmp), SLBUF_DEV(dev_U4), SLARG(width), SLARG(height), SLARG(q),
+                                     SLARG(border));
       if(!err)
-        err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_horiz", width, height,
-                                       SLBUF_DEV(dev_U4), SLBUF_DEV(dev_U4_t), SLARG(width), SLARG(height),
+        err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_horiz", pwidth, pheight,
+                                       SLBUF_DEV(dev_U4), SLBUF_DEV(dev_U4_t), SLARG(pwidth), SLARG(pheight),
                                        SLARG(q), SLARG(P));
       if(!err)
-        err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_vert", width, height,
-                                       SLBUF_DEV(dev_U4_t), SLBUF_DEV(dev_U4_tt), SLARG(width), SLARG(height),
+        err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_vert", pwidth, pheight,
+                                       SLBUF_DEV(dev_U4_t), SLBUF_DEV(dev_U4_tt), SLARG(pwidth), SLARG(pheight),
                                        SLARG(q), SLARG(P), SLARG(norm), SLARG(central_pixel_weight),
                                        SLBUF_DEV(dev_U4));
       if(!err)
         err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_accu", width, height,
                                        SLIMG_DEV(dev_tmp), SLBUF_DEV(dev_U2), SLBUF_DEV(dev_U4_tt),
-                                       SLARG(width), SLARG(height), SLARG(q));
+                                       SLARG(width), SLARG(height), SLARG(q), SLARG(border));
     }
   }
   if(err) goto error;

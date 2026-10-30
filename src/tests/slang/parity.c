@@ -2035,24 +2035,19 @@ static int make_tests(test_t *t)
     // non-local means on preconditioned data, which is around 2 sqrt(x / a)
     static float dp_pre[4 * W * H];
     for(int k = 0; k < 4 * W * H; k++) dp_pre[k] = (k % 4 == 3) ? 1.0f : 2.0f * sqrtf(fmaxf(image_in[k], 0.0f) / 0.012f);
-    enum { DP_P = 3, DP_BS = 16 };
-    // the box sums of the OpenCL kernels repeat the edge pixel, where the
-    // Slang ones skip what lies outside the image as nlmeans_denoise() does
-    // on the CPU. Inputs that are 0 within P of the edges they sum across
-    // give the same sums either way.
-    static float dp_u4[W * H], dp_u4h[W * H], dp_u4b[W * H];
+    // DP_B is the mirrored border the distances are computed over
+    enum { DP_P = 3, DP_BS = 16, DP_B = 5 };
+    static float dp_u4[W * H], dp_u4b[W * H];
     for(int k = 0; k < W * H; k++)
     {
-      const int x = k % W, y = k / W;
       dp_u4[k] = 4.0f * image_in[4 * k];
-      dp_u4h[k] = (x < DP_P || x >= W - DP_P) ? 0.0f : dp_u4[k];
-      dp_u4b[k] = (y < DP_P || y >= H - DP_P) ? 0.0f : 30.0f * image_in[4 * k + 1] * image_in[4 * k + 2];
+      dp_u4b[k] = 30.0f * image_in[4 * k + 1] * image_in[4 * k + 2];
     }
-    TEST("denoiseprofile_dist", "denoiseprofile", "denoiseprofile_dist",
-         IMG_IN("in", dp_pre), BUFFER_OUT("U4", NULL, sizeof(float) * W * H), INT("width", W), INT("height", H),
-         INT2("q", 3, -2));
+    TEST_GRID("denoiseprofile_dist", "denoiseprofile", "denoiseprofile_dist", 0.0, W + 2 * DP_B, H + 2 * DP_B,
+              IMG_IN("in", dp_pre), BUFFER_OUT("U4", NULL, sizeof(float) * (W + 2 * DP_B) * (H + 2 * DP_B)),
+              INT("width", W), INT("height", H), INT2("q", 3, -2), INT("border", DP_B));
     TEST("denoiseprofile_horiz", "denoiseprofile", "denoiseprofile_horiz",
-         BUFFER("U4_in", dp_u4h, sizeof(dp_u4h)), BUFFER_OUT("U4_out", NULL, sizeof(float) * W * H),
+         BUFFER("U4_in", dp_u4, sizeof(dp_u4)), BUFFER_OUT("U4_out", NULL, sizeof(float) * W * H),
          INT("width", W), INT("height", H), INT2("q", 3, -2), INT("P", DP_P),
          LOCAL("buffer", sizeof(float) * (DP_BS + 2 * DP_P)));
     t[n - 1].clgw = (W + DP_BS - 1) / DP_BS * DP_BS;
@@ -2069,11 +2064,11 @@ static int make_tests(test_t *t)
     // accumulated weights so far, then one more offset
     static float dp_u2[4 * W * H];
     for(int k = 0; k < 4 * W * H; k++) dp_u2[k] = (k % 4 == 3) ? 3.0f + image_in[k] : 3.0f * dp_pre[k];
-    static float dp_w[W * H];
-    for(int k = 0; k < W * H; k++) dp_w[k] = image_in[4 * k + 2];
+    static float dp_w[(W + 2 * DP_B) * (H + 2 * DP_B)];
+    for(int k = 0; k < (W + 2 * DP_B) * (H + 2 * DP_B); k++) dp_w[k] = image_in[4 * (k % (W * H)) + 2];
     TEST("denoiseprofile_accu", "denoiseprofile", "denoiseprofile_accu",
          IMG_IN("in", dp_pre), BUFFER_OUT("U2", dp_u2, sizeof(dp_u2)), BUFFER("U4", dp_w, sizeof(dp_w)),
-         INT("width", W), INT("height", H), INT2("q", -2, 3));
+         INT("width", W), INT("height", H), INT2("q", -2, 3), INT("border", DP_B));
     TEST("denoiseprofile_finish", "denoiseprofile", "denoiseprofile_finish",
          IMG_IN("in", image_in), BUFFER("U2", dp_u2, sizeof(dp_u2)), IMG_OUT("out"), INT("width", W),
          INT("height", H), FLOAT4("a", 0.012f, 0.011f, 0.013f, 1.0f), FLOAT4("sigma2", 0.002f, 0.003f, 0.001f, 0.0f));

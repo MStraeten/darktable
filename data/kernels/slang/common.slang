@@ -216,6 +216,15 @@ public int clip_mirror(int i, int max)
   return i;
 }
 
+// as clip_mirror, but folding again as often as needed for offsets wider than the image
+public int fold_mirror(int i, int max)
+{
+  if(max <= 0) return 0;
+  const int period = 2 * max;
+  i = abs(i) % period;
+  return i > max ? period - i : i;
+}
+
 // Images. OpenCL reads go through sampler objects; Vulkan storage images and
 // Metal read access have none, so each addressing mode in ../common.h is a
 // method here. Keeping every kernel behind these two types also means a later

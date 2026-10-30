@@ -357,13 +357,16 @@ gboolean process_slang(dt_iop_module_t *self,
   // the steps of the old process_cl() code; dt_slang_gpu_buffer_new() zeroes
   // the accumulator. Each pass adds the patches at q and -q, so the passes
   // cover the half of the search window with j < 0, and of the row j = 0 the
-  // part with i <= 0, so that every patch counts once, as in
-  // nlmeans_denoise(). process_cl() runs all of row 0 and counts its patches
-  // twice.
+  // part with i <= 0, so that every patch counts once. The patch distances
+  // are computed over the image extended by mirroring, as on the CPU.
+  const int border = K + P;
+  const int pwidth = width + 2 * border;
+  const int pheight = height + 2 * border;
+  const size_t ppixels = (size_t)pwidth * pheight;
   dt_slang_gpu_buffer_t *dev_U2 = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npixels, NULL);
-  dt_slang_gpu_buffer_t *dev_U4 = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
-  dt_slang_gpu_buffer_t *dev_U4_t = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
-  dt_slang_gpu_buffer_t *dev_U4_tt = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
+  dt_slang_gpu_buffer_t *dev_U4 = dt_slang_gpu_buffer_new_uninit(sizeof(float) * ppixels);
+  dt_slang_gpu_buffer_t *dev_U4_t = dt_slang_gpu_buffer_new_uninit(sizeof(float) * ppixels);
+  dt_slang_gpu_buffer_t *dev_U4_tt = dt_slang_gpu_buffer_new_uninit(sizeof(float) * ppixels);
 
   int err = !dev_U2 || !dev_U4 || !dev_U4_t || !dev_U4_tt;
 
@@ -371,18 +374,18 @@ gboolean process_slang(dt_iop_module_t *self,
     for(int i = -K; i <= (j < 0 ? K : 0) && !err; i++)
     {
       const int q[2] = { i, j };
-      err = dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_dist", width, height,
+      err = dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_dist", pwidth, pheight,
                                      SLIMG_DEV(dev_in), SLBUF_DEV(dev_U4), SLARG(width), SLARG(height),
-                                     SLARG(q), SLARG(nL2), SLARG(nC2))
-        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_horiz", width, height,
-                                    SLBUF_DEV(dev_U4), SLBUF_DEV(dev_U4_t), SLARG(width), SLARG(height),
+                                     SLARG(q), SLARG(nL2), SLARG(nC2), SLARG(border))
+        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_horiz", pwidth, pheight,
+                                    SLBUF_DEV(dev_U4), SLBUF_DEV(dev_U4_t), SLARG(pwidth), SLARG(pheight),
                                     SLARG(P))
-        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_vert", width, height,
-                                    SLBUF_DEV(dev_U4_t), SLBUF_DEV(dev_U4_tt), SLARG(width), SLARG(height),
+        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_vert", pwidth, pheight,
+                                    SLBUF_DEV(dev_U4_t), SLBUF_DEV(dev_U4_tt), SLARG(pwidth), SLARG(pheight),
                                     SLARG(P), SLARG(sharpness))
         || dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_accu", width, height,
                                     SLIMG_DEV(dev_in), SLBUF_DEV(dev_U2), SLBUF_DEV(dev_U4_tt),
-                                    SLARG(width), SLARG(height), SLARG(q));
+                                    SLARG(width), SLARG(height), SLARG(q), SLARG(border));
     }
 
   // normalize and blend

@@ -111,28 +111,22 @@ void denoiseprofile_precondition_Y0U0V0(uint3 gid : SV_DispatchThreadID,
 [numthreads(16, 16, 1)]
 void denoiseprofile_dist(uint3 gid : SV_DispatchThreadID,
                          uniform ImageIn in, uniform RWStructuredBuffer<float> U4,
-                         uniform int width, uniform int height, uniform int2 q)
+                         uniform int width, uniform int height, uniform int2 q, uniform int border)
 {
+  // U4 covers the image plus a border on each side, read from the image by mirroring
+  const int pwidth = width + 2 * border;
+  const int pheight = height + 2 * border;
   const int x = gid.x;
   const int y = gid.y;
-  const int gidx = y * width + x;
-  if(x >= width || y >= height) return;
+  if(x >= pwidth || y >= pheight) return;
 
-  int xpq = x + q.x;
-  int ypq = y + q.y;
-  // out of bounds indexes become 0. q.x and q.y can be negative
-  xpq *= (x + q.x < width && x + q.x >= 0) ? 1 : 0;
-  ypq *= (y + q.y < height && y + q.y >= 0) ? 1 : 0;
-
-  const float4 p1 = in.readpixel(x, y);
-  const float4 p2 = in.readpixel(xpq, ypq);
+  const int xi = x - border;
+  const int yi = y - border;
+  const float4 p1 = in.readpixel(fold_mirror(xi, width - 1), fold_mirror(yi, height - 1));
+  const float4 p2 = in.readpixel(fold_mirror(xi + q.x, width - 1), fold_mirror(yi + q.y, height - 1));
   const float4 tmp = (p1 - p2) * (p1 - p2);
-  float dist = tmp.x + tmp.y + tmp.z;
 
-  // dist is 0 where xpq or ypq is out of bounds
-  dist *= (x + q.x < width && x + q.x >= 0 && y + q.y < height && y + q.y >= 0) ? 1.0f : 0.0f;
-
-  U4[gidx] = dist;
+  U4[y * pwidth + x] = tmp.x + tmp.y + tmp.z;
 }
 
 // the OpenCL kernels take q but don't use it, and Metal drops parameters
@@ -154,8 +148,8 @@ void denoiseprofile_horiz(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   float distacc = 0.0f;
-  for(int pi = max(-P, -x); pi <= min(P, width - 1 - x); pi++)
-    distacc += U4_in[y * width + x + pi];
+  for(int pi = -P; pi <= P; pi++)
+    distacc += U4_in[y * width + clamp(x + pi, 0, width - 1)];
 
   U4_out[y * width + x] = distacc;
 }
@@ -176,8 +170,8 @@ void denoiseprofile_vert(uint3 gid : SV_DispatchThreadID,
   const int gidx = y * width + x;
 
   float distacc = 0.0f;
-  for(int pj = max(-P, -y); pj <= min(P, height - 1 - y); pj++)
-    distacc += U4_in[(y + pj) * width + x];
+  for(int pj = -P; pj <= P; pj++)
+    distacc += U4_in[clamp(y + pj, 0, height - 1) * width + x];
 
   distacc += U4_single_pixel[gidx] * (2 * P + 1) * (2 * P + 1) * central_pixel_weight;
   distacc /= (1.0f + central_pixel_weight);
@@ -192,38 +186,26 @@ void denoiseprofile_vert(uint3 gid : SV_DispatchThreadID,
 void denoiseprofile_accu(uint3 gid : SV_DispatchThreadID,
                          uniform ImageIn in, uniform RWStructuredBuffer<float4> U2,
                          uniform StructuredBuffer<float> U4,
-                         uniform int width, uniform int height, uniform int2 q)
+                         uniform int width, uniform int height, uniform int2 q, uniform int border)
 {
   const int x = gid.x;
   const int y = gid.y;
   const int gidx = y * width + x;
   if(x >= width || y >= height) return;
 
-  // wpq and wmq weigh the reads at (x, y) + q and (x, y) - q, and are 1 only
-  // where their position is in bounds
-  int wpq = 1;
-  int wmq = 1;
+  // U4 holds the patch distances for offset q over the mirror-extended image; the
+  // distance for offset -q at (x, y) is the one for offset q at (x, y) - q
+  const int pwidth = width + 2 * border;
+  const float4 u1_pq = in.readpixel(fold_mirror(x + q.x, width - 1), fold_mirror(y + q.y, height - 1));
+  const float4 u1_mq = in.readpixel(fold_mirror(x - q.x, width - 1), fold_mirror(y - q.y, height - 1));
 
-  wpq *= (x + q.x < width) ? 1 : 0;
-  wmq *= (x - q.x < width) ? 1 : 0;
-  wpq *= (x + q.x >= 0) ? 1 : 0;
-  wmq *= (x - q.x >= 0) ? 1 : 0;
-
-  wpq *= (y + q.y >= 0) ? 1 : 0;
-  wmq *= (y - q.y >= 0) ? 1 : 0;
-  wpq *= (y + q.y < height) ? 1 : 0;
-  wmq *= (y - q.y < height) ? 1 : 0;
-
-  const float4 u1_pq = wpq != 0 ? in.readpixel(x + q.x, y + q.y) : float4(0.0f);
-  const float4 u1_mq = wmq != 0 ? in.readpixel(x - q.x, y - q.y) : float4(0.0f);
-
-  const float u4 = U4[gidx];
-  const float u4_mq = U4[clamp(y - q.y, 0, height - 1) * width + clamp(x - q.x, 0, width - 1)];
+  const float u4 = U4[(y + border) * pwidth + x + border];
+  const float u4_mq = U4[(y + border - q.y) * pwidth + x + border - q.x];
 
   const float u4_mq_dd = u4_mq * ddirac(q);
 
   float4 accu = (u4 * u1_pq) + (u4_mq_dd * u1_mq);
-  accu.w = (wpq * u4 + wmq * u4_mq_dd);
+  accu.w = u4 + u4_mq_dd;
 
   U2[gidx] += accu;
 }
