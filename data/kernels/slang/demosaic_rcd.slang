@@ -337,3 +337,23 @@ void rcd_step_4_3(uint3 gid : SV_DispatchThreadID,
     _rgb_set(rgb0, rgb1, rgb2, c, idx, rgb1[idx] + lerp(V_Est, H_Est, clipf(VH_Disc)));
   }
 }
+
+// blends the high and low frequency demosaic of dual demosaic by the mask
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void write_blended_dual(uint3 gid : SV_DispatchThreadID,
+                        uniform ImageIn high, uniform ImageIn low, uniform ImageOut out,
+                        uniform int w, uniform int height, uniform StructuredBuffer<float> mask,
+                        uniform int showmask)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+  if(col >= w || row >= height) return;
+
+  const float4 high_val = high.Areadpixel(col, row);
+  const float4 low_val = low.Areadpixel(col, row);
+  const float4 blender = float4(clipf(mask[row * w + col]));
+  float4 data = lerp(low_val, high_val, blender);
+  data.w = showmask != 0 ? blender.x : 0.0f;
+  out.write(int2(col, row), data);
+}

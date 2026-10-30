@@ -1535,9 +1535,9 @@ finish:
 
 #ifdef HAVE_SLANG_GPU
 // RCD, PPG and VNG4 on full scale Bayer data and VNG and Markesteijn on
-// X-Trans, with green equilibration and color smoothing, but without the
-// options that need more kernels: dual demosaic, capture sharpening, the
-// masks and details and the scaled darkroom views
+// X-Trans, with green equilibration, color smoothing, capture sharpening and
+// dual demosaic, but without the options that need more kernels: the masks
+// and details and the scaled darkroom views
 gboolean process_slang(dt_iop_module_t *self,
                        dt_dev_pixelpipe_iop_t *piece,
                        dt_slang_gpu_image_t *dev_in,
@@ -1549,10 +1549,11 @@ gboolean process_slang(dt_iop_module_t *self,
   dt_dev_pixelpipe_t *const pipe = piece->pipe;
   const dt_iop_demosaic_data_t *d = piece->data;
   const uint32_t filters = piece->filters;
-  const int method = d->demosaicing_method;
+  const int method = d->demosaicing_method & ~DT_DEMOSAIC_DUAL;
   const int iwidth = roi_in->width;
   const int iheight = roi_in->height;
   const gboolean run_fast = dt_pipe_is_fast(pipe) || dt_pipe_is_preview(pipe);
+  const gboolean dual = (d->demosaicing_method & DT_DEMOSAIC_DUAL) && !run_fast;
   const gboolean direct = roi_out->width == iwidth && roi_out->height == iheight
                           && feqf(roi_in->scale, roi_out->scale, 1e-8f);
 
@@ -1624,31 +1625,44 @@ gboolean process_slang(dt_iop_module_t *self,
   // the masks are not displayed, which process_cl() calls no_masking
   const gboolean greens = is_bayer && d->green_eq != DT_IOP_GREEN_EQ_NO && !run_fast;
   dt_slang_gpu_image_t *in_image = greens ? dt_slang_gpu_image_new(iwidth, iheight, 1, NULL) : dev_in;
-  gboolean ok = in_image
+  // dual demosaic blends the demosaic in high with a VNG one in low
+  dt_slang_gpu_image_t *high = dual ? dt_slang_gpu_image_new(iwidth, iheight, 4, NULL) : dev_out;
+  dt_slang_gpu_image_t *low = dual ? dt_slang_gpu_image_new(iwidth, iheight, 4, NULL) : NULL;
+  gboolean ok = in_image && high && (!dual || low)
     && (!greens || green_equilibration_slang(self, piece, dev_in, in_image, iwidth, iheight, filters));
 
   if(ok)
     switch(method)
     {
       case DT_IOP_DEMOSAIC_RCD:
-        ok = process_rcd_slang(piece, in_image, dev_out, iwidth, iheight, filters);
+        ok = process_rcd_slang(piece, in_image, high, iwidth, iheight, filters);
         break;
       case DT_IOP_DEMOSAIC_PPG:
-        ok = process_ppg_slang(in_image, dev_out, iwidth, iheight, filters);
+        ok = process_ppg_slang(in_image, high, iwidth, iheight, filters);
         break;
       case DT_IOP_DEMOSAIC_VNG4:
       case DT_IOP_DEMOSAIC_VNG:
-        ok = process_vng_slang(in_image, dev_out, piece->xtrans, iwidth, iheight, filters, 0, FALSE);
+        ok = process_vng_slang(in_image, high, piece->xtrans, iwidth, iheight, filters, 0, FALSE);
         break;
       default:
-        ok = process_markesteijn_slang(piece, in_image, dev_out, piece->xtrans, iwidth, iheight);
+        ok = process_markesteijn_slang(piece, in_image, high, piece->xtrans, iwidth, iheight);
     }
 
   if(ok && do_capture)
-    ok = _capture_sharpen_slang(self, piece, in_image, dev_out, iwidth, iheight, roi_in->x, roi_in->y,
+    ok = _capture_sharpen_slang(self, piece, in_image, high, iwidth, iheight, roi_in->x, roi_in->y,
                                 piece->xtrans, filters);
 
+  if(ok && dual)
+    ok = process_vng_slang(in_image, low, piece->xtrans, iwidth, iheight, filters, 0, TRUE)
+      && color_smoothing_slang(low, iwidth, iheight, DT_DEMOSAIC_SMOOTH_2)
+      && dual_demosaic_slang(piece, high, low, dev_out, iwidth, iheight);
+
   if(greens) dt_slang_gpu_image_free(in_image);
+  if(dual)
+  {
+    dt_slang_gpu_image_free(high);
+    dt_slang_gpu_image_free(low);
+  }
 
   if(ok && d->color_smoothing != DT_DEMOSAIC_SMOOTH_OFF && !run_fast)
     ok = color_smoothing_slang(dev_out, iwidth, iheight, d->color_smoothing);

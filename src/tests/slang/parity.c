@@ -786,6 +786,25 @@ static int make_tests(test_t *t)
          IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("blendmask", cs_blend, sizeof(cs_blend)),
          BUFFER("luminance", cs_lum, sizeof(cs_lum)), BUFFER("tmp", cs_tmp, sizeof(cs_tmp)), INT("width", W),
          INT("height", H));
+
+    // the mask of dual demosaic, which the detail mask shares, and its blend
+    static float dual_low[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++) dual_low[k] = image_in[(k + 4 * 97) % (4 * W * H)];
+    TEST("calc_Y0_mask", "blendop", "calc_Y0_mask",
+         BUFFER_OUT("mask", NULL, sizeof(cs_y)), IMG_IN("in", image_in), INT("w", W), INT("height", H),
+         FLOAT4("wb", 0.5f, 1.0f, 0.7f, 1.0f));
+    TEST("calc_scharr_mask", "blendop", "calc_scharr_mask",
+         BUFFER("in", cs_y, sizeof(cs_y)), BUFFER_OUT("out", NULL, sizeof(cs_tmp)), INT("w", W),
+         INT("height", H));
+    TEST("calc_detail_blend", "blendop", "calc_detail_blend",
+         BUFFER("in", cs_blend, sizeof(cs_blend)), BUFFER_OUT("out", NULL, sizeof(cs_tmp)), INT("w", W),
+         INT("height", H), FLOAT("threshold", 0.3f), INT("detail", 1));
+    TEST("calc_detail_blend inverted", "blendop", "calc_detail_blend",
+         BUFFER("in", cs_blend, sizeof(cs_blend)), BUFFER_OUT("out", NULL, sizeof(cs_tmp)), INT("w", W),
+         INT("height", H), FLOAT("threshold", 0.3f), INT("detail", 0));
+    TEST("write_blended_dual", "demosaic_rcd", "write_blended_dual",
+         IMG_IN("high", image_in), IMG_IN("low", dual_low), IMG_OUT("out"), INT("w", W), INT("height", H),
+         BUFFER("mask", cs_blend, sizeof(cs_blend)), INT("showmask", 0));
   }
 
   // VNG for one Bayer pattern and X-Trans: the linear interpolation over the

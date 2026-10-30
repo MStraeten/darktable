@@ -1261,3 +1261,59 @@ void blendop_fill_mask(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
   mask.write(int2(x, y), float4(value));
 }
+
+// the luminance, scharr and detail blend kernels of the detail mask and of
+// dual demosaic
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void calc_Y0_mask(uint3 gid : SV_DispatchThreadID,
+                  uniform RWStructuredBuffer<float> mask, uniform ImageIn in,
+                  uniform int w, uniform int height, uniform float4 wb)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+  if(col >= w || row >= height) return;
+  const int idx = row * w + col;
+
+  const float4 pt = wb * max(0.0f, in.Areadpixel(col, row));
+  mask[idx] = dtcl_sqrt((pt.x + pt.y + pt.z) / 3.0f);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void calc_scharr_mask(uint3 gid : SV_DispatchThreadID,
+                      uniform StructuredBuffer<float> in, uniform RWStructuredBuffer<float> out,
+                      uniform int w, uniform int height)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+  if(col >= w || row >= height) return;
+
+  const int oidx = row * w + col;
+  const int incol = clamp(col, 1, w - 2);
+  const int inrow = clamp(row, 1, height - 2);
+  const int idx = inrow * w + incol;
+  const float gradient_magnitude = scharr_gradient(in, idx, w);
+  out[oidx] = clipf(gradient_magnitude / 16.0f);
+}
+
+float _calc_blend_factor(float val, float threshold)
+{
+  // sigmoid with its inflexion point at (threshold, 0.5)
+  return 1.0f / (1.0f + dt_fast_expf(16.0f - (16.0f / threshold) * val));
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void calc_detail_blend(uint3 gid : SV_DispatchThreadID,
+                       uniform StructuredBuffer<float> in, uniform RWStructuredBuffer<float> out,
+                       uniform int w, uniform int height, uniform float threshold, uniform int detail)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+  if(col >= w || row >= height) return;
+
+  const int idx = row * w + col;
+  const float blend = clipf(_calc_blend_factor(in[idx], threshold));
+  out[idx] = detail != 0 ? blend : 1.0f - blend;
+}
