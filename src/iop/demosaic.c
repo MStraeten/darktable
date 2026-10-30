@@ -1570,8 +1570,7 @@ gboolean process_slang(dt_iop_module_t *self,
     && direct
     && iwidth >= 16 && iheight >= 16
     && dt_pipe_no_mask_display(pipe)
-    && !pipe->want_detail_mask
-    && (run_fast || !d->cs_enabled);
+    && !pipe->want_detail_mask;
   if(!supported) return FALSE;
 
   dt_iop_demosaic_gui_data_t *g = self->gui_data;
@@ -1584,6 +1583,43 @@ gboolean process_slang(dt_iop_module_t *self,
   }
 
   dt_dev_clear_scharr_mask(pipe);
+
+  // the autotuning of capture sharpening, as in process_cl()
+  const gboolean do_capture = !run_fast && d->cs_enabled;
+  if(do_capture)
+  {
+    dt_iop_demosaic_data_t *dw = piece->data;
+    const gboolean fullpipe = dt_pipe_is_full(pipe);
+    gboolean autotune = d->cs_radius == 0.0f && !dt_image_altered(img->id);
+    if(g)
+    {
+      dt_iop_gui_enter_critical_section(self);
+      if(autotune && fullpipe)
+        g->autotune_request = TRUE;
+      autotune = fullpipe && g->autotune_request;
+      dt_iop_gui_leave_critical_section(self);
+    }
+
+    if(autotune)
+    {
+      const float cs_thrs = _capture_noise(self, piece);
+      const float cs_radius = _capture_radius_slang(self, piece, dev_in, roi_in, piece->xtrans, filters);
+      dw->cs_radius = cs_radius;
+      dw->cs_thrs = cs_thrs;
+
+      if(g)
+      {
+        dt_iop_gui_enter_critical_section(self);
+        g->autotune_result = TRUE;
+        g->new_radius = cs_radius;
+        g->new_thrs = cs_thrs;
+        dt_iop_gui_leave_critical_section(self);
+      }
+
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "autotuned capture",
+        pipe, self, DT_DEVICE_NONE, roi_in, NULL, "threshold=%.2f radius=%.2f", cs_thrs, cs_radius);
+    }
+  }
 
   // the masks are not displayed, which process_cl() calls no_masking
   const gboolean greens = is_bayer && d->green_eq != DT_IOP_GREEN_EQ_NO && !run_fast;
@@ -1607,6 +1643,10 @@ gboolean process_slang(dt_iop_module_t *self,
       default:
         ok = process_markesteijn_slang(piece, in_image, dev_out, piece->xtrans, iwidth, iheight);
     }
+
+  if(ok && do_capture)
+    ok = _capture_sharpen_slang(self, piece, in_image, dev_out, iwidth, iheight, roi_in->x, roi_in->y,
+                                piece->xtrans, filters);
 
   if(greens) dt_slang_gpu_image_free(in_image);
 

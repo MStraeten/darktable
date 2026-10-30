@@ -24,6 +24,7 @@
 
 import common;
 import color_conversion;
+import capture_common;
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -373,4 +374,23 @@ void shadows_highlights_mix(uint3 gid : SV_DispatchThreadID,
 
   io.w = w;
   out.write(int2(x, y), io);
+}
+
+// gaussian_kernel_9x9 of ../gaussian.cl for 1 channel, the blur of
+// dt_gaussian_fast_blur_cl_buffer() that capture sharpening uses. The OpenCL
+// kernel also takes 2 and 4 channels; ch is checked so that a caller asking
+// for those gets no output rather than a wrong one
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void gaussian_kernel_9x9(uint3 gid : SV_DispatchThreadID,
+                         uniform StructuredBuffer<float> input, uniform RWStructuredBuffer<float> output,
+                         uniform int width, uniform int height, uniform int ch,
+                         uniform StructuredBuffer<float> kern, uniform float minval, uniform float maxval)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+  if(col >= width || row >= height || ch != 1) return;
+
+  const float val = sum_9x9(input, kern, 0, col, row, width, height, false);
+  output[row * width + col] = clamp(val, minval, maxval);
 }

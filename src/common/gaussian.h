@@ -192,6 +192,17 @@ int dt_gaussian_mean_blur_slang(dt_slang_gpu_buffer_t *buf,
                                 const int height,
                                 const int ch,
                                 const float sigma);
+
+/** Like dt_gaussian_fast_blur_cl_buffer() for 1 channel, from one device
+ *  buffer of the Slang kernels to another. Returns 0 on success.
+ */
+int dt_gaussian_fast_blur_slang_buffer(dt_slang_gpu_buffer_t *dev_in,
+                                       dt_slang_gpu_buffer_t *dev_out,
+                                       const int width,
+                                       const int height,
+                                       const float sigma,
+                                       const float min,
+                                       const float max);
 #endif
 
 // clang-format off

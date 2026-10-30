@@ -1252,6 +1252,22 @@ int dt_gaussian_blur_4c_slang(dt_slang_gpu_image_t *dev_in,
   return err;
 }
 
+int dt_gaussian_fast_blur_slang_buffer(dt_slang_gpu_buffer_t *dev_in,
+                                       dt_slang_gpu_buffer_t *dev_out,
+                                       const int width,
+                                       const int height,
+                                       const float sigma,
+                                       const float min,
+                                       const float max)
+{
+  float kern[25];
+  _calc_9x9_gauss_coeffs(kern, sigma);
+  const int ch = 1;
+  return dt_slang_gpu_run_2d_args("gaussian", "gaussian_kernel_9x9", width, height,
+                                  SLBUF_DEV(dev_in), SLBUF_DEV(dev_out), SLARG(width), SLARG(height),
+                                  SLARG(ch), SLBUF(kern, sizeof(kern)), SLARG(min), SLARG(max));
+}
+
 int dt_gaussian_mean_blur_slang(dt_slang_gpu_buffer_t *buf,
                                 const int width,
                                 const int height,

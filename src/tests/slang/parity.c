@@ -739,6 +739,55 @@ static int make_tests(test_t *t)
          INT("border", 9));
   }
 
+  // capture sharpening of demosaic, on a 4-channel demosaiced image and the
+  // raw it came from. The kernel table picks small and large 9x9 kernels.
+  {
+    enum { CS_ALIGN = 32, CS_TABLE = (W * H + 3) & ~3 };
+    static float cs_ones[W * H], cs_y[W * H], cs_blend[W * H], cs_lum[W * H], cs_tmp[W * H];
+    static float cs_kernels[256 * CS_ALIGN], cs_gauss[25];
+    static unsigned char cs_table[CS_TABLE];
+    for(int k = 0; k < W * H; k++)
+    {
+      cs_ones[k] = 1.0f;
+      cs_y[k] = 0.02f + fabsf(image_in[4 * k + 1]);
+      cs_blend[k] = (k % 11 == 0) ? 0.0f : fminf(fmaxf(image_in[4 * k + 2], 0.0f), 1.0f);
+      cs_lum[k] = 0.01f + fabsf(image_in[4 * k]);
+      cs_tmp[k] = 0.01f + fabsf(image_in[4 * k + 3]);
+      cs_table[k] = (unsigned char)((k * 37) % 256);
+    }
+    for(int k = 0; k < 256 * CS_ALIGN; k++) cs_kernels[k] = 0.01f + 0.04f * frand();
+    for(int k = 0; k < 25; k++) cs_gauss[k] = 0.01f + 0.04f * frand();
+    TEST("prepare_blend", "capture", "prepare_blend",
+         RAW_IN("cfa", image_raw), IMG_IN("dev_out", image_in), INT("filters", bayer[0]),
+         BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER_OUT("mask", cs_ones, sizeof(cs_ones)),
+         BUFFER_OUT("Yold", NULL, sizeof(cs_y)), FLOAT4("wb", 0.9f, 0.95f, 0.85f, 0.0f), INT("w", W),
+         INT("height", H));
+    TEST("modify_blend", "capture", "modify_blend",
+         BUFFER_OUT("blend", cs_blend, sizeof(cs_blend)), BUFFER("Yold", cs_y, sizeof(cs_y)),
+         BUFFER_OUT("luminance", NULL, sizeof(cs_lum)), FLOAT("dthresh", 0.4f), INT("width", W),
+         INT("height", H));
+    TEST_LINE("final_blend", "capture", "final_blend", 0.0, W * H,
+              BUFFER_OUT("blendmask", cs_blend, sizeof(cs_blend)), BUFFER("unblurred", cs_tmp, sizeof(cs_tmp)),
+              INT("pixels", W * H));
+    TEST("gaussian_kernel_9x9", "gaussian", "gaussian_kernel_9x9",
+         BUFFER("input", cs_y, sizeof(cs_y)), BUFFER_OUT("output", NULL, sizeof(cs_y)), INT("width", W),
+         INT("height", H), INT("ch", 1), BUFFER("kern", cs_gauss, sizeof(cs_gauss)), FLOAT("minval", 0.0f),
+         FLOAT("maxval", 1.0f));
+    TEST("kernel_9x9_div", "capture", "kernel_9x9_div",
+         BUFFER("in", cs_y, sizeof(cs_y)), BUFFER_OUT("out", cs_tmp, sizeof(cs_tmp)),
+         BUFFER("luminance", cs_lum, sizeof(cs_lum)), BUFFER("blend", cs_blend, sizeof(cs_blend)),
+         BUFFER("kernels", cs_kernels, sizeof(cs_kernels)), BUFFER("table", cs_table, sizeof(cs_table)),
+         INT("w1", W), INT("height", H));
+    TEST("kernel_9x9_mul", "capture", "kernel_9x9_mul",
+         BUFFER("in", cs_tmp, sizeof(cs_tmp)), BUFFER_OUT("out", cs_y, sizeof(cs_y)),
+         BUFFER("blend", cs_blend, sizeof(cs_blend)), BUFFER("kernels", cs_kernels, sizeof(cs_kernels)),
+         BUFFER("table", cs_table, sizeof(cs_table)), INT("w1", W), INT("height", H));
+    TEST("capture_result", "capture", "capture_result",
+         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("blendmask", cs_blend, sizeof(cs_blend)),
+         BUFFER("luminance", cs_lum, sizeof(cs_lum)), BUFFER("tmp", cs_tmp, sizeof(cs_tmp)), INT("width", W),
+         INT("height", H));
+  }
+
   // VNG for one Bayer pattern and X-Trans: the linear interpolation over the
   // whole image and only on a border, and the gradients on its output
   {
