@@ -25,9 +25,10 @@ import noise_generator;
 
 // each work item paints its pixel with the average of the 5 points of its
 // big pixel that the CPU code takes. The CPU code paints each big pixel up
-// to, but not including, its bottom right corner, so the last column and row
-// of the image are never written there and usually come out black; they are
-// written as zeroes here, to keep both paths alike.
+// to, but not including, its bottom right corner, except that the last big
+// pixel with any width or height also covers the last column or row. A big
+// pixel that starts on the last column or row has none, so that column or
+// row takes the one before it.
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void censorize_pixelate(uint3 gid : SV_DispatchThreadID,
@@ -39,11 +40,17 @@ void censorize_pixelate(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   const int2 size = int2(width, height);
-  const int2 tl = clamp(2 * radius * (int2(x, y) / (2 * radius)), int2(0), size - 1);
+  int2 cell = int2(x, y) / (2 * radius);
+  if(cell.x > 0 && 2 * radius * cell.x >= width - 1) cell.x--;
+  if(cell.y > 0 && 2 * radius * cell.y >= height - 1) cell.y--;
+  const int2 tl = clamp(2 * radius * cell, int2(0), size - 1);
   const int2 cc = clamp(tl + radius, int2(0), size - 1);
   const int2 br = clamp(cc + radius, int2(0), size - 1);
-  if(x >= br.x || y >= br.y)
+  const bool in_x = x < br.x || (br.x == width - 1 && tl.x < br.x);
+  const bool in_y = y < br.y || (br.y == height - 1 && tl.y < br.y);
+  if(!in_x || !in_y)
   {
+    // only an image one pixel wide or high, which the CPU code leaves unpainted
     out.write(int2(x, y), float4(0.0f));
     return;
   }
