@@ -1352,8 +1352,7 @@ gboolean process_slang(dt_iop_module_t *self,
   int err = 0;
 
   // the histogram, before every early return as in process_cl()
-  const gboolean want_histogram = self->dev->gui_attached && dt_pipe_is_full(piece->pipe)
-                                  && dt_iop_has_focus(self) && piece->pipe == self->dev->full.pipe;
+  const gboolean want_histogram = self->dev->gui_attached && piece->pipe == self->dev->preview_pipe;
   if(want_histogram)
   {
     int hist_bins_host[DT_IOP_SATCURVE_HIST_RES] = { 0 };
