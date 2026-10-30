@@ -587,7 +587,7 @@ void highlights_initmask(uint3 gid : SV_DispatchThreadID,
       if(y < iheight && x < iwidth)
       {
         const int color = fcol(y, x, filters, xtrans);
-        const float val = in.readsingle(x, y);
+        const float val = in.Areadsingle(x, y);
         mbuff[color] += (val >= clips[color]) ? 1 : 0;
       }
     }
@@ -662,45 +662,6 @@ float _calc_refavg(ImageIn in, StructuredBuffer<uint> xtrans, uint filters,
   const float croot_refavg[3] = { 0.5f * (mean[1] + mean[2]), 0.5f * (mean[0] + mean[2]), 0.5f * (mean[0] + mean[1]) };
   const int color = fcol(row, col, filters, xtrans);
   return fcube(croot_refavg[color]);
-}
-
-// one row per work item, dispatched as height x 1
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void highlights_chroma(uint3 gid : SV_DispatchThreadID,
-                       uniform ImageIn in, uniform RWStructuredBuffer<uint> mask, uniform RWStructuredBuffer<float> accu,
-                       uniform int width, uniform int height, uniform int msize, uniform int mwidth,
-                       uniform uint filters, uniform StructuredBuffer<uint> xtrans,
-                       uniform StructuredBuffer<float> clips, uniform StructuredBuffer<float> correction)
-{
-  const int row = gid.y * 16 + gid.x;
-  if(row >= height) return;
-
-  float sum[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-  float cnt[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-
-  float clipped = 0.0f;
-  for(int col = 0; col < width; col++)
-  {
-    const int color = fcol(row, col, filters, xtrans);
-    const float inval = in.Areadsingle(col, row);
-    const int px = color * msize + (row/3) * mwidth + col/3;
-    const bool masked = _mask_get(mask, px) != 0;
-    if(masked && (inval > 0.2f*clips[color]) && (inval < clips[color]))
-    {
-      const float ref = _calc_refavg(in, xtrans, filters, row, col, height, width, correction);
-      sum[color] += inval - ref;
-      cnt[color] += 1.0f;
-    }
-    if(masked) clipped += 1.0f;
-  }
-
-  for(int c = 0; c < 3; c++)
-  {
-    accu[row*8 + 2*c] = sum[c];
-    accu[row*8 + 2*c +1] = cnt[c];
-  }
-  accu[row*8 + 6] = clipped;
 }
 
 [shader("compute")]

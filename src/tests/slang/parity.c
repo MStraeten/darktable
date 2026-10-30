@@ -101,11 +101,9 @@ static void make_inputs(void)
     for(int c = 0; c < 3; c++) rcd_rgb[c][k] = rcd_cfa[k] * (0.9f + 0.2f * frand());
   }
 
-  // a sparse mask of 3x3 cells for the opposed highlights, for three colors.
-  // highlights_chroma reads a cell past the end of a plane for the last
-  // column, as the host code allocates it, so there is some room after.
+  // a sparse mask of 3x3 cells for the opposed highlights, for three colors
   const int msize = ((W / 3 + 3) / 4 * 4) * ((H / 3 + 3) / 4 * 4);
-  mask_bytes = calloc(1, 3 * msize + 64);
+  mask_bytes = calloc(1, 3 * msize);
   for(int k = 0; k < 3 * msize; k++) mask_bytes[k] = frand() < 0.05f;
   for(size_t k = 0; k < (size_t)W * H; k++)
   {
@@ -618,10 +616,10 @@ static int make_tests(test_t *t)
   static const float hl_clips[4] = { 0.95f, 0.98f, 0.9f, 1.0f };
   static const float hl_correction[4] = { 1.1f, 1.0f, 0.9f, 1.0f };
   static const float hl_chroma[4] = { 0.05f, -0.02f, 0.03f, 0.0f };
-  static const char *bayer_labels[2][6] = {
-    { "whitebalance_1f rggb", "highlights_1f_clip rggb", "highlights_initmask rggb", "highlights_chroma rggb",
+  static const char *bayer_labels[2][5] = {
+    { "whitebalance_1f rggb", "highlights_1f_clip rggb", "highlights_initmask rggb",
       "highlights_opposed rggb", "border_interpolate rggb" },
-    { "whitebalance_1f bggr", "highlights_1f_clip bggr", "highlights_initmask bggr", "highlights_chroma bggr",
+    { "whitebalance_1f bggr", "highlights_1f_clip bggr", "highlights_initmask bggr",
       "highlights_opposed bggr", "border_interpolate bggr" } };
 
   // the opposed method's 3x3 downscaled masks, one byte per cell and color
@@ -643,18 +641,12 @@ static int make_tests(test_t *t)
          RAW_IN("in", image_raw), BYTES_OUT("inmask", 3 * msize), INT("msize", msize), INT("mwidth", mwidth),
          INT("mheight", mheight), INT("iwidth", W), INT("iheight", H), INT("filters", bayer[b]),
          BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)));
-    TEST_LINE(bayer_labels[b][3], "basic", "highlights_chroma", 0.0, H,
-         RAW_IN("in", image_raw), BUFFER("mask", mask_bytes, 3 * msize + 64),
-         BUFFER_OUT("accu", NULL, sizeof(float) * 8 * H), INT("width", W), INT("height", H),
-         INT("msize", msize), INT("mwidth", mwidth), INT("filters", bayer[b]),
-         BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)),
-         BUFFER("correction", hl_correction, sizeof(hl_correction)));
-    TEST(bayer_labels[b][4], "basic", "highlights_opposed",
+    TEST(bayer_labels[b][3], "basic", "highlights_opposed",
          RAW_IN("in", image_raw), RAW_OUT("out"), INT("owidth", W), INT("oheight", H),
          INT("iwidth", W), INT("iheight", H), INT("dx", 0), INT("dy", 0), INT("filters", bayer[b]),
          BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)),
          BUFFER("chroma", hl_chroma, sizeof(hl_chroma)), BUFFER("correction", hl_correction, sizeof(hl_correction)));
-    TEST(bayer_labels[b][5], "demosaic_ppg", "border_interpolate",
+    TEST(bayer_labels[b][4], "demosaic_ppg", "border_interpolate",
          RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[b]));
   }
   TEST("whitebalance_1f_xtrans", "basic", "whitebalance_1f_xtrans",

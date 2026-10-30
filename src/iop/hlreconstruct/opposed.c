@@ -833,9 +833,11 @@ static gboolean process_opposed_slang(dt_iop_module_t *self,
   const gboolean wbon = dsc->temperature.enabled;
   const dt_aligned_pixel_t icoeffs = { wbon ? dsc->temperature.coeffs[0] : 1.0f,
                                        wbon ? dsc->temperature.coeffs[1] : 1.0f,
-                                       wbon ? dsc->temperature.coeffs[2] : 1.0f};
+                                       wbon ? dsc->temperature.coeffs[2] : 1.0f,
+                                       1.0f };
 
   const dt_aligned_pixel_t clips = { clipval * icoeffs[0], clipval * icoeffs[1], clipval * icoeffs[2], 1.0f};
+  const dt_aligned_pixel_t lo_clips = { 0.2f * clips[0], 0.2f * clips[1], 0.2f * clips[2], 1.0f };
 
   const dt_dev_wb_t *wb = &piece->pipe->wb;
   const gboolean late = wb->late_correction;
@@ -884,21 +886,21 @@ static gboolean process_opposed_slang(dt_iop_module_t *self,
     const int iheight = roi_in->height;
     const int mwidth  = iwidth / 3;
     const int mheight = iheight / 3;
-    const int msize = dt_round_size((size_t) mwidth, 4) * dt_round_size(mheight, 4);
-    // three byte planes, in a buffer as large as OpenCL's, since
-    // highlights_chroma reads one cell past a plane at the last column
-    const size_t mbufsize = sizeof(float) * msize;
-    const int mwords = msize;
+    const int msize = mwidth * mheight;
+    // three byte planes, packed four to a word in the Slang buffers
+    const size_t mbufsize = 3 * (size_t)msize;
+    const int mwords = (mbufsize + 3) / 4;
     const int clear_width = 4096;
     const int clear_height = (mwords + clear_width - 1) / clear_width;
-    const size_t accu_floats = 8 * iheight;
 
-    dt_slang_gpu_buffer_t *inmask = dt_slang_gpu_buffer_new(mbufsize, NULL);
-    dt_slang_gpu_buffer_t *outmask = dt_slang_gpu_buffer_new(mbufsize, NULL);
-    dt_slang_gpu_buffer_t *accu = dt_slang_gpu_buffer_new(sizeof(float) * accu_floats, NULL);
-    float *claccu = dt_alloc_align_float(accu_floats);
+    dt_slang_gpu_buffer_t *inmask = dt_slang_gpu_buffer_new(sizeof(uint32_t) * mwords, NULL);
+    dt_slang_gpu_buffer_t *outmask = dt_slang_gpu_buffer_new(sizeof(uint32_t) * mwords, NULL);
+    char *mask = dt_alloc_aligned(sizeof(uint32_t) * mwords);
+    float *indata = dt_alloc_align_float((size_t)iwidth * iheight);
 
-    ok = inmask && outmask && accu && claccu
+    // as process_opposed_cl(), the chrominance is summed in double on the
+    // host, from the dilated mask and the input read back
+    ok = inmask && outmask && mask && indata
       && !dt_slang_gpu_run_2d_args("basic", "highlights_clearmask", clear_width, clear_height,
                                    SLBUF_DEV(inmask), SLARG(clear_width), SLARG(mwords))
       && !dt_slang_gpu_run_2d_args("basic", "highlights_clearmask", clear_width, clear_height,
@@ -911,31 +913,39 @@ static gboolean process_opposed_slang(dt_iop_module_t *self,
       && !dt_slang_gpu_run_2d_args("basic", "highlights_dilatemask", mwidth, mheight,
                                    SLBUF_DEV(inmask), SLBUF_DEV(outmask),
                                    SLARG(msize), SLARG(mwidth), SLARG(mheight))
-      && !dt_slang_gpu_run_1d_args("basic", "highlights_chroma", iheight,
-                                   SLIMG_DEV(dev_in), SLBUF_DEV(outmask), SLBUF_DEV(accu),
-                                   SLARG(iwidth), SLARG(iheight), SLARG(msize), SLARG(mwidth),
-                                   SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)),
-                                   SLBUF(clips, sizeof(clips)), SLBUF(correction, sizeof(correction)))
-      && !dt_slang_gpu_buffer_read(accu, claccu, sizeof(float) * accu_floats);
+      && !dt_slang_gpu_image_read(dev_in, indata)
+      && !dt_slang_gpu_buffer_read(outmask, mask, sizeof(uint32_t) * mwords);
 
     if(ok)
     {
-      // collect row data and accumulate
-      dt_aligned_pixel_t sums = { 0.0f, 0.0f, 0.0f};
-      dt_aligned_pixel_t cnts = { 0.0f, 0.0f, 0.0f};
-      float clipped = 0.0f;
+      const uint8_t(*const xtrans)[6] = (const uint8_t(*const)[6])piece->xtrans;
 
-      for(int row = 0; row < iheight; row++)
+      double sums[3] = { 0.0, 0.0, 0.0 };
+      int cnts[3] = { 0, 0, 0 };
+      gboolean anyclipped = FALSE;
+
+      DT_OMP_FOR(reduction(+ : sums, cnts) reduction( | : anyclipped) collapse(2))
+      for(size_t row = 0; row < iheight; row++)
       {
-        for_three_channels(c)
+        for(size_t col = 0; col < iwidth; col++)
         {
-          sums[c] += claccu[8*row + 2*c];
-          cnts[c] += claccu[8*row + 2*c +1];
-          clipped += claccu[8*row + 6];
+          const size_t idx = row * iwidth + col;
+          const int color = fcol(row, col, filters, xtrans);
+          const float inval = indata[idx];
+
+          if((inval < clips[color])
+              && (inval > lo_clips[color])
+              && (mask[color * msize + _raw_to_cmap(mwidth, mheight, row, col)]))
+          {
+            sums[color] += (double)(inval - _calc_refavg(indata, xtrans, filters, row, col, roi_in, correction, TRUE));
+            cnts[color] += 1;
+          }
+          anyclipped |= inval >= clips[color];
         }
       }
+
       for_three_channels(c)
-        chrominance[c] = (cnts[c] > 100.0f) ? sums[c] / cnts[c] : 0.0f;
+        chrominance[c] = cnts[c] > 100 ? (float)(sums[c] / (double)cnts[c]) : 0.0f;
 
       if(self->dev->gui_attached && g && fullpipe)
       {
@@ -943,22 +953,22 @@ static gboolean process_opposed_slang(dt_iop_module_t *self,
         for_three_channels(c)
           g->oppchroma[c] = chrominance[c];
         g->opphash = opphash;
-        g->oppclipped = clipped > 0.0f;
+        g->oppclipped = anyclipped;
         g->oppresult = TRUE;
         dt_iop_gui_leave_critical_section(self);
       }
       dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
           "opposed chroma", piece->pipe, self, DT_DEVICE_NONE, NULL, NULL,
           "%12.7f (%d)%12.7f (%d)%12.7f (%d) clipped=%s",
-          chrominance[0], (int)cnts[0],
-          chrominance[1], (int)cnts[1],
-          chrominance[2], (int)cnts[2],
-          STR_YESNO(clipped > 0.0f));
+          chrominance[0], cnts[0],
+          chrominance[1], cnts[1],
+          chrominance[2], cnts[2],
+          STR_YESNO(anyclipped));
     }
     dt_slang_gpu_buffer_free(inmask);
     dt_slang_gpu_buffer_free(outmask);
-    dt_slang_gpu_buffer_free(accu);
-    dt_free_align(claccu);
+    dt_free_align(mask);
+    dt_free_align(indata);
   }
 
   return ok
