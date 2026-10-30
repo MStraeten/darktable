@@ -70,7 +70,6 @@ typedef struct test_t
   double tolerance; // 0 for the default
   int gw, gh;       // work items, W x H if 0
   int clgw, clgh, cllx, clly; // OpenCL global and local sizes, if they differ from the above
-  int skip_alpha;   // the OpenCL kernel leaves the alpha of 4-channel outputs undefined
   int outliers;     // values allowed past the tolerance, where the math is ill-conditioned
   int nargs;
   arg_t args[MAX_ARGS];

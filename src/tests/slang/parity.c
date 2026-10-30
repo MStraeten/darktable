@@ -1301,15 +1301,10 @@ static int make_tests(test_t *t)
          RAW_IN("in", rcd_dir), IMG_OUT("out"), INT("width", W), INT("height", H));
     static const char *fm_noise[3] = { "filmic_inpaint_noise uniform", "filmic_inpaint_noise gaussian",
                                        "filmic_inpaint_noise poissonian" };
-    // the OpenCL poissonian noise reads uninitialized alpha values, the Slang
-    // one starts them at zero as the CPU code does
     for(int k = 0; k < 3; k++)
-    {
       TEST(fm_noise[k], "filmic", "filmic_inpaint_noise",
            IMG_IN("in", image_in), RAW_IN("mask", rcd_dir), IMG_OUT("out"), INT("width", W), INT("height", H),
            FLOAT("noise_level", 0.2f), FLOAT("threshold", 3.0f), INT("noise_distribution", k));
-      t[n - 1].skip_alpha = k == 2;
-    }
     TEST("init_reconstruct", "filmic", "init_reconstruct",
          IMG_IN("in", image_in), RAW_IN("mask", rcd_dir), IMG_OUT("out"), INT("width", W), INT("height", H));
     static const char *fm_wr[4] = { "wavelets_reconstruct rgb", "wavelets_reconstruct rgb last",
@@ -3052,7 +3047,6 @@ int main(int argc, char **argv)
           if(err > tolerance) over++;
           continue;
         }
-        if(t->skip_alpha && arg->channels == 4 && i % 4 == 3) continue;
         if(isnan(fc[i]) || isnan(fv[i]))
         {
           if(isnan(fc[i]) != isnan(fv[i])) nan_mismatch++;
