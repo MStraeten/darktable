@@ -1317,3 +1317,184 @@ void calc_detail_blend(uint3 gid : SV_DispatchThreadID,
   const float blend = clipf(_calc_blend_factor(in[idx], threshold));
   out[idx] = detail != 0 ? blend : 1.0f - blend;
 }
+
+static const int DT_DEV_PIXELPIPE_DISPLAY_OUTPUT = 1 << 2;
+static const int DT_DEV_PIXELPIPE_DISPLAY_L = 1 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_a = 2 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_b = 3 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_R = 4 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_G = 5 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_B = 6 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_GRAY = 7 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_LCH_C = 8 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_LCH_h = 9 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_HSL_H = 10 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_HSL_S = 11 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_HSL_l = 12 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Jz = 13 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Cz = 14 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_hz = 15 << 3;
+static const int DT_DEV_PIXELPIPE_DISPLAY_ANY = 0xff << 2;
+
+// rgb_to_JzCzhz() of ../blendop.cl, which takes the RGB as XYZ without a profile
+float4 _display_JzCzhz(float4 rgb, ProfileInfo profile_info, ImageIn profile_lut, int use_profile)
+{
+  const float4 xyz = use_profile != 0 ? rgb_matrix_to_xyz(rgb, profile_info, profile_info.matrix_out, profile_lut)
+                                      : rgb;
+  return JzAzBz_to_JzCzhz(XYZ_to_JzAzBz(xyz));
+}
+
+// blendop_display_channel in ../blendop.cl, including its choice of boost
+// factors and exp2 variants
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void blendop_display_channel(uint3 gid : SV_DispatchThreadID,
+                             uniform ImageIn in_a, uniform ImageIn in_b, uniform ImageIn mask, uniform ImageOut out,
+                             uniform int width, uniform int height, uniform int2 offs, uniform int mask_display,
+                             uniform StructuredBuffer<float> boost_factors,
+                             uniform StructuredBuffer<ProfileInfo> profile_info, uniform ImageIn profile_lut,
+                             uniform int use_profile,
+                             uniform StructuredBuffer<ProfileInfo> work_profile_info, uniform ImageIn work_profile_lut,
+                             uniform int use_work_profile)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 a = in_a.readpixel(x + offs.x, y + offs.y);
+  const float4 b = in_b.Areadpixel(x, y);
+  const float opacity = mask.Areadsingle(x, y);
+
+  float c = 0.0f;
+  bool is_lab = false;
+  switch(mask_display & DT_DEV_PIXELPIPE_DISPLAY_ANY)
+  {
+    case DT_DEV_PIXELPIPE_DISPLAY_L:
+      c = a.x / 100.0f / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_L_in]);
+      is_lab = true;
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_L | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = b.x / 100.0f / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_L_out]);
+      is_lab = true;
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_a:
+      c = a.y / 256.0f / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_A_in]) + 0.5f;
+      is_lab = true;
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_a | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = b.y / 256.0f / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_A_out]) + 0.5f;
+      is_lab = true;
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_b:
+      c = a.z / 256.0f / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_B_in]) + 0.5f;
+      is_lab = true;
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_b | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      // the OpenCL kernel reads the a input boost here
+      c = b.z / 256.0f / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_A_in]) + 0.5f;
+      is_lab = true;
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_R:
+      c = a.x / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_RED_in]);
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_R | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = b.x / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_RED_out]);
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_G:
+      c = a.y / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_GREEN_in]);
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_G | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = b.y / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_GREEN_out]);
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_B:
+      c = a.z / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_BLUE_in]);
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_B | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = b.z / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_BLUE_out]);
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_GRAY:
+      c = use_profile == 0 ? 0.3f * a.x + 0.59f * a.y + 0.11f * a.z
+                           : get_rgb_matrix_luminance(a, profile_info[0], profile_info[0].matrix_in, profile_lut);
+      c = c / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_GRAY_in]);
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_GRAY | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = use_profile == 0 ? 0.3f * b.x + 0.59f * b.y + 0.11f * b.z
+                           : get_rgb_matrix_luminance(b, profile_info[0], profile_info[0].matrix_in, profile_lut);
+      c = c / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_GRAY_out]);
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_LCH_C:
+      // the input and output divide differently in the OpenCL kernel
+      c = Lab_2_LCH(a).y / (128.0f * M_SQRT2_F / exp2(boost_factors[DEVELOP_BLENDIF_C_in]));
+      is_lab = true;
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_LCH_C | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = Lab_2_LCH(b).y / (128.0f * M_SQRT2_F) / exp2(boost_factors[DEVELOP_BLENDIF_C_out]);
+      is_lab = true;
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_LCH_h:
+      c = Lab_2_LCH(a).z;
+      is_lab = true;
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_LCH_h | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = Lab_2_LCH(b).z;
+      is_lab = true;
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_HSL_H:
+      c = RGB_2_HSL(a).x;
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_HSL_H | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = RGB_2_HSL(b).x;
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_HSL_S:
+      c = RGB_2_HSL(a).y;
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_HSL_S | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = RGB_2_HSL(b).y;
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_HSL_l:
+      c = RGB_2_HSL(a).z;
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_HSL_l | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = RGB_2_HSL(b).z;
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Jz:
+      c = _display_JzCzhz(a, profile_info[0], profile_lut, use_profile).x / exp2(boost_factors[DEVELOP_BLENDIF_Jz_in]);
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Jz | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = _display_JzCzhz(b, profile_info[0], profile_lut, use_profile).x
+          / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_Jz_out]);
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Cz:
+      c = _display_JzCzhz(a, profile_info[0], profile_lut, use_profile).y
+          / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_Cz_in]);
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_Cz | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = _display_JzCzhz(b, profile_info[0], profile_lut, use_profile).y
+          / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_Cz_out]);
+      break;
+    case DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_hz:
+      c = _display_JzCzhz(a, profile_info[0], profile_lut, use_profile).z
+          / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_hz_in]);
+      break;
+    case (DT_DEV_PIXELPIPE_DISPLAY_JzCzhz_hz | DT_DEV_PIXELPIPE_DISPLAY_OUTPUT):
+      c = _display_JzCzhz(b, profile_info[0], profile_lut, use_profile).z
+          / dtcl_exp2(boost_factors[DEVELOP_BLENDIF_hz_out]);
+      break;
+    default:
+      break;
+  }
+
+  a.xyz = float3(clipf(c));
+  a.w = opacity;
+
+  if(is_lab)
+  {
+    const float4 xyz = use_work_profile != 0
+      ? rgb_matrix_to_xyz(a, work_profile_info[0], work_profile_info[0].matrix_in, work_profile_lut)
+      : sRGB_to_XYZ(a);
+    a = XYZ_to_Lab(xyz);
+    a.w = opacity;
+  }
+
+  out.write(int2(x, y), a);
+}

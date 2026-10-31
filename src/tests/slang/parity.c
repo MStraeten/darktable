@@ -1256,6 +1256,42 @@ static int make_tests(test_t *t)
                   INT("blend_mode", bl_modes[m]), FLOAT("blend_parameter", 1.5f), INT2("offs", 3, 2),
                   INT("mask_display", 0));
       }
+
+    // the channel display of each channel, input and output, with and
+    // without the masking and work profiles
+    static float bl_boost[16];
+    for(int k = 0; k < 16; k++) bl_boost[k] = 0.1f * (k % 5) - 0.15f;
+    // the hue of JzCzhz is undefined near the achromatic axis, where float
+    // rounding decides it on either backend, so the input stays clear of it
+    static float bl_disp_jz[4 * W * H];
+    for(int k = 0; k < W * H; k++)
+    {
+      bl_disp_jz[4 * k] = 0.6f * fabsf(image_in[4 * k]) + 0.2f;
+      bl_disp_jz[4 * k + 1] = 0.3f * fabsf(image_in[4 * k + 1]);
+      bl_disp_jz[4 * k + 2] = 0.5f * fabsf(image_in[4 * k + 2]) + 0.1f;
+      bl_disp_jz[4 * k + 3] = image_in[4 * k + 3];
+    }
+    static char bl_disp_labels[2 * 2 * 15][64];
+    for(int chn = 1; chn <= 15; chn++)
+      for(int outp = 0; outp < 2; outp++)
+        for(int prof = 0; prof < 2; prof++)
+        {
+          // L, a, b and LCh read Lab, the rest RGB
+          const int lab = chn <= 3 || chn == 8 || chn == 9;
+          const int display = (chn << 3) | (outp ? 4 : 0) | 2;
+          char *lbl = bl_disp_labels[(chn - 1) * 4 + outp * 2 + prof];
+          snprintf(lbl, 64, "display_channel %d%s%s", chn, outp ? " out" : "", prof ? " profile" : "");
+          TEST_GRID(lbl, "blendop", "blendop_display_channel", 1e-4, OW, OH,
+                    IMG_IN("in_a", lab ? image_lab : chn == 15 ? bl_disp_jz : image_in),
+                    BL_IMG("in_b", lab ? bl_lab_b : bl_rgb_b, 4),
+                    BL_IMG("mask", bl_form, 1), BL_OUT("out", 4), INT("width", OW), INT("height", OH),
+                    INT2("offs", 3, 2), INT("mask_display", display),
+                    BUFFER("boost_factors", bl_boost, sizeof(bl_boost)),
+                    BUFFER("profile_info", &profile_nonlinear, sizeof(profile_info_t)),
+                    LUT("profile_lut", lut_profile, 256, 256 * 6), INT("use_profile", prof),
+                    BUFFER("work_profile_info", &profile_nonlinear, sizeof(profile_info_t)),
+                    LUT("work_profile_lut", lut_profile, 256, 256 * 6), INT("use_work_profile", prof));
+        }
 #undef BL_IMG
 #undef BL_OUT
   }

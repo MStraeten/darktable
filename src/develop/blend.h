@@ -995,8 +995,7 @@ void dt_develop_blendif_rgb_jzczhz_blend(dt_dev_pixelpipe_iop_t *piece,
 #ifdef HAVE_SLANG_GPU
 struct dt_slang_gpu_image_t;
 
-/** whether dt_develop_blend_process_slang() can blend this piece. Mask and
- * channel display stay on the CPU */
+/** whether dt_develop_blend_process_slang() can blend this piece */
 gboolean dt_develop_blend_slang_supported(dt_iop_module_t *self,
                                           dt_dev_pixelpipe_iop_t *piece,
                                           const dt_iop_roi_t *roi_in,

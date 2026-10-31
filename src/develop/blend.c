@@ -2276,13 +2276,6 @@ gboolean dt_develop_blend_slang_supported(dt_iop_module_t *self,
 
   if(piece->colors != 1 && piece->colors != 4) return FALSE;
 
-  // mask and channel display, of this module or an earlier one
-  const gboolean valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe);
-  if(piece->pipe->mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE
-     || (valid_request && (self->request_mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE
-                           || self->suppress_mask)))
-    return FALSE;
-
   // the guided filter of feathering takes an RGB guide
   const gboolean global_refine_bypass = _flexi_global_refine_bypassed(piece, d);
   _develop_mask_post_processing post_operations[3];
@@ -2392,16 +2385,30 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
   const size_t obuffsize = (size_t)owidth * oheight;
   const int offs[2] = { roi_out->x - roi_in->x, roi_out->y - roi_in->y };
 
-  const gboolean uniform = mask_mode == DEVELOP_MASK_ENABLED;
   const gboolean raster = mask_mode & DEVELOP_MASK_RASTER;
   const gboolean mode_drawn = mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_FLEXI);
+  const gboolean mode_parametric = mask_mode & DEVELOP_MASK_CONDITIONAL;
+
+  // the mask and channel display, as in dt_develop_blend_process_cl()
+  const gboolean valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe);
+  const dt_dev_pixelpipe_display_mask_t request_mask_display =
+      valid_request && (mode_parametric || mode_drawn || d->details != 0.0f)
+        ? self->request_mask_display
+        : DT_DEV_PIXELPIPE_DISPLAY_NONE;
+  const dt_dev_pixelpipe_display_mask_t request_raster_display =
+      valid_request && raster ? self->request_mask_display : DT_DEV_PIXELPIPE_DISPLAY_NONE;
+  const gboolean suppress_mask = self->suppress_mask && valid_request && (mask_mode & ~DEVELOP_MASK_ENABLED);
+  gboolean mask_is_uniform_fallback = FALSE;
+
+  const gboolean uniform = mask_mode == DEVELOP_MASK_ENABLED || suppress_mask;
 
   const gboolean global_refine_bypass = _flexi_global_refine_bypassed(piece, d);
   _develop_mask_post_processing post_operations[3];
   const size_t post_operations_size =
     global_refine_bypass ? 0 : _get_post_operations(d, piece, post_operations);
   const float details = global_refine_bypass ? 0.0f : d->details;
-  const gboolean refine_details = !feqf(details, 0.0f, 1e-6f);
+  // not for suppress_mask, which shows the global opacity
+  const gboolean refine_details = !feqf(details, 0.0f, 1e-6f) && !(uniform && suppress_mask);
 
   const float opacity = CLIP(d->opacity / 100.0f);
 
@@ -2490,6 +2497,7 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
   {
     const gboolean inverted = d->mask_combine & DEVELOP_COMBINE_MASKS_POS;
     gboolean form_missing = FALSE;
+    gboolean form_ok = FALSE;
     // the uniform value of the form part, or -1 for a rendered form
     float fill = -1.0f;
     dt_masks_form_t *form =
@@ -2525,7 +2533,7 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
       piece->blend_refine_roi_out = roi_out;
       piece->blend_refine_slang = &slang_context;
       gboolean pixels_missing = FALSE;
-      const gboolean form_ok = _render_drawn_mask_cached(self, piece, form, roi_in, roi_out,
+      form_ok = _render_drawn_mask_cached(self, piece, form, roi_in, roi_out,
                                                          DT_DEVICE_NONE, mask, &pixels_missing);
       piece->blend_refine_roi_in = NULL;
       piece->blend_refine_roi_out = NULL;
@@ -2603,6 +2611,10 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
         goto error;
     }
 
+    mask_is_uniform_fallback =
+      mode_drawn && dt_blend_may_render_group(self, mask_mode) && !form_ok && !inverted
+      && !form_missing && !refine_details;
+
     // as on the CPU path: the combine inverts for DEVELOP_COMBINE_INV, so
     // the mask, still 0 on the host, goes over its result
     if(form_missing && dt_slang_gpu_image_write(dev_mask, mask)) goto error;
@@ -2675,14 +2687,57 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
     }
   }
 
-  const int blend_mode = d->blend_mode;
-  const float blend_parameter = exp2f(d->blend_parameter);
-  const int mask_display = piece->pipe->mask_display;
-  if(dt_slang_gpu_run_2d_args("blendop", kernel, owidth, oheight,
+  if(request_mask_display & DT_DEV_PIXELPIPE_DISPLAY_ANY)
+  {
+    // the display channel of Lab blending is generated in RGB and transformed
+    // to Lab with the pipe's work profile, as in OpenCL
+    if(!profile_lut)
+    {
+      use_profile = dt_develop_blendif_init_masking_profile(piece, &profile, blend_csp);
+      profile_lut = dt_ioppr_build_iccprofile_params_slang(use_profile ? &profile : NULL, &profile_info,
+                                                           &lut_w, &lut_h);
+      if(!profile_lut) goto error;
+    }
+    dt_iop_order_iccprofile_info_t *work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+    const int use_work_profile = work_profile != NULL;
+    dt_colorspaces_iccprofile_info_slang_t work_profile_info;
+    int wlut_w = 0, wlut_h = 0;
+    float *work_profile_lut = dt_ioppr_build_iccprofile_params_slang(work_profile, &work_profile_info,
+                                                                     &wlut_w, &wlut_h);
+    if(!work_profile_lut) goto error;
+    const int display = request_mask_display;
+    const int err = dt_slang_gpu_run_2d_args("blendop", "blendop_display_channel", owidth, oheight,
        SLIMG_DEV(dev_in), SLIMG_DEV(dev_module), SLIMG_DEV(dev_mask), SLIMG_DEV(dev_out),
-       SLARG(owidth), SLARG(oheight), SLARG(blend_mode), SLARG(blend_parameter), SLARG(offs),
-       SLARG(mask_display)))
-    goto error;
+       SLARG(owidth), SLARG(oheight), SLARG(offs), SLARG(display),
+       SLBUF(d->blendif_boost_factors, sizeof(d->blendif_boost_factors)),
+       SLBUF(&profile_info, sizeof(profile_info)), SLIMG_IN(profile_lut, lut_w, lut_h, 1), SLARG(use_profile),
+       SLBUF(&work_profile_info, sizeof(work_profile_info)), SLIMG_IN(work_profile_lut, wlut_w, wlut_h, 1),
+       SLARG(use_work_profile));
+    free(work_profile_lut);
+    if(err) goto error;
+  }
+  else
+  {
+    const int blend_mode = d->blend_mode;
+    const float blend_parameter = exp2f(d->blend_parameter);
+    // only non-zero if an earlier module set it
+    const int mask_display = piece->pipe->mask_display;
+    if(dt_slang_gpu_run_2d_args("blendop", kernel, owidth, oheight,
+         SLIMG_DEV(dev_in), SLIMG_DEV(dev_module), SLIMG_DEV(dev_mask), SLIMG_DEV(dev_out),
+         SLARG(owidth), SLARG(oheight), SLARG(blend_mode), SLARG(blend_parameter), SLARG(offs),
+         SLARG(mask_display)))
+      goto error;
+  }
+
+  // register if _this_ module should expose mask or display channel, as in
+  // dt_develop_blend_process_cl()
+  const dt_dev_pixelpipe_display_mask_t shown_mask_display =
+    mask_is_uniform_fallback ? request_mask_display & ~DT_DEV_PIXELPIPE_DISPLAY_MASK
+                             : request_mask_display;
+  if(shown_mask_display & (DT_DEV_PIXELPIPE_DISPLAY_MASK | DT_DEV_PIXELPIPE_DISPLAY_CHANNEL))
+    piece->pipe->mask_display = shown_mask_display;
+  else if(request_raster_display & (DT_DEV_PIXELPIPE_DISPLAY_MASK | DT_DEV_PIXELPIPE_DISPLAY_CHANNEL))
+    piece->pipe->mask_display = request_raster_display;
 
   // store the final mask for export or for later modules, as the CPU does
   if(dt_iop_is_raster_mask_stored(piece, BLEND_RASTER_ID))
