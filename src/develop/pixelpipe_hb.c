@@ -1508,6 +1508,25 @@ static inline gboolean _piece_may_tile(const dt_dev_pixelpipe_iop_t *piece)
              && piece->module->flags() & IOP_FLAGS_WRITE_DETAILS);
 }
 
+// hands a preview pipe's histogram to the module for its GUI
+static void _histogram_to_module(dt_dev_pixelpipe_t *pipe,
+                                 dt_iop_module_t *module,
+                                 dt_dev_pixelpipe_iop_t *piece)
+{
+  if(piece->histogram
+     && (module->request_histogram & DT_REQUEST_ON)
+     && dt_pipe_is_preview(pipe))
+  {
+    const size_t buf_size = 4 * piece->histogram_stats.bins_count * sizeof(uint32_t);
+    module->histogram = realloc(module->histogram, buf_size);
+    memcpy(module->histogram, piece->histogram, buf_size);
+    module->histogram_stats = piece->histogram_stats;
+    memcpy(module->histogram_max, piece->histogram_max, sizeof(piece->histogram_max));
+    if(module->widget)
+      dt_control_queue_redraw_widget(module->widget);
+  }
+}
+
 static void _collect_histogram_on_CPU(dt_dev_pixelpipe_t *pipe,
                                       dt_develop_t *dev,
                                       const float *input,
@@ -1523,19 +1542,7 @@ static void _collect_histogram_on_CPU(dt_dev_pixelpipe_t *pipe,
     _histogram_collect(piece, input, roi_in, &piece->histogram, piece->histogram_max);
     *pixelpipe_flow |= (PIXELPIPE_FLOW_HISTOGRAM_ON_CPU);
     *pixelpipe_flow &= ~(PIXELPIPE_FLOW_HISTOGRAM_NONE | PIXELPIPE_FLOW_HISTOGRAM_ON_GPU);
-
-    if(piece->histogram
-       && (module->request_histogram & DT_REQUEST_ON)
-       && dt_pipe_is_preview(pipe))
-    {
-      const size_t buf_size = 4 * piece->histogram_stats.bins_count * sizeof(uint32_t);
-      module->histogram = realloc(module->histogram, buf_size);
-      memcpy(module->histogram, piece->histogram, buf_size);
-      module->histogram_stats = piece->histogram_stats;
-      memcpy(module->histogram_max, piece->histogram_max, sizeof(piece->histogram_max));
-      if(module->widget)
-        dt_control_queue_redraw_widget(module->widget);
-    }
+    _histogram_to_module(pipe, module, piece);
   }
 }
 
@@ -2108,6 +2115,49 @@ static void _slang_release(dt_dev_pixelpipe_t *pipe)
   pipe->slang_host_valid = FALSE;
 }
 
+// the module histogram of an image on the device. Where the device can't
+// count it, it is counted on the host: on host if that holds the image, else
+// on a copy read back from the device
+static void _collect_histogram_slang(dt_dev_pixelpipe_t *pipe,
+                                     dt_develop_t *dev,
+                                     dt_slang_gpu_image_t *img,
+                                     const float *host,
+                                     const dt_iop_roi_t *roi_in,
+                                     dt_iop_module_t *module,
+                                     dt_dev_pixelpipe_iop_t *piece,
+                                     dt_pixelpipe_flow_t *pixelpipe_flow)
+{
+  dt_dev_histogram_collection_params_t histogram_params = piece->histogram_params;
+  // if the current module did not specify its own ROI, use the full ROI
+  dt_histogram_roi_t histogram_roi = { .width = roi_in->width, .height = roi_in->height };
+  if(histogram_params.roi == NULL) histogram_params.roi = &histogram_roi;
+
+  if(dt_histogram_helper_slang(&histogram_params, &piece->histogram_stats,
+                               module->input_colorspace(module, pipe, piece), module->histogram_cst,
+                               img, &piece->histogram, piece->histogram_max,
+                               module->histogram_middle_grey, dt_ioppr_get_pipe_work_profile_info(pipe)))
+  {
+    *pixelpipe_flow |= PIXELPIPE_FLOW_HISTOGRAM_ON_GPU;
+    *pixelpipe_flow &= ~(PIXELPIPE_FLOW_HISTOGRAM_NONE | PIXELPIPE_FLOW_HISTOGRAM_ON_CPU);
+    _histogram_to_module(pipe, module, piece);
+    return;
+  }
+
+  float *copy = NULL;
+  if(!host)
+  {
+    copy = dt_iop_image_alloc(roi_in->width, roi_in->height, 4);
+    if(copy && dt_slang_gpu_image_read(img, copy))
+    {
+      dt_free_align(copy);
+      copy = NULL;
+    }
+  }
+  if(host || copy)
+    _collect_histogram_on_CPU(pipe, dev, host ? host : copy, roi_in, module, piece, pixelpipe_flow);
+  dt_free_align(copy);
+}
+
 // the color picker for an image on the device. Where the device can't reduce
 // it, the picker runs on the host: on host if that holds the image, else on
 // a copy read back from the device
@@ -2398,8 +2448,8 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   // the Bayer and X-Trans patterns as seen from this module's roi
   dt_dev_prepare_piece_cfa(piece, roi_in);
 
-  // the cache keeps a focused module's input, and histograms are collected
-  // on the host
+  // the cache keeps a focused module's input; histograms are counted on the
+  // device
   const gboolean histogram = (dev->gui_attached || !(piece->request_histogram & DT_REQUEST_ONLY_IN_GUI))
                              && (piece->request_histogram & DT_REQUEST_ON);
   // the color picker reduces the input and output on the device
@@ -2412,12 +2462,11 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     _slang_release(pipe);
     return 0;
   }
-  if(resident && (important_input || histogram) && !_slang_sync_host(pipe)) return -1;
+  if(resident && important_input && !_slang_sync_host(pipe)) return -1;
 
-  // a colorspace conversion of the input runs on the device if it can, and
-  // the histogram is taken from the converted input
+  // a colorspace conversion of the input runs on the device if it can
   dt_slang_gpu_image_t *dev_in = NULL;
-  if(convert && !histogram)
+  if(convert)
   {
     dt_slang_gpu_image_t *src = resident
       ? pipe->slang_image
@@ -2451,8 +2500,6 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     _slang_release(pipe);
   }
   const float *host_in = converted ? converted : input;
-  if(!converted_on_device)
-    _collect_histogram_on_CPU(pipe, dev, host_in, roi_in, module, piece, pixelpipe_flow);
 
   // a wrapped input may share host_in's memory until it is freed below, so
   // converted is only freed after that
@@ -2463,6 +2510,12 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     dev_in = on_device
       ? pipe->slang_image
       : dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, ch_in, host_in);
+  // the histogram is taken from the converted input
+  if(histogram && dev_in)
+    _collect_histogram_slang(pipe, dev, dev_in,
+                             converted || (!converted_on_device && (!on_device || pipe->slang_host_valid))
+                               ? host_in : NULL,
+                             roi_in, module, piece, pixelpipe_flow);
   // on unified memory the output can be its cacheline, which makes syncing
   // the cacheline free
   dt_slang_gpu_image_t *dev_out = NULL;
