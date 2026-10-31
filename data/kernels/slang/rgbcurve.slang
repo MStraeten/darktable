@@ -20,6 +20,19 @@
 
 import rgb_norms;
 
+// the curve up to its last node and its extrapolation beyond, as process()
+// in src/iop/rgbcurve.c. lookup_unbounded() switches at 1, but the last
+// node can be left of it.
+float _lookup_curve(ImageIn lut, float x, float a[3])
+{
+  if(x < 1.0f / a[0])
+  {
+    const int xi = clamp(int(x * 65536.0f), 0, 0xffff);
+    return lut.read(int2(xi & 0xff, xi >> 8)).x;
+  }
+  return a[1] * dtcl_pow(x * a[0], a[2]);
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void rgbcurve(uint3 gid : SV_DispatchThreadID,
@@ -44,17 +57,17 @@ void rgbcurve(uint3 gid : SV_DispatchThreadID,
 
   if(autoscale == 1) // DT_S_SCALE_MANUAL_RGB
   {
-    pixel.x = lookup_unbounded(table_r, pixel.x, a_r);
-    pixel.y = lookup_unbounded(table_g, pixel.y, a_g);
-    pixel.z = lookup_unbounded(table_b, pixel.z, a_b);
+    pixel.x = _lookup_curve(table_r, pixel.x, a_r);
+    pixel.y = _lookup_curve(table_g, pixel.y, a_g);
+    pixel.z = _lookup_curve(table_b, pixel.z, a_b);
   }
   else if(autoscale == 0) // DT_S_SCALE_AUTOMATIC_RGB
   {
     if(preserve_colors == DT_RGB_NORM_NONE)
     {
-      pixel.x = lookup_unbounded(table_r, pixel.x, a_r);
-      pixel.y = lookup_unbounded(table_r, pixel.y, a_r);
-      pixel.z = lookup_unbounded(table_r, pixel.z, a_r);
+      pixel.x = _lookup_curve(table_r, pixel.x, a_r);
+      pixel.y = _lookup_curve(table_r, pixel.y, a_r);
+      pixel.z = _lookup_curve(table_r, pixel.z, a_r);
     }
     else
     {
@@ -62,7 +75,7 @@ void rgbcurve(uint3 gid : SV_DispatchThreadID,
       const float lum = dt_rgb_norm(pixel, preserve_colors, use_work_profile, profile_info[0], lut);
       if(lum > 0.f)
       {
-        const float curve_lum = lookup_unbounded(table_r, lum, a_r);
+        const float curve_lum = _lookup_curve(table_r, lum, a_r);
         ratio = curve_lum / lum;
       }
       pixel.xyz *= ratio;

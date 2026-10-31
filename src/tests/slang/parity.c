@@ -327,7 +327,6 @@ static void markesteijn_hex(const uint8_t (*const xtrans)[6], signed char allhex
 static const float levels[9] = { 0.05f, 0.45f, 0.9f, 0.0f, 0.5f, 1.0f, 0.1f, 0.4f, 0.95f };
 static const float inv_gamma[3] = { 1.1f, 0.9f, 1.3f };
 static const float coeffs_linear[3] = { 1.0f, 1.0f, 0.6f };
-static const float coeffs_off[3] = { -1.0f, 0.0f, 0.0f };
 static const float matrix3x3[9] = { 0.9f, 0.05f, 0.05f, 0.1f, 0.8f, 0.1f, 0.0f, 0.2f, 0.8f };
 
 static int make_tests(test_t *t)
@@ -386,12 +385,14 @@ static int make_tests(test_t *t)
     const int autoscale = mode == 0 ? 1 : 0;
     const int preserve = mode == 2 ? 1 : 0;
     static const char *labels[3] = { "rgbcurve manual", "rgbcurve automatic", "rgbcurve luminance" };
+    // rgbcurve fits the extrapolation at its last node, here 0.85
+    static const float coeffs_rgbcurve[3] = { 1.0f / 0.85f, 0.9f, 0.8f };
     // same LUT step as for rgblevels above
     TEST_TOL(labels[mode], "rgbcurve", "rgbcurve", mode == 2 ? 1e-3 : 0.0,
          IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
          LUT("table_r", lut_curve, 256, 256), LUT("table_g", lut_curve, 256, 256),
          LUT("table_b", lut_curve, 256, 256),
-         BUFFER("coeffs_r", coeffs_linear, sizeof(coeffs_linear)), BUFFER("coeffs_g", coeffs_off, sizeof(coeffs_off)),
+         BUFFER("coeffs_r", coeffs_linear, sizeof(coeffs_linear)), BUFFER("coeffs_g", coeffs_rgbcurve, sizeof(coeffs_rgbcurve)),
          BUFFER("coeffs_b", coeffs_linear, sizeof(coeffs_linear)),
          INT("autoscale", autoscale), INT("preserve_colors", preserve),
          BUFFER("profile_info", &profile_linear, sizeof(profile_info_t)),
