@@ -68,7 +68,6 @@ typedef struct dt_slang_metal_t
   gboolean usable;
   __strong id<MTLDevice> dev;
   __strong id<MTLCommandQueue> queue;
-  __strong NSMutableDictionary<NSString *, NSObject *> *libraries; // program -> MTLLibrary
   __strong NSMutableDictionary<NSString *, DtSlangKernel *> *kernels; // "program:kernel"
   __strong NSMutableArray<id<MTLCommandBuffer>> *inflight; // committed, not yet checked
   __strong NSMutableArray *images;        // freed device images, most recent first
@@ -104,7 +103,6 @@ static gboolean _init_device(void)
   // the 2D texture limit of the Metal feature set tables
   _mtl.max_image_dim = [_mtl.dev supportsFamily:MTLGPUFamilyApple3] || [_mtl.dev supportsFamily:MTLGPUFamilyMetal3]
                          ? 16384 : 8192;
-  _mtl.libraries = [NSMutableDictionary dictionary];
   _mtl.kernels = [NSMutableDictionary dictionary];
   _mtl.images = [NSMutableArray array];
   _mtl.buffers = [NSMutableArray array];
@@ -149,7 +147,6 @@ void dt_slang_gpu_cleanup(void)
   _mtl.staging = nil;
   g_mutex_unlock(&_staging_lock);
   _mtl.kernels = nil;
-  _mtl.libraries = nil;
   _mtl.queue = nil;
   _mtl.dev = nil;
   _mtl.initialized = _mtl.usable = FALSE;
@@ -241,23 +238,21 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
   DtSlangKernel *k = _mtl.kernels[key];
   if(k) return k;
 
-  // one library per entry point, see data/kernels/slang/CMakeLists.txt
+  // one library per entry point, see data/kernels/slang/CMakeLists.txt. A
+  // library keeps its file open until it is released, and there are more
+  // of them than the 256 files macOS lets a process open by default, so
+  // only the pipeline is kept: it does not need the library once built
   NSString *name = [NSString stringWithFormat:@"%s.%s", program, entry];
-  id<MTLLibrary> lib = (id<MTLLibrary>)_mtl.libraries[name];
   NSError *error = nil;
+  char datadir[PATH_MAX] = { 0 };
+  dt_loc_get_datadir(datadir, sizeof(datadir));
+  NSString *path = [NSString stringWithFormat:@"%s/kernels/slang/%@.metallib", datadir, name];
+  id<MTLLibrary> lib = [_mtl.dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
   if(!lib)
   {
-    char datadir[PATH_MAX] = { 0 };
-    dt_loc_get_datadir(datadir, sizeof(datadir));
-    NSString *path = [NSString stringWithFormat:@"%s/kernels/slang/%@.metallib", datadir, name];
-    lib = [_mtl.dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
-    if(!lib)
-    {
-      dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't load %s: %s", path.UTF8String,
-               error.localizedDescription.UTF8String);
-      return nil;
-    }
-    _mtl.libraries[name] = lib;
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't load %s: %s", path.UTF8String,
+             error.localizedDescription.UTF8String);
+    return nil;
   }
 
   id<MTLFunction> fn = [lib newFunctionWithName:@(entry)];
@@ -301,7 +296,10 @@ static void _preload_kernels(void)
   {
     if(!g_str_has_suffix(file, ".metallib")) continue;
     gchar **parts = g_strsplit(file, ".", 3);
-    if(g_strv_length(parts) == 3) _get_kernel(parts[0], parts[1]);
+    // drains the library each _get_kernel() call leaves behind, so that its
+    // file is closed before the next one is opened
+    if(g_strv_length(parts) == 3)
+      @autoreleasepool { _get_kernel(parts[0], parts[1]); }
     g_strfreev(parts);
   }
   if(dir) g_dir_close(dir);
