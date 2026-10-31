@@ -650,6 +650,17 @@ static int make_tests(test_t *t)
     TEST(bayer_labels[b][4], "demosaic_ppg", "border_interpolate",
          RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", bayer[b]));
   }
+  // the clipped highlights view, cropped as highlights_1f_clip
+  static const unsigned int hl_fc_filters[3] = { 0x94949494u, 0x16161616u, 9u };
+  static const char *hl_fc_labels[3] = { "highlights_false_color rggb", "highlights_false_color bggr",
+                                         "highlights_false_color xtrans" };
+  for(int f = 0; f < 3; f++)
+    TEST(hl_fc_labels[f], "basic", "highlights_false_color",
+         RAW_IN("in", image_raw), RAW_OUT("out"), INT("owidth", W - 5), INT("oheight", H - 4),
+         INT("iwidth", W), INT("iheight", H), INT("dx", 3), INT("dy", 2), INT("filters", hl_fc_filters[f]),
+         BUFFER("xtrans", xtrans, sizeof(xtrans)), FLOAT4("clip", 0.95f, 0.98f, 0.9f, 0.98f));
+  TEST("highlights_4f_clip", "basic", "highlights_4f_clip",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), FLOAT("clip", 0.6f));
   TEST("whitebalance_1f_xtrans", "basic", "whitebalance_1f_xtrans",
        RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H),
        BUFFER("coeffs", wb_coeffs, sizeof(wb_coeffs)), INT("filters", 9),

@@ -365,6 +365,36 @@ void highlights_1f_clip(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), float4(pixel));
 }
 
+// the clipped highlights in false color, as highlights_false_color in
+// data/kernels/basic.cl
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_false_color(uint3 gid : SV_DispatchThreadID,
+                            uniform ImageIn in, uniform ImageOut out,
+                            uniform int owidth, uniform int oheight,
+                            uniform int iwidth, uniform int iheight,
+                            uniform int dx, uniform int dy,
+                            uniform int filters, uniform StructuredBuffer<uint> xtrans,
+                            uniform float4 clip)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= owidth || y >= oheight) return;
+
+  const int irow = y + dy;
+  const int icol = x + dx;
+  float oval = 0.0f;
+  const float clips[4] = { clip.x, clip.y, clip.z, clip.w };
+  if((irow >= 0) && (icol >= 0) && (icol < iwidth) && (irow < iheight))
+  {
+    const float ival = in.Areadsingle(icol, irow);
+    const int c = fcol(irow, icol, uint(filters), xtrans);
+    oval = (ival < clips[c]) ? 0.2f * ival : 1.0f;
+  }
+  out.write(int2(x, y), float4(oval));
+}
+
 // highlights on demosaiced images, which only clips
 [shader("compute")]
 [numthreads(16, 16, 1)]
