@@ -2110,8 +2110,6 @@ static int make_tests(test_t *t)
     // the sample positions come from hypot() and a division, which may each
     // be an ulp off: at 260 pixels from the center that moves a sample by
     // 3e-5 pixels, and on this noise image moves the result by up to 8e-5.
-    // OpenCL computes taps for lanczos3 with the bilinear formula, which at
-    // that width has negative taps and a small norm, so it amplifies more.
     for(int d = 0; d < 4; d++)
       TEST_TOL(md_labels[d], "basic", "md_lens_correction", 1e-3,
                IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("knots_dist", md_knots, sizeof(md_knots)),
