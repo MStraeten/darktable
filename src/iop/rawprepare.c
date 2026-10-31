@@ -503,12 +503,10 @@ gboolean process_slang(dt_iop_module_t *self,
   const dt_iop_rawprepare_data_t *d = piece->data;
   dt_dev_pixelpipe_t *pipe = piece->pipe;
 
-  // gain maps run on the CPU. The pipe converts uint16 input to a float
-  // image, so one kernel serves both.
+  // the pipe converts uint16 input to a float image, so one kernel serves both
   const gboolean mosaic = pipe->dsc.filters && piece->dsc_in.channels == 1;
   const gboolean color_sraw = !(dt_image_is_raw(&pipe->image) || dt_image_is_mono_sraw(&pipe->image));
-  if((mosaic && d->apply_gainmaps)
-     || (!mosaic && piece->dsc_in.channels != 4))
+  if(!mosaic && piece->dsc_in.channels != 4)
     return FALSE;
 
   const int csx = _compute_proper_crop(piece, roi_in, d->left);
@@ -516,11 +514,39 @@ gboolean process_slang(dt_iop_module_t *self,
   const int width = roi_out->width;
   const int height = roi_out->height;
 
-  const int err = dt_slang_gpu_run_2d_args("basic", mosaic ? "rawprepare_1f_unnormalized" : "rawprepare_4f",
-    width, height,
-    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(csx), SLARG(csy),
-    SLBUF(d->sub, sizeof(float) * 4), SLBUF(d->div, sizeof(float) * 4), SLBUF(d->rdiv, sizeof(float) * 4),
-    SLARG(roi_out->x), SLARG(roi_out->y));
+  int err = 0;
+  if(mosaic && d->apply_gainmaps)
+  {
+    const int map_w = d->gainmaps[0]->map_points_h;
+    const int map_h = d->gainmaps[0]->map_points_v;
+    const size_t map_size = (size_t)map_w * map_h;
+    const float im_to_rel_x = 1.0f / piece->buf_in.width;
+    const float im_to_rel_y = 1.0f / piece->buf_in.height;
+    const float rel_to_map_x = 1.0f / d->gainmaps[0]->map_spacing_h;
+    const float rel_to_map_y = 1.0f / d->gainmaps[0]->map_spacing_v;
+    const float map_origin_h = d->gainmaps[0]->map_origin_h;
+    const float map_origin_v = d->gainmaps[0]->map_origin_v;
+
+    float *maps = malloc(sizeof(float) * 4 * map_size);
+    if(!maps) return FALSE;
+    for(int f = 0; f < 4; f++)
+      memcpy(maps + f * map_size, d->gainmaps[f]->map_gain, sizeof(float) * map_size);
+
+    err = dt_slang_gpu_run_2d_args("basic", "rawprepare_1f_gainmap", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(csx), SLARG(csy),
+      SLBUF(d->sub, sizeof(float) * 4), SLBUF(d->div, sizeof(float) * 4), SLBUF(d->rdiv, sizeof(float) * 4),
+      SLARG(roi_out->x), SLARG(roi_out->y),
+      SLBUF(maps, sizeof(float) * 4 * map_size), SLARG(map_w), SLARG(map_h),
+      SLARG(im_to_rel_x), SLARG(im_to_rel_y), SLARG(rel_to_map_x), SLARG(rel_to_map_y),
+      SLARG(map_origin_h), SLARG(map_origin_v));
+    free(maps);
+  }
+  else
+    err = dt_slang_gpu_run_2d_args("basic", mosaic ? "rawprepare_1f_unnormalized" : "rawprepare_4f",
+      width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(csx), SLARG(csy),
+      SLBUF(d->sub, sizeof(float) * 4), SLBUF(d->div, sizeof(float) * 4), SLBUF(d->rdiv, sizeof(float) * 4),
+      SLARG(roi_out->x), SLARG(roi_out->y));
   if(err) return FALSE;
   // before the descriptor changes below, which a CPU rerun must not see
   if(color_sraw && pipe->want_detail_mask && dt_dev_write_scharr_mask_slang(piece, dev_out, roi_out, FALSE))

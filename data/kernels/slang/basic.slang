@@ -872,6 +872,54 @@ void rawprepare_1f_unnormalized(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), float4(oval));
 }
 
+// rawprepare_1f_unnormalized followed by the DNG gain maps, interpolated as
+// in process() rather than with the OpenCL linear sampler. maps holds the
+// four map_w x map_h maps one after the other, in BL() order
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void rawprepare_1f_gainmap(uint3 gid : SV_DispatchThreadID,
+                           uniform ImageIn in, uniform ImageOut out,
+                           uniform int width, uniform int height,
+                           uniform int cx, uniform int cy,
+                           uniform StructuredBuffer<float> sub, uniform StructuredBuffer<float> div,
+                           uniform StructuredBuffer<float> rdiv,
+                           uniform int rx, uniform int ry,
+                           uniform StructuredBuffer<float> maps,
+                           uniform int map_w, uniform int map_h,
+                           uniform float im_to_rel_x, uniform float im_to_rel_y,
+                           uniform float rel_to_map_x, uniform float rel_to_map_y,
+                           uniform float map_origin_h, uniform float map_origin_v)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float pix = in.read(int2(x + cx, y + cy)).x;
+  const int id = BL(ry + cy + y, rx + cx + x);
+  const float n = pix - sub[id];
+  const float q = n * rdiv[id];
+  const float rem = fma_exact(-q, div[id], n);
+  const float oval = fma_exact(rem, rdiv[id], q);
+
+  const float y_map = clamp((float(ry + cy + y) * im_to_rel_y - map_origin_v) * rel_to_map_y, 0.0f, float(map_h));
+  const float x_map = clamp((float(rx + cx + x) * im_to_rel_x - map_origin_h) * rel_to_map_x, 0.0f, float(map_w));
+  const int y_i0 = min(int(y_map), map_h - 1);
+  const int y_i1 = min(y_i0 + 1, map_h - 1);
+  const int x_i0 = min(int(x_map), map_w - 1);
+  const int x_i1 = min(x_i0 + 1, map_w - 1);
+  const float y_frac = y_map - float(y_i0);
+  const float x_frac = x_map - float(x_i0);
+
+  const int base = id * map_w * map_h;
+  const int row0 = base + y_i0 * map_w;
+  const int row1 = base + y_i1 * map_w;
+  const float gain_top = (1.0f - x_frac) * maps[row0 + x_i0] + x_frac * maps[row0 + x_i1];
+  const float gain_bottom = (1.0f - x_frac) * maps[row1 + x_i0] + x_frac * maps[row1 + x_i1];
+  const float gain = (1.0f - y_frac) * gain_top + y_frac * gain_bottom;
+
+  out.write(int2(x, y), float4(oval * gain));
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void rawprepare_4f(uint3 gid : SV_DispatchThreadID,
