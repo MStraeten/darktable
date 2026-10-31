@@ -996,8 +996,7 @@ void dt_develop_blendif_rgb_jzczhz_blend(dt_dev_pixelpipe_iop_t *piece,
 struct dt_slang_gpu_image_t;
 
 /** whether dt_develop_blend_process_slang() can blend this piece. Mask and
- * channel display, feathering, mask blur, and drawn groups that read the
- * module's images stay on the CPU */
+ * channel display stay on the CPU */
 gboolean dt_develop_blend_slang_supported(dt_iop_module_t *self,
                                           dt_dev_pixelpipe_iop_t *piece,
                                           const dt_iop_roi_t *roi_in,
@@ -1012,6 +1011,32 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
                                         struct dt_slang_gpu_image_t *dev_out,
                                         const dt_iop_roi_t *roi_in,
                                         const dt_iop_roi_t *roi_out);
+
+/** the Slang blend's device images and masking profile, lent to the group
+ * renderer as piece->blend_refine_slang, as dt_develop_blend_cl_context_t */
+typedef struct dt_develop_blend_slang_context_t
+{
+  struct dt_slang_gpu_image_t *dev_in;
+  struct dt_slang_gpu_image_t *dev_out;
+  const dt_colorspaces_iccprofile_info_slang_t *profile_info;
+  const float *profile_lut;
+  int lut_w, lut_h;
+  int use_profile;
+  int offs[2];
+  // the parametric elements' images, allocated by the first of them and
+  // released by the blend
+  struct dt_slang_gpu_image_t *dev_ones;
+  struct dt_slang_gpu_image_t *dev_mask;
+  // an element could not be rendered on the device: the blend fails, and the
+  // pipe redoes the module on the CPU
+  gboolean failed;
+} dt_develop_blend_slang_context_t;
+
+/** evaluate blendif settings `d` on the Slang device into `mask`, as
+ * dt_develop_blendif_make_mask_cl() */
+void dt_develop_blendif_make_mask_slang(dt_dev_pixelpipe_iop_t *piece,
+                                        const dt_develop_blend_params_t *const d,
+                                        float *const mask);
 #endif
 
 /** May the blend render mask_id's group as this module's blend mask?

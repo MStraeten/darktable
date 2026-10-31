@@ -131,6 +131,8 @@ typedef struct dt_dev_pixelpipe_iop_t
   // the same images on the device while dt_develop_blend_process_cl runs,
   // where the guides above are not read back; NULL otherwise
   struct dt_develop_blend_cl_context_t *blend_refine_cl;
+  // and on the Slang device while dt_develop_blend_process_slang runs
+  struct dt_develop_blend_slang_context_t *blend_refine_slang;
 
   // the refinements previewed as off, copied at commit time so that the
   // renderer never reads the GUI's set from a worker thread
