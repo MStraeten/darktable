@@ -20,6 +20,7 @@
 #include "common/colorspaces.h"
 #include "common/histogram.h"
 #include "common/opencl.h"
+#include "common/interpolation.h"
 #include "common/slang_gpu.h"
 #include "common/iop_order.h"
 #include "common/imagebuf.h"
@@ -2107,6 +2108,69 @@ static void _slang_release(dt_dev_pixelpipe_t *pipe)
   pipe->slang_host_valid = FALSE;
 }
 
+// the downscale of a non-raw input in the pipe's first step, as the OpenCL
+// path of dt_dev_pixelpipe_process_rec() does it. The result stays on the
+// device as the first module's input, like the output of process_slang(), and
+// output becomes its cacheline. Returns TRUE on success
+static gboolean _slang_clip_and_zoom_input(dt_dev_pixelpipe_t *pipe,
+                                           float *output,
+                                           const dt_iop_roi_t *const roi_out,
+                                           const dt_iop_roi_t *const roi_in,
+                                           const gboolean gamma)
+{
+  if(!pipe->slang_enabled || !dt_slang_gpu_enabled()
+     || roi_out->width >= roi_in->width || roi_out->height >= roi_in->height)
+    return FALSE;
+
+  size_t available = 0;
+  int max_dim = 0;
+  dt_slang_gpu_memory_info(&available, &max_dim);
+  const size_t in_size = sizeof(float) * 4 * roi_in->width * roi_in->height * (gamma ? 2 : 1);
+  const size_t out_size = sizeof(float) * 4 * roi_out->width * roi_out->height * (gamma ? 2 : 1);
+  if(in_size + out_size >= available
+     || MAX(roi_in->width, roi_in->height) > max_dim)
+    return FALSE;
+
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  dt_slang_gpu_image_t *in = dt_slang_gpu_image_wrap(roi_in->width, roi_in->height, 4, pipe->input);
+  dt_slang_gpu_image_t *out = dt_slang_gpu_image_new(roi_out->width, roi_out->height, 4, NULL);
+  dt_slang_gpu_image_t *lin = gamma ? dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, NULL) : in;
+  dt_slang_gpu_image_t *lout = gamma ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, 4, NULL) : out;
+  const float to_linear = 2.4f;
+  const float from_linear = 1.0f / 2.4f;
+  int err = !in || !out || !lin || !lout;
+  if(!err && gamma)
+    err = dt_slang_gpu_run_2d_args("colorspaces", "colorspaces_transform_gamma", roi_in->width, roi_in->height,
+                                   SLIMG_DEV(in), SLIMG_DEV(lin), SLARG(roi_in->width), SLARG(roi_in->height),
+                                   SLARG(to_linear));
+  if(!err)
+    err = dt_interpolation_resample_slang(itor, lout, roi_out, lin, roi_in);
+  if(!err && gamma)
+    err = dt_slang_gpu_run_2d_args("colorspaces", "colorspaces_transform_gamma", roi_out->width, roi_out->height,
+                                   SLIMG_DEV(lout), SLIMG_DEV(out), SLARG(roi_out->width), SLARG(roi_out->height),
+                                   SLARG(from_linear));
+
+  if(lin != in) dt_slang_gpu_image_free(lin);
+  if(lout != out) dt_slang_gpu_image_free(lout);
+  dt_slang_gpu_image_free(in);
+  if(err)
+    dt_slang_gpu_image_free(out);
+  else
+  {
+    _slang_release(pipe);
+    pipe->slang_image = out;
+    pipe->slang_host = output;
+    pipe->slang_host_valid = FALSE;
+  }
+  if(err)
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "slang fallback", pipe, NULL, DT_DEVICE_NONE,
+                  roi_in, roi_out, "clip&zoom of the input on the CPU");
+  else
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "slang clip&zoom", pipe, NULL, DT_DEVICE_NONE,
+                  roi_in, roi_out, "%s", gamma ? "gamma corrected" : "");
+  return !err;
+}
+
 /* Runs the module's process_slang() if it has one and the module needs nothing
    that only the CPU path does. The input stays on the device when the previous
    module ran here too, and the output is left on the device for the next one;
@@ -2893,7 +2957,10 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
         {
 #ifdef HAVE_OPENCL
           gboolean done = FALSE;
-          if(cl_scale_possible)
+#ifdef HAVE_SLANG_GPU
+          done = _slang_clip_and_zoom_input(pipe, *output, roi_out, &roi_in, gamma);
+#endif
+          if(!done && cl_scale_possible)
           {
             cl_mem clin = dt_opencl_copy_host_to_image(pipe->devid, pipe->input, roi_in.width, roi_in.height, bpp);
             cl_mem clout = dt_opencl_alloc_device(pipe->devid, roi_out->width, roi_out->height, bpp);
@@ -2928,6 +2995,9 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
           if(!done)
             dt_iop_clip_and_zoom(*output, pipe->input, roi_out, &roi_in, gamma);
 #else
+#ifdef HAVE_SLANG_GPU
+          if(!_slang_clip_and_zoom_input(pipe, *output, roi_out, &roi_in, gamma))
+#endif
          dt_iop_clip_and_zoom(*output, pipe->input, roi_out, &roi_in, gamma);
 #endif
         }
