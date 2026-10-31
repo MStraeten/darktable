@@ -562,6 +562,14 @@ gboolean dt_dev_write_scharr_mask(dt_dev_pixelpipe_iop_t *piece,
                                   float *const rgb,
                                   const dt_iop_roi_t *const roi_in,
                                   const gboolean mode);
+#ifdef HAVE_SLANG_GPU
+// as dt_dev_write_scharr_mask(), from an RGB image on the Slang device.
+// TRUE on failure.
+gboolean dt_dev_write_scharr_mask_slang(dt_dev_pixelpipe_iop_t *piece,
+                                        struct dt_slang_gpu_image_t *in,
+                                        const dt_iop_roi_t *const roi_in,
+                                        const gboolean mode);
+#endif
 #ifdef HAVE_OPENCL
 int dt_dev_write_scharr_mask_cl(dt_dev_pixelpipe_iop_t *piece,
                                 const cl_mem in,

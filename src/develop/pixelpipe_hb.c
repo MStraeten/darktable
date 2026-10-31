@@ -5047,6 +5047,59 @@ gboolean dt_dev_write_scharr_mask(dt_dev_pixelpipe_iop_t *piece,
   return TRUE;
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean dt_dev_write_scharr_mask_slang(dt_dev_pixelpipe_iop_t *piece,
+                                        struct dt_slang_gpu_image_t *in,
+                                        const dt_iop_roi_t *const roi,
+                                        const gboolean rawmode)
+{
+  dt_dev_pixelpipe_t *p = piece->pipe;
+  dt_dev_clear_scharr_mask(p);
+  if(p->tiling) return TRUE;
+
+  const int width = roi->width;
+  const int height = roi->height;
+  const size_t bsize = sizeof(float) * width * height;
+
+  float *mask = dt_alloc_align_float((size_t)width * height);
+  dt_slang_gpu_buffer_t *out = dt_slang_gpu_buffer_new_uninit(bsize);
+  dt_slang_gpu_buffer_t *tmp = dt_slang_gpu_buffer_new_uninit(bsize);
+  int err = !mask || !out || !tmp;
+
+  const gboolean wboff = !p->dsc.temperature.enabled || !rawmode;
+  const dt_aligned_pixel_t wb =
+      { wboff ? 1.0f : 1.0f / p->dsc.temperature.coeffs[0],
+        wboff ? 1.0f : 1.0f / p->dsc.temperature.coeffs[1],
+        wboff ? 1.0f : 1.0f / p->dsc.temperature.coeffs[2], 1.0f };
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("blendop", "calc_Y0_mask", width, height,
+                                   SLBUF_DEV(tmp), SLIMG_DEV(in), SLARG(width), SLARG(height), SLARG(wb));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("blendop", "calc_scharr_mask", width, height,
+                                   SLBUF_DEV(tmp), SLBUF_DEV(out), SLARG(width), SLARG(height));
+  if(!err) err = dt_slang_gpu_buffer_read(out, mask, bsize);
+  dt_slang_gpu_buffer_free(out);
+  dt_slang_gpu_buffer_free(tmp);
+
+  if(err)
+  {
+    dt_print_pipe(DT_DEBUG_ALWAYS, "couldn't write scharr mask slang", p, NULL, DT_DEVICE_NONE, roi, NULL);
+    dt_free_align(mask);
+    return TRUE;
+  }
+
+  p->scharr.data = mask;
+  p->scharr.size = bsize;
+  memcpy(&p->scharr.roi, roi, sizeof(dt_iop_roi_t));
+  p->scharr.hash = dt_hash(DT_INITHASH, &p->scharr.roi, sizeof(dt_iop_roi_t));
+
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE, "write scharr mask slang",
+                p, NULL, DT_DEVICE_NONE, roi, NULL);
+  return FALSE;
+}
+#endif
+
 #ifdef HAVE_OPENCL
 int dt_dev_write_scharr_mask_cl(dt_dev_pixelpipe_iop_t *piece,
                                 const cl_mem in,

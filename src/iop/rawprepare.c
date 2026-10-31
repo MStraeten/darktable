@@ -503,13 +503,12 @@ gboolean process_slang(dt_iop_module_t *self,
   const dt_iop_rawprepare_data_t *d = piece->data;
   dt_dev_pixelpipe_t *pipe = piece->pipe;
 
-  // gain maps and the detail mask of color sraws run on the CPU. The pipe
-  // converts uint16 input to a float image, so one kernel serves both.
+  // gain maps run on the CPU. The pipe converts uint16 input to a float
+  // image, so one kernel serves both.
   const gboolean mosaic = pipe->dsc.filters && piece->dsc_in.channels == 1;
   const gboolean color_sraw = !(dt_image_is_raw(&pipe->image) || dt_image_is_mono_sraw(&pipe->image));
   if((mosaic && d->apply_gainmaps)
-     || (!mosaic && piece->dsc_in.channels != 4)
-     || (color_sraw && pipe->want_detail_mask))
+     || (!mosaic && piece->dsc_in.channels != 4))
     return FALSE;
 
   const int csx = _compute_proper_crop(piece, roi_in, d->left);
@@ -523,6 +522,9 @@ gboolean process_slang(dt_iop_module_t *self,
     SLBUF(d->sub, sizeof(float) * 4), SLBUF(d->div, sizeof(float) * 4), SLBUF(d->rdiv, sizeof(float) * 4),
     SLARG(roi_out->x), SLARG(roi_out->y));
   if(err) return FALSE;
+  // before the descriptor changes below, which a CPU rerun must not see
+  if(color_sraw && pipe->want_detail_mask && dt_dev_write_scharr_mask_slang(piece, dev_out, roi_out, FALSE))
+    return FALSE;
 
   if(pipe->dsc.filters)
   {

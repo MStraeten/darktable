@@ -1598,8 +1598,7 @@ gboolean process_slang(dt_iop_module_t *self,
          && (method == DT_IOP_DEMOSAIC_VNG || method == DT_IOP_DEMOSAIC_MARKESTEIJN
              || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3 || passthru)))
     && iwidth >= 16 && iheight >= 16
-    && dt_pipe_no_mask_display(pipe)
-    && !pipe->want_detail_mask;
+    && dt_pipe_no_mask_display(pipe);
   if(!supported) return FALSE;
 
   dt_iop_demosaic_gui_data_t *g = self->gui_data;
@@ -1702,6 +1701,9 @@ gboolean process_slang(dt_iop_module_t *self,
     dt_slang_gpu_image_free(high);
     dt_slang_gpu_image_free(low);
   }
+
+  if(ok && pipe->want_detail_mask)
+    ok = !dt_dev_write_scharr_mask_slang(piece, full, roi_in, TRUE);
 
   if(ok && d->color_smoothing != DT_DEMOSAIC_SMOOTH_OFF && !run_fast)
     ok = color_smoothing_slang(full, iwidth, iheight, d->color_smoothing);
