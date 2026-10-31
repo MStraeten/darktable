@@ -1536,8 +1536,9 @@ finish:
 #ifdef HAVE_SLANG_GPU
 // RCD, PPG, VNG4 and the passthroughs on Bayer data and VNG, Markesteijn and
 // the passthroughs on X-Trans, with green equilibration, color smoothing,
-// capture sharpening, dual demosaic and the low quality thumbnails, but
-// without the options that need more kernels: the masks and details
+// capture sharpening, dual demosaic, downscaled output and the low quality
+// thumbnails, but without the options that need more kernels: the masks and
+// details
 gboolean process_slang(dt_iop_module_t *self,
                        dt_dev_pixelpipe_iop_t *piece,
                        dt_slang_gpu_image_t *dev_in,
@@ -1596,7 +1597,6 @@ gboolean process_slang(dt_iop_module_t *self,
      || (is_xtrans
          && (method == DT_IOP_DEMOSAIC_VNG || method == DT_IOP_DEMOSAIC_MARKESTEIJN
              || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3 || passthru)))
-    && direct
     && iwidth >= 16 && iheight >= 16
     && dt_pipe_no_mask_display(pipe)
     && !pipe->want_detail_mask;
@@ -1654,9 +1654,11 @@ gboolean process_slang(dt_iop_module_t *self,
   const gboolean greens = is_bayer && d->green_eq != DT_IOP_GREEN_EQ_NO && !run_fast;
   dt_slang_gpu_image_t *in_image = greens ? dt_slang_gpu_image_new(iwidth, iheight, 1, NULL) : dev_in;
   // dual demosaic blends the demosaic in high with a VNG one in low
-  dt_slang_gpu_image_t *high = dual ? dt_slang_gpu_image_new(iwidth, iheight, 4, NULL) : dev_out;
+  // a downscaled output is demosaiced at full size into full, then resampled
+  dt_slang_gpu_image_t *full = direct ? dev_out : dt_slang_gpu_image_new(iwidth, iheight, 4, NULL);
+  dt_slang_gpu_image_t *high = dual ? dt_slang_gpu_image_new(iwidth, iheight, 4, NULL) : full;
   dt_slang_gpu_image_t *low = dual ? dt_slang_gpu_image_new(iwidth, iheight, 4, NULL) : NULL;
-  gboolean ok = in_image && high && (!dual || low)
+  gboolean ok = in_image && full && high && (!dual || low)
     && (!greens || green_equilibration_slang(self, piece, dev_in, in_image, iwidth, iheight, filters));
 
   if(ok)
@@ -1692,7 +1694,7 @@ gboolean process_slang(dt_iop_module_t *self,
   if(ok && dual)
     ok = process_vng_slang(in_image, low, piece->xtrans, iwidth, iheight, filters, 0, TRUE)
       && color_smoothing_slang(low, iwidth, iheight, DT_DEMOSAIC_SMOOTH_2)
-      && dual_demosaic_slang(piece, high, low, dev_out, iwidth, iheight);
+      && dual_demosaic_slang(piece, high, low, full, iwidth, iheight);
 
   if(greens) dt_slang_gpu_image_free(in_image);
   if(dual)
@@ -1702,7 +1704,19 @@ gboolean process_slang(dt_iop_module_t *self,
   }
 
   if(ok && d->color_smoothing != DT_DEMOSAIC_SMOOTH_OFF && !run_fast)
-    ok = color_smoothing_slang(dev_out, iwidth, iheight, d->color_smoothing);
+    ok = color_smoothing_slang(full, iwidth, iheight, d->color_smoothing);
+
+  // as dt_iop_clip_and_zoom_roi_cl() in process_cl()
+  if(!direct)
+  {
+    dt_iop_roi_t oroi = *roi_out;
+    oroi.x = oroi.y = 0;
+    dt_iop_roi_t iroi = *roi_in;
+    iroi.x = iroi.y = 0;
+    const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+    if(ok) ok = !dt_interpolation_resample_slang(itor, dev_out, &oroi, full, &iroi);
+    dt_slang_gpu_image_free(full);
+  }
   return ok;
 }
 #endif
