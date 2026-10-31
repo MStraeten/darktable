@@ -1318,6 +1318,20 @@ void calc_detail_blend(uint3 gid : SV_DispatchThreadID,
   out[idx] = detail != 0 ? blend : 1.0f - blend;
 }
 
+// a blend mask refined with the detail mask, as at the end of
+// _refine_with_detail_mask() in src/develop/blend.c
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void blendop_detail_multiply(uint3 gid : SV_DispatchThreadID,
+                             uniform ImageIn mask_in, uniform StructuredBuffer<float> detail,
+                             uniform ImageOut mask_out, uniform int width, uniform int height)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  mask_out.write(int2(x, y), float4(mask_in.Areadsingle(x, y) * clipf(detail[y * width + x])));
+}
+
 static const int DT_DEV_PIXELPIPE_DISPLAY_OUTPUT = 1 << 2;
 static const int DT_DEV_PIXELPIPE_DISPLAY_L = 1 << 3;
 static const int DT_DEV_PIXELPIPE_DISPLAY_a = 2 << 3;

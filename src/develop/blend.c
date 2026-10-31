@@ -2305,6 +2305,92 @@ static int _blend_fill_mask_slang(dt_slang_gpu_image_t *mask,
                                   SLIMG_DEV(mask), SLARG(width), SLARG(height), SLARG(value));
 }
 
+// _refine_with_detail_mask() for a mask on the device. The threshold and the
+// blur of the detail mask run there, as in _refine_with_detail_mask_cl(); the
+// geometry of the modules between its source and this one is applied on the
+// host, as on the other paths, and the result goes back to the device to
+// refine the mask there. *mask is replaced by the refined mask. Returns
+// nonzero on a device error; a missing detail mask leaves the mask as it is,
+// as on the CPU.
+static int _refine_with_detail_mask_slang(dt_iop_module_t *self,
+                                          dt_dev_pixelpipe_iop_t *piece,
+                                          dt_slang_gpu_image_t **mask,
+                                          const dt_iop_roi_t *const roi_in,
+                                          const dt_iop_roi_t *const roi_out,
+                                          const float level)
+{
+  if(feqf(level, 0.0f, 1e-6f)) return 0;
+
+  const int detail = level > 0.0f;
+  const float threshold = _detail_mask_threshold(level, detail);
+
+  dt_dev_pixelpipe_t *p = piece->pipe;
+  if(p->scharr.data == NULL)
+  {
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_MASKS, "refine with detail mask",
+                  p, self, DT_DEVICE_NONE, roi_in, roi_out, "no mask data available");
+    dt_control_log(_("detail mask blending error"));
+    return 0;
+  }
+
+  const int iwidth = p->scharr.roi.width;
+  const int iheight = p->scharr.roi.height;
+  const size_t isize = sizeof(float) * iwidth * iheight;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+
+  dt_slang_gpu_buffer_t *dev_scharr = dt_slang_gpu_buffer_new(isize, p->scharr.data);
+  dt_slang_gpu_buffer_t *dev_blend = dev_scharr ? dt_slang_gpu_buffer_new_uninit(isize) : NULL;
+  dt_slang_gpu_buffer_t *dev_lum = dev_blend ? dt_slang_gpu_buffer_new_uninit(isize) : NULL;
+  float *lum = dt_alloc_align_float((size_t)iwidth * iheight);
+  int err = !dev_lum || !lum
+    || dt_slang_gpu_run_2d_args("blendop", "calc_detail_blend", iwidth, iheight,
+                                SLBUF_DEV(dev_scharr), SLBUF_DEV(dev_blend), SLARG(iwidth), SLARG(iheight),
+                                SLARG(threshold), SLARG(detail))
+    || dt_gaussian_fast_blur_slang_buffer(dev_blend, dev_lum, iwidth, iheight, 2.0f, 0.0f, 1.0f)
+    || dt_slang_gpu_buffer_read(dev_lum, lum, isize);
+  dt_slang_gpu_buffer_free(dev_scharr);
+  dt_slang_gpu_buffer_free(dev_blend);
+  dt_slang_gpu_buffer_free(dev_lum);
+  if(err)
+  {
+    dt_free_align(lum);
+    return err;
+  }
+
+  // src_hash encodes what the thresholded mask depends on (scharr data + slider value),
+  // so the distortion cache is invalidated when the details slider changes.
+  const dt_hash_t src_hash = dt_hash(p->scharr.hash, &level, sizeof(level));
+  float *warp_mask = dt_dev_distort_detail_mask(piece, lum, self, src_hash);
+  dt_free_align(lum);
+  if(warp_mask == NULL)
+  {
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_MASKS, "refine with detail mask",
+                  p, self, DT_DEVICE_NONE, roi_in, roi_out, "no mask data available");
+    dt_control_log(_("detail mask blending error"));
+    return 0;
+  }
+
+  dt_print_pipe(DT_DEBUG_PIPE, "refine with detail mask slang", p, self, DT_DEVICE_NONE, roi_in, roi_out);
+
+  dt_slang_gpu_buffer_t *dev_warp = dt_slang_gpu_buffer_new(sizeof(float) * owidth * oheight, warp_mask);
+  dt_free_align(warp_mask);
+  dt_slang_gpu_image_t *refined = dev_warp ? dt_slang_gpu_image_new(owidth, oheight, 1, NULL) : NULL;
+  err = !refined
+    || dt_slang_gpu_run_2d_args("blendop", "blendop_detail_multiply", owidth, oheight,
+                                SLIMG_DEV(*mask), SLBUF_DEV(dev_warp), SLIMG_DEV(refined),
+                                SLARG(owidth), SLARG(oheight));
+  dt_slang_gpu_buffer_free(dev_warp);
+  if(err)
+  {
+    dt_slang_gpu_image_free(refined);
+    return 1;
+  }
+  dt_slang_gpu_image_free(*mask);
+  *mask = refined;
+  return 0;
+}
+
 void dt_develop_blendif_make_mask_slang(dt_dev_pixelpipe_iop_t *piece,
                                         const dt_develop_blend_params_t *const d,
                                         float *const mask)
@@ -2451,20 +2537,11 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
   if(uniform)
   {
     what = "uniform";
-    if(refine_details)
-    {
-      mask = dt_alloc_align_float(obuffsize);
-      if(!mask) goto error;
-      dt_iop_image_fill(mask, opacity, owidth, oheight, 1);
-      _refine_with_detail_mask(self, piece, mask, roi_in, roi_out, details);
-      dev_mask = dt_slang_gpu_image_new(owidth, oheight, 1, mask);
-      if(!dev_mask) goto error;
-    }
-    else
-    {
-      dev_mask = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
-      if(!dev_mask || _blend_fill_mask_slang(dev_mask, owidth, oheight, opacity)) goto error;
-    }
+    dev_mask = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
+    if(!dev_mask || _blend_fill_mask_slang(dev_mask, owidth, oheight, opacity)) goto error;
+    if(refine_details
+       && _refine_with_detail_mask_slang(self, piece, &dev_mask, roi_in, roi_out, details))
+      goto error;
   }
   else if(raster)
   {
@@ -2474,6 +2551,7 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
     gboolean free_mask;
     float *raster_mask = dt_dev_get_raster_mask(piece, _raster_source(piece), d->raster_mask_id,
                                                 self, &free_mask);
+    const gboolean have_raster = raster_mask != NULL;
     if(raster_mask)
     {
       if(d->raster_mask_invert)
@@ -2485,13 +2563,15 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
       else
         dt_iop_image_scaled_copy(mask, raster_mask, opacity, owidth, oheight, 1);
       if(free_mask) dt_free_align(raster_mask);
-      _refine_with_detail_mask(self, piece, mask, roi_in, roi_out, details);
     }
     else
       dt_iop_image_fill(mask, 0.0f, owidth, oheight, 1);
 
     dev_mask = dt_slang_gpu_image_new(owidth, oheight, 1, mask);
     if(!dev_mask) goto error;
+    if(have_raster
+       && _refine_with_detail_mask_slang(self, piece, &dev_mask, roi_in, roi_out, details))
+      goto error;
   }
   else
   {
@@ -2570,15 +2650,8 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
     }
     else
     {
-      if(fill >= 0.0f && refine_details)
-      {
-        mask = dt_alloc_align_float(obuffsize);
-        if(!mask) goto error;
-        dt_iop_image_fill(mask, fill, owidth, oheight, 1);
-      }
       if(mask)
       {
-        _refine_with_detail_mask(self, piece, mask, roi_in, roi_out, details);
         dev_mask_2 = dt_slang_gpu_image_new(owidth, oheight, 1, mask);
         if(!dev_mask_2) goto error;
       }
@@ -2587,6 +2660,8 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
         dev_mask_2 = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
         if(!dev_mask_2 || _blend_fill_mask_slang(dev_mask_2, owidth, oheight, fill)) goto error;
       }
+      if(_refine_with_detail_mask_slang(self, piece, &dev_mask_2, roi_in, roi_out, details))
+        goto error;
 
       float parameters[DEVELOP_BLENDIF_PARAMETER_ITEMS * DEVELOP_BLENDIF_SIZE] DT_ALIGNED_ARRAY;
       dt_develop_blendif_process_parameters(parameters, d);
