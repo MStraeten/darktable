@@ -1291,6 +1291,9 @@ static int make_tests(test_t *t)
                     LUT("profile_lut", lut_profile, 256, 256 * 6), INT("use_profile", prof),
                     BUFFER("work_profile_info", &profile_nonlinear, sizeof(profile_info_t)),
                     LUT("work_profile_lut", lut_profile, 256, 256 * 6), INT("use_work_profile", prof));
+          // a hue of exactly 0 can round to either side of the wrap, 0 or 1,
+          // which is the same hue: Metal and OpenCL differ on a few pixels
+          if(chn == 15) t[n - 1].outliers = 8;
         }
 #undef BL_IMG
 #undef BL_OUT
