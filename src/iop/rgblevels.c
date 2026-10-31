@@ -1534,17 +1534,43 @@ gboolean process_slang(dt_iop_module_t *self,
   dt_iop_rgblevels_data_t *d = piece->data;
   dt_iop_rgblevels_gui_data_t *g = self->gui_data;
 
-  // auto levels read the input on the host, so process() does them
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+
+  // auto levels read the input on the host, as in process_cl()
   if(g && dt_pipe_is_preview(piece->pipe))
   {
     dt_iop_gui_enter_critical_section(self);
-    const gboolean auto_levels = g->call_auto_levels == 1;
+    const gboolean auto_levels = g->call_auto_levels == 1 && !DT_IN_GUI_UPDATE();
+    if(auto_levels) g->call_auto_levels = -1;
     dt_iop_gui_leave_critical_section(self);
-    if(auto_levels) return FALSE;
-  }
 
-  const dt_iop_order_iccprofile_info_t *const work_profile =
-    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+    if(auto_levels)
+    {
+      float *src_buffer = dt_alloc_align_float((size_t)4 * roi_in->width * roi_in->height);
+      if(!src_buffer || dt_slang_gpu_image_read(dev_in, src_buffer))
+      {
+        dt_free_align(src_buffer);
+        // let process() try again
+        dt_iop_gui_enter_critical_section(self);
+        g->call_auto_levels = 1;
+        dt_iop_gui_leave_critical_section(self);
+        return FALSE;
+      }
+
+      memcpy(&g->params, &d->params, sizeof(dt_iop_rgblevels_params_t));
+
+      int box[4] = { 0 };
+      _get_selected_area(self, piece, g, roi_in, box);
+      _auto_levels(src_buffer, roi_in->width, roi_in->height, box,
+                   &(g->params), g->channel, work_profile);
+      dt_free_align(src_buffer);
+
+      dt_iop_gui_enter_critical_section(self);
+      g->call_auto_levels = 2;
+      dt_iop_gui_leave_critical_section(self);
+    }
+  }
   dt_colorspaces_iccprofile_info_slang_t profile_info;
   int lut_width, lut_height;
   float *profile_lut = dt_ioppr_build_iccprofile_params_slang(work_profile, &profile_info,
