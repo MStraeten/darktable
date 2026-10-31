@@ -1630,6 +1630,19 @@ float _lookup_unbounded_twosided(ImageIn lut, float x, StructuredBuffer<float> c
   else return x;
 }
 
+// the L curve up to its last node and its extrapolation beyond, as process()
+// in src/iop/tonecurve.c. lookup_unbounded() switches at 1, but the last
+// node can be left of it.
+float _tonecurve_lookup_L(ImageIn lut, float x, StructuredBuffer<float> a)
+{
+  if(x < 1.0f / a[0])
+  {
+    const int xi = clamp(int(x * 65536.0f), 0, 0xffff);
+    return lut.read(int2(xi & 0xff, xi >> 8)).x;
+  }
+  return a[1] * dtcl_pow(x * a[0], a[2]);
+}
+
 /* kernel for the tonecurve plugin. */
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -1649,7 +1662,7 @@ void tonecurve(uint3 gid : SV_DispatchThreadID,
   float4 pixel = in.read(int2(x, y));
   const float L_in = pixel.x / 100.0f;
   // use lut or extrapolation:
-  const float L = _lookup_unbounded_buf(table_L, L_in, coeffs_L);
+  const float L = _tonecurve_lookup_L(table_L, L_in, coeffs_L);
 
   if(autoscale_ab == 0)
   {
@@ -1686,9 +1699,9 @@ void tonecurve(uint3 gid : SV_DispatchThreadID,
   else if(autoscale_ab == 2)
   {
     float4 xyz = Lab_to_XYZ(pixel);
-    xyz.x = _lookup_unbounded_buf(table_L, xyz.x, coeffs_L);
-    xyz.y = _lookup_unbounded_buf(table_L, xyz.y, coeffs_L);
-    xyz.z = _lookup_unbounded_buf(table_L, xyz.z, coeffs_L);
+    xyz.x = _tonecurve_lookup_L(table_L, xyz.x, coeffs_L);
+    xyz.y = _tonecurve_lookup_L(table_L, xyz.y, coeffs_L);
+    xyz.z = _tonecurve_lookup_L(table_L, xyz.z, coeffs_L);
     pixel.xyz = XYZ_to_Lab(xyz).xyz;
   }
   else if(autoscale_ab == 3)
@@ -1697,9 +1710,9 @@ void tonecurve(uint3 gid : SV_DispatchThreadID,
 
     if(preserve_colors == DT_RGB_NORM_NONE)
     {
-      rgb.x = _lookup_unbounded_buf(table_L, rgb.x, coeffs_L);
-      rgb.y = _lookup_unbounded_buf(table_L, rgb.y, coeffs_L);
-      rgb.z = _lookup_unbounded_buf(table_L, rgb.z, coeffs_L);
+      rgb.x = _tonecurve_lookup_L(table_L, rgb.x, coeffs_L);
+      rgb.y = _tonecurve_lookup_L(table_L, rgb.y, coeffs_L);
+      rgb.z = _tonecurve_lookup_L(table_L, rgb.z, coeffs_L);
     }
     else
     {
@@ -1707,7 +1720,7 @@ void tonecurve(uint3 gid : SV_DispatchThreadID,
       const float lum = dt_rgb_norm(rgb, preserve_colors, 1, profile_info[0], lut);
       if(lum > 0.f)
       {
-        const float curve_lum = _lookup_unbounded_buf(table_L, lum, coeffs_L);
+        const float curve_lum = _tonecurve_lookup_L(table_L, lum, coeffs_L);
         ratio = curve_lum / lum;
       }
       rgb.xyz *= ratio;

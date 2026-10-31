@@ -981,6 +981,8 @@ static int make_tests(test_t *t)
   // tone curve on Lab: the a and b curves bounded and unbounded, a and b
   // scaled with L, the curve on XYZ, and on ProPhoto RGB with and without a norm
   {
+    // the L curve ends left of 1, where its extrapolation takes over
+    static const float tc_coeffs_L[3] = { 1.0f / 0.85f, 0.9f, 0.8f };
     static const float tc_coeffs_ab[12] = { 1.25f, 1.0f, 1.4f, 1.3f, 1.0f, 1.2f,
                                             1.2f, 1.0f, 1.3f, 1.35f, 1.0f, 1.5f };
     static const char *tc_labels[6] = { "tonecurve ab", "tonecurve ab unbounded", "tonecurve scaled ab",
@@ -995,7 +997,7 @@ static int make_tests(test_t *t)
                IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
                LUT("table_L", lut_curve, 256, 256), LUT("table_a", lut_curve, 256, 256),
                LUT("table_b", lut_curve, 256, 256), INT("autoscale_ab", tc_autoscale[k]),
-               INT("unbound_ab", k == 1), BUFFER("coeffs_L", coeffs_linear, sizeof(coeffs_linear)),
+               INT("unbound_ab", k == 1), BUFFER("coeffs_L", tc_coeffs_L, sizeof(tc_coeffs_L)),
                BUFFER("coeffs_ab", tc_coeffs_ab, sizeof(tc_coeffs_ab)), FLOAT("low_approximation", 0.7f),
                INT("preserve_colors", k == 5 ? 1 : 0),
                BUFFER("profile_info", &profile_linear, sizeof(profile_info_t)),
