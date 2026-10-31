@@ -1071,11 +1071,17 @@ gboolean process_slang(dt_iop_module_t *self,
 {
   const dt_iop_colorin_data_t *d = piece->data;
   dt_dev_pixelpipe_t *pipe = piece->pipe;
-  // a Lab input profile is a plain copy, left to the CPU
-  if(d->type == DT_COLORSPACE_LAB) return FALSE;
-
   const int width = roi_in->width;
   const int height = roi_in->height;
+
+  // a Lab input profile is a plain copy
+  if(d->type == DT_COLORSPACE_LAB)
+  {
+    const int zero = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+      SLARG(zero), SLARG(zero));
+  }
 
   const dt_dev_wb_t *wb = &pipe->wb;
   const gboolean corrected = wb->late_correction;

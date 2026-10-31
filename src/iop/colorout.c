@@ -464,13 +464,20 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_out)
 {
   const dt_iop_colorout_data_t *d = piece->data;
-  // a Lab output profile is a plain copy, left to the CPU
-  if(d->type == DT_COLORSPACE_LAB) return FALSE;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // a Lab output profile is a plain copy
+  if(d->type == DT_COLORSPACE_LAB)
+  {
+    const int zero = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+      SLARG(zero), SLARG(zero));
+  }
   // the soft proof's clip and gamut marker are not in the Slang kernel
   if(d->mode != DT_PROFILE_NORMAL) return FALSE;
 
-  const int width = roi_in->width;
-  const int height = roi_in->height;
   float cmatrix[9];
   pack_3xSSE_to_3x3(d->cmatrix, cmatrix);
 
