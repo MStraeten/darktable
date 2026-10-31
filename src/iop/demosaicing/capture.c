@@ -1210,8 +1210,8 @@ static float _capture_radius_slang(dt_iop_module_t *self,
 }
 
 // _capture_sharpen_cl() on the Slang kernels, sharpening dev_out in place
-// from the raw data in dev_in. The mask views are left to the other paths.
-// Returns TRUE on success.
+// from the raw data in dev_in, or showing the blend or sigma mask in its
+// alpha channel. Returns TRUE on success.
 static gboolean _capture_sharpen_slang(dt_iop_module_t *self,
                                        dt_dev_pixelpipe_iop_t *const piece,
                                        dt_slang_gpu_image_t *dev_in,
@@ -1220,6 +1220,8 @@ static gboolean _capture_sharpen_slang(dt_iop_module_t *self,
                                        const int height,
                                        const int dx,
                                        const int dy,
+                                       const gboolean showmask,
+                                       const gboolean show_sigmamask,
                                        const uint8_t (*const xtrans)[6],
                                        const uint32_t filters)
 {
@@ -1229,7 +1231,7 @@ static gboolean _capture_sharpen_slang(dt_iop_module_t *self,
 
   if(dt_pipe_is_thumb(pipe) && !_get_thumb_quality(pipe->final_width, pipe->final_height))
     return TRUE;
-  if(!d->cs_enabled) return TRUE;
+  if(!d->cs_enabled && !showmask) return TRUE;
 
   const int pixels = width * height;
   const size_t bsize = sizeof(float) * pixels;
@@ -1284,7 +1286,16 @@ static gboolean _capture_sharpen_slang(dt_iop_module_t *self,
     err = dt_slang_gpu_run_1d_args("capture", "final_blend", pixels,
                                    SLBUF_DEV(blendmask), SLBUF_DEV(tmp2), SLARG(pixels));
 
-  for(int iter = 0; iter < d->cs_iter && !err; iter++)
+  const gboolean show = showmask || show_sigmamask;
+  if(!err && show)
+  {
+    const int blender = showmask;
+    err = dt_slang_gpu_run_2d_args("capture", "show_blend_mask", width, height,
+                                   SLIMG_DEV(dev_rgb), SLIMG_DEV(dev_out), SLBUF_DEV(blendmask),
+                                   SLBUF_DEV(gauss_idx), SLARG(width), SLARG(height), SLARG(blender));
+  }
+
+  for(int iter = 0; iter < d->cs_iter && !err && !show; iter++)
   {
     err = dt_slang_gpu_run_2d_args("capture", "kernel_9x9_div", width, height,
                                    SLBUF_DEV(tmp1), SLBUF_DEV(tmp2), SLBUF_DEV(luminance), SLBUF_DEV(blendmask),
@@ -1295,7 +1306,7 @@ static gboolean _capture_sharpen_slang(dt_iop_module_t *self,
                                      SLBUF_DEV(gcoeffs), SLBUF_DEV(gauss_idx), SLARG(width), SLARG(height));
   }
 
-  if(!err)
+  if(!err && !show)
     err = dt_slang_gpu_run_2d_args("capture", "capture_result", width, height,
                                    SLIMG_DEV(dev_rgb), SLIMG_DEV(dev_out), SLBUF_DEV(blendmask),
                                    SLBUF_DEV(luminance), SLBUF_DEV(tmp1), SLARG(width), SLARG(height));

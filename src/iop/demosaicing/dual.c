@@ -153,7 +153,8 @@ static gboolean dual_demosaic_slang(const dt_dev_pixelpipe_iop_t *const piece,
                                     dt_slang_gpu_image_t *low_image,
                                     dt_slang_gpu_image_t *out,
                                     const int width,
-                                    const int height)
+                                    const int height,
+                                    const int dual_mask)
 {
   const dt_dev_pixelpipe_t *p = piece->pipe;
   const dt_iop_demosaic_data_t *data = piece->data;
@@ -170,7 +171,6 @@ static gboolean dual_demosaic_slang(const dt_dev_pixelpipe_iop_t *const piece,
   dt_slang_gpu_buffer_t *tmp = dt_slang_gpu_buffer_new_uninit(bsize);
   dt_slang_gpu_buffer_t *mask = dt_slang_gpu_buffer_new_uninit(bsize);
   const int detail = 1;
-  const int showmask = 0;
   int err = !tmp || !mask;
   if(!err)
     err = dt_slang_gpu_run_2d_args("blendop", "calc_Y0_mask", width, height,
@@ -188,7 +188,7 @@ static gboolean dual_demosaic_slang(const dt_dev_pixelpipe_iop_t *const piece,
   if(!err)
     err = dt_slang_gpu_run_2d_args("demosaic_rcd", "write_blended_dual", width, height,
                                    SLIMG_DEV(high_image), SLIMG_DEV(low_image), SLIMG_DEV(out),
-                                   SLARG(width), SLARG(height), SLBUF_DEV(tmp), SLARG(showmask));
+                                   SLARG(width), SLARG(height), SLBUF_DEV(tmp), SLARG(dual_mask));
 
   if(err)
     dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "dual demosaic", p, NULL, DT_DEVICE_NONE, NULL, NULL,

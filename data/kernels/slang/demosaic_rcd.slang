@@ -357,3 +357,31 @@ void write_blended_dual(uint3 gid : SV_DispatchThreadID,
   data.w = showmask != 0 ? blender.x : 0.0f;
   out.write(int2(col, row), data);
 }
+
+// the 3x3 box average of each color, for the highlights mask views
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void demosaic_box3(uint3 gid : SV_DispatchThreadID,
+                   uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                   uniform int filters, uniform StructuredBuffer<uint> xtrans)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+  if(col >= width || row >= height) return;
+  float sum[3] = { 0.0f, 0.0f, 0.0f };
+  float cnt[3] = { 0.0f, 0.0f, 0.0f };
+  for(int y = row - 1; y < row + 2; y++)
+  {
+    for(int x = col - 1; x < col + 2; x++)
+    {
+      if(x >= 0 && y >= 0 && x < width && y < height)
+      {
+        const int color = fcol(y, x, uint(filters), xtrans);
+        sum[color] += max(0.0f, in.Areadsingle(x, y));
+        cnt[color] += 1.0f;
+      }
+    }
+  }
+  out.write(int2(col, row), float4(fp32_div(sum[0], max(1.0f, cnt[0])), fp32_div(sum[1], max(1.0f, cnt[1])),
+                                   fp32_div(sum[2], max(1.0f, cnt[2])), 0.0f));
+}

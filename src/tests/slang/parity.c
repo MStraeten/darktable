@@ -659,6 +659,12 @@ static int make_tests(test_t *t)
          RAW_IN("in", image_raw), RAW_OUT("out"), INT("owidth", W - 5), INT("oheight", H - 4),
          INT("iwidth", W), INT("iheight", H), INT("dx", 3), INT("dy", 2), INT("filters", hl_fc_filters[f]),
          BUFFER("xtrans", xtrans, sizeof(xtrans)), FLOAT4("clip", 0.95f, 0.98f, 0.9f, 0.98f));
+  // the box average of the highlights mask views, which demosaic runs
+  static const char *box3_labels[3] = { "demosaic_box3 rggb", "demosaic_box3 bggr", "demosaic_box3 xtrans" };
+  for(int f = 0; f < 3; f++)
+    TEST(box3_labels[f], "demosaic_rcd", "demosaic_box3",
+         RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H),
+         INT("filters", hl_fc_filters[f]), BUFFER("xtrans", xtrans, sizeof(xtrans)));
   TEST("highlights_4f_clip", "basic", "highlights_4f_clip",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), FLOAT("clip", 0.6f));
   TEST("whitebalance_1f_xtrans", "basic", "whitebalance_1f_xtrans",
@@ -856,6 +862,16 @@ static int make_tests(test_t *t)
     TEST("write_blended_dual", "demosaic_rcd", "write_blended_dual",
          IMG_IN("high", image_in), IMG_IN("low", dual_low), IMG_OUT("out"), INT("w", W), INT("height", H),
          BUFFER("mask", cs_blend, sizeof(cs_blend)), INT("showmask", 0));
+    TEST("write_blended_dual showmask", "demosaic_rcd", "write_blended_dual",
+         IMG_IN("high", image_in), IMG_IN("low", dual_low), IMG_OUT("out"), INT("w", W), INT("height", H),
+         BUFFER("mask", cs_blend, sizeof(cs_blend)), INT("showmask", 1));
+    // the capture mask views, of the blend mask and of the kernel table
+    TEST("show_blend_mask blend", "capture", "show_blend_mask",
+         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("blend_mask", cs_blend, sizeof(cs_blend)),
+         BUFFER("sigma_mask", cs_table, sizeof(cs_table)), INT("width", W), INT("height", H), INT("blender", 1));
+    TEST("show_blend_mask sigma", "capture", "show_blend_mask",
+         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("blend_mask", cs_blend, sizeof(cs_blend)),
+         BUFFER("sigma_mask", cs_table, sizeof(cs_table)), INT("width", W), INT("height", H), INT("blender", 0));
   }
 
   // VNG for one Bayer pattern and X-Trans: the linear interpolation over the

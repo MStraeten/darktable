@@ -16,8 +16,7 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Slang port of ../capture.cl, the capture sharpening of demosaic. The
-// sigma mask view (show_blend_mask) stays on the CPU.
+// Slang port of ../capture.cl, the capture sharpening of demosaic
 
 import common;
 import capture_common;
@@ -168,6 +167,24 @@ void final_blend(uint3 gid : SV_DispatchThreadID,
   const float diff = unblurred[k] - blendmask[k];
   const float w_tmp2 = 1.0f / (1.0f + dtcl_exp(5.0f - 10.0f * diff));
   blendmask[k] = clipf(w_tmp2 * unblurred[k] + (1.0f - w_tmp2) * blendmask[k]);
+}
+
+// the blend or sigma mask in the alpha channel, for the mask views
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void show_blend_mask(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform StructuredBuffer<float> blend_mask,
+                     uniform StructuredBuffer<uint> sigma_mask, uniform int width, uniform int height,
+                     uniform int blender)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+  if(col >= width || row >= height) return;
+
+  float4 pix = max(float4(0.0f), in.Areadpixel(col, row));
+  const int k = row * width + col;
+  pix.w = blender != 0 ? blend_mask[k] : float(_table(sigma_mask, k)) / 255.0f;
+  out.write(int2(col, row), pix);
 }
 
 [shader("compute")]
