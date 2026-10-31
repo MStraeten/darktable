@@ -5097,6 +5097,7 @@ static int rt_process_forms_slang(dt_slang_gpu_image_t *layer,
   dt_develop_blend_params_t *bp = piece->blendop_data;
   dt_iop_retouch_params_t *p = piece->data;
   dt_iop_roi_t *roi_layer = &usr_d->roi;
+  const gboolean mask_display = usr_d->mask_display && (scale == usr_d->display_scale);
 
   // when the requested scales is grather than max scales the residual
   // image index will be different from the one defined by the user,
@@ -5215,6 +5216,24 @@ static int rt_process_forms_slang(dt_slang_gpu_image_t *layer,
       }
       else
         dt_print(DT_DEBUG_ALWAYS, "rt_process_forms: unknown algorithm %i", algo);
+
+      if(!err && mask_display)
+      {
+        const int mwidth = roi_mask_scaled.width;
+        const int mheight = roi_mask_scaled.height;
+        const int ox = roi_mask_scaled.x - roi_layer->x;
+        const int oy = roi_mask_scaled.y - roi_layer->y;
+        dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(mwidth, mheight, 4, NULL);
+        err = !tmp
+          || dt_slang_gpu_run_2d_args("retouch", "retouch_mask_to_alpha", mwidth, mheight,
+                                      SLIMG_DEV(layer), SLIMG_DEV(dev_mask), SLIMG_DEV(tmp),
+                                      SLARG(mwidth), SLARG(mheight), SLARG(ox), SLARG(oy),
+                                      SLARG(form_opacity))
+          || dt_slang_gpu_run_2d_args("retouch", "retouch_rect_to_layer", mwidth, mheight,
+                                      SLIMG_DEV(tmp), SLIMG_DEV(layer),
+                                      SLARG(mwidth), SLARG(mheight), SLARG(ox), SLARG(oy));
+        dt_slang_gpu_image_free(tmp);
+      }
       dt_slang_gpu_image_free(dev_mask);
     }
 
@@ -5235,20 +5254,7 @@ gboolean process_slang(dt_iop_module_t *self,
   dt_iop_retouch_gui_data_t *g = self->gui_data;
   dt_dev_pixelpipe_t *pipe = piece->pipe;
 
-  // the previews of the mask, of a wavelet scale and of the auto levels stay
-  // on the CPU, as does a mask shown by another module, whose alpha channel
-  // process() passes on
-  if(pipe->mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE) return FALSE;
-  if(g && dt_pipe_is_full(pipe))
-  {
-    dt_iop_gui_enter_critical_section(self);
-    const gboolean auto_levels = g->preview_auto_levels == 1;
-    dt_iop_gui_leave_critical_section(self);
-    if(auto_levels
-       || (dt_iop_has_focus(self) && (g->display_wavelet_scale || g->mask_display)))
-      return FALSE;
-  }
-
+  const gboolean display_wavelet_scale = g && dt_iop_has_focus(self) ? g->display_wavelet_scale : FALSE;
   const int width = roi_in->width;
   const int height = roi_in->height;
 
@@ -5263,16 +5269,36 @@ gboolean process_slang(dt_iop_module_t *self,
                             && (pipe == self->dev->full.pipe));
   usr_data.display_scale = p->curr_scale;
 
+  // the mask view and the wavelet scale view show the shapes in the alpha
+  // channel, as in process(); process_cl() does that for the mask view only
+  const gboolean expose_mask = dt_pipe_is_full(pipe) && g
+                               && (g->mask_display || display_wavelet_scale)
+                               && dt_iop_has_focus(self) && (pipe == self->dev->full.pipe);
+
   // all the clone, heal, etc work on a copy of the input, so that the
   // source of one algorithm can be the destination of a previous one
   dt_slang_gpu_image_t *in_retouch = dt_slang_gpu_image_new(width, height, 4, NULL);
-  dwt_params_slang_t *dwt_p = dt_dwt_init_slang(in_retouch, width, height, p->num_scales, 0,
+  dwt_params_slang_t *dwt_p = dt_dwt_init_slang(in_retouch, width, height, p->num_scales,
+                                                (!display_wavelet_scale || !dt_pipe_is_full(pipe))
+                                                ? 0 : p->curr_scale,
                                                 p->merge_from_scale, &usr_data, roi_in->scale / piece->iscale);
   const int zero = 0;
+  const int clear = 1;
   gboolean ok = in_retouch && dwt_p
-    && !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
-                                 SLIMG_DEV(dev_in), SLIMG_DEV(in_retouch), SLARG(width), SLARG(height),
-                                 SLARG(width), SLARG(height), SLARG(zero), SLARG(zero));
+    && (expose_mask
+        ? !dt_slang_gpu_run_2d_args("retouch", "retouch_set_alpha", width, height,
+                                    SLIMG_DEV(dev_in), SLIMG_DEV(dev_in), SLIMG_DEV(in_retouch),
+                                    SLARG(width), SLARG(height), SLARG(clear))
+        : !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                    SLIMG_DEV(dev_in), SLIMG_DEV(in_retouch), SLARG(width), SLARG(height),
+                                    SLARG(width), SLARG(height), SLARG(zero), SLARG(zero)));
+
+  if(ok && expose_mask)
+  {
+    pipe->mask_display = g->mask_display ? DT_DEV_PIXELPIPE_DISPLAY_MASK : DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+    pipe->bypass_blendif = TRUE;
+    usr_data.mask_display = TRUE;
+  }
 
   if(ok && dt_pipe_is_full(pipe))
   {
@@ -5287,10 +5313,64 @@ gboolean process_slang(dt_iop_module_t *self,
     if(g) g->first_scale_visible = dt_dwt_first_scale_visible_slang(dwt_p);
   }
 
-  ok = ok
-    && !dwt_decompose_slang(dwt_p, rt_process_forms_slang)
-    && !_rt_copy_in_to_out_slang(in_retouch, roi_in, dev_out, roi_out, 0, 0, 0.0f, 0.0f, 0.0f);
+  ok = ok && !dwt_decompose_slang(dwt_p, rt_process_forms_slang);
 
+  dt_aligned_pixel_t levels = { p->preview_levels[0],
+                                p->preview_levels[1],
+                                p->preview_levels[2] };
+
+  // the auto levels and the levels of a wavelet scale view run on the host,
+  // as in process_cl()
+  const gboolean scale_levels = ok && dwt_p->return_layer > 0 && dwt_p->return_layer < dwt_p->scales + 1;
+  gboolean auto_levels = FALSE;
+  if(ok && g && dt_pipe_is_full(pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    auto_levels = g->preview_auto_levels == 1 && !DT_IN_GUI_UPDATE();
+    if(auto_levels) g->preview_auto_levels = -1;
+    dt_iop_gui_leave_critical_section(self);
+  }
+  if(auto_levels || scale_levels)
+  {
+    float *host = dt_alloc_align_float((size_t)4 * width * height);
+    ok = host && !dt_slang_gpu_image_read(in_retouch, host);
+    if(ok && auto_levels)
+    {
+      levels[0] = levels[1] = levels[2] = 0;
+      rt_process_stats(self, piece, host, width, height, 4, levels);
+      rt_clamp_minmax(levels, levels);
+      for(int i = 0; i < 3; i++) g->preview_levels[i] = levels[i];
+    }
+    if(ok && scale_levels)
+    {
+      rt_adjust_levels(self, piece, host, width, height, 4, levels);
+      ok = !dt_slang_gpu_image_write(in_retouch, host);
+    }
+    dt_free_align(host);
+  }
+  if(auto_levels)
+  {
+    // a failure leaves the request for process()
+    dt_iop_gui_enter_critical_section(self);
+    g->preview_auto_levels = ok ? 2 : 1;
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  // pass on the alpha channel of a mask shown by another module
+  dt_slang_gpu_image_t *result = in_retouch;
+  if(ok && (pipe->mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK) && g && !g->mask_display)
+  {
+    const int keep = 0;
+    result = dt_slang_gpu_image_new(width, height, 4, NULL);
+    ok = result
+      && !dt_slang_gpu_run_2d_args("retouch", "retouch_set_alpha", width, height,
+                                   SLIMG_DEV(in_retouch), SLIMG_DEV(dev_in), SLIMG_DEV(result),
+                                   SLARG(width), SLARG(height), SLARG(keep));
+  }
+
+  ok = ok && !_rt_copy_in_to_out_slang(result, roi_in, dev_out, roi_out, 0, 0, 0.0f, 0.0f, 0.0f);
+
+  if(result != in_retouch) dt_slang_gpu_image_free(result);
   dt_dwt_free_slang(dwt_p);
   dt_slang_gpu_image_free(in_retouch);
   return ok;

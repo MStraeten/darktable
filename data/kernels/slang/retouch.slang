@@ -118,3 +118,37 @@ void retouch_rect_to_layer(uint3 gid : SV_DispatchThreadID,
 
   layer.write(int2(x + ox, y + oy), rect.Areadpixel(x, y));
 }
+
+// rt_copy_mask_to_alpha(): the mask, for the mask view, raised into the
+// alpha channel of the rectangle at (ox, oy) in the layer
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void retouch_mask_to_alpha(uint3 gid : SV_DispatchThreadID,
+                           uniform ImageIn layer, uniform ImageIn mask, uniform ImageOut out,
+                           uniform int width, uniform int height, uniform int ox, uniform int oy,
+                           uniform float opacity)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float f = mask.Areadpixel(x, y).x * opacity;
+  float4 d = layer.read(int2(x + ox, y + oy));
+  if(f > d.w) d.w = f;
+  out.write(int2(x, y), d);
+}
+
+// the color of rgb with the alpha channel of alpha, or 0 where clear is set
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void retouch_set_alpha(uint3 gid : SV_DispatchThreadID,
+                       uniform ImageIn rgb, uniform ImageIn alpha, uniform ImageOut out,
+                       uniform int width, uniform int height, uniform int clear)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float4 d = rgb.read(int2(x, y));
+  out.write(int2(x, y), float4(d.xyz, clear != 0 ? 0.0f : alpha.read(int2(x, y)).w));
+}
