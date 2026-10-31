@@ -126,7 +126,7 @@ How the two relate depends on what the module does:
 
 The pixelpipe is designed to be threaded.
 -   **CPU**: Modules use OpenMP (`DT_OMP_FOR`) within their `process()` function to parallelize loops.
--   **GPU**: If OpenCL is available and enabled, the pipe looks for `process_cl()` callbacks. The pipe handles data transfer to/from the GPU.
+-   **GPU**: If Slang GPU is available and enabled, the pipe prefers `process_slang()` over `process_cl()`. Otherwise, if OpenCL is available and enabled, it looks for `process_cl()` callbacks. The pipe handles data transfer to/from the GPU and synchronizes results when switching between backends.
 
 ## Pipeline Ordering Asymmetry
 

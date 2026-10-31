@@ -22,6 +22,7 @@
 #include "common/interpolation.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -1140,6 +1141,86 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 
 error:
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_clipping_data_t *d = piece->data;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const int iwidth = roi_in->width;
+  const int iheight = roi_in->height;
+
+  // only crop, no rot fast and sharp path:
+  if(!d->flags && d->angle == 0.0 && d->all_off && iwidth == width && iheight == height)
+  {
+    const int dx = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(dx), SLARG(dx));
+  }
+
+  // kwidth 0 is bilinear, lanczos 0 bicubic, as clip_rotate in basic.slang reads them
+  int kwidth, lanczos;
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+  switch(interpolation->id)
+  {
+    case DT_INTERPOLATION_BILINEAR:
+      kwidth = 0;
+      lanczos = 0;
+      break;
+    case DT_INTERPOLATION_BICUBIC:
+      kwidth = 2;
+      lanczos = 0;
+      break;
+    case DT_INTERPOLATION_LANCZOS2:
+      kwidth = 2;
+      lanczos = 2;
+      break;
+    case DT_INTERPOLATION_LANCZOS3:
+      kwidth = 3;
+      lanczos = 3;
+      break;
+    default:
+      return FALSE;
+  }
+
+  const int roi[2] = { roi_in->x, roi_in->y };
+  const float roo[2] = { roi_out->x - roi_out->scale * d->enlarge_x + roi_out->scale * d->cix,
+                         roi_out->y - roi_out->scale * d->enlarge_y + roi_out->scale * d->ciy };
+  const float t[2] = { d->tx, d->ty };
+  const float k[2] = { d->k_h, d->k_v };
+  const float m[4] = { d->m[0], d->m[1], d->m[2], d->m[3] };
+
+  const float k_sizes[2] = { piece->buf_in.width * roi_in->scale, piece->buf_in.height * roi_in->scale };
+  const float k_space[4] = { d->k_space[0] * k_sizes[0], d->k_space[1] * k_sizes[1],
+                             d->k_apply ? d->k_space[2] * k_sizes[0] : 0.0f,
+                             d->k_space[3] * k_sizes[1] };
+  float ma, mb, md, me, mg, mh;
+  keystone_get_matrix(k_space, d->kxa * k_sizes[0], d->kxb * k_sizes[0], d->kxc * k_sizes[0],
+                      d->kxd * k_sizes[0], d->kya * k_sizes[1], d->kyb * k_sizes[1], d->kyc * k_sizes[1],
+                      d->kyd * k_sizes[1], &ma, &mb, &md, &me, &mg, &mh);
+  const float ka[2] = { d->kxa * k_sizes[0], d->kya * k_sizes[1] };
+  const float maa[4] = { ma, mb, md, me };
+  const float mbb[2] = { mg, mh };
+  const float scale_in = roi_in->scale;
+  const float scale_out = roi_out->scale;
+  const int flip = d->flip;
+
+  return !dt_slang_gpu_run_2d_args("basic", "clip_rotate", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(iwidth), SLARG(iheight), SLARG(roi), SLARG(roo),
+                                   SLARG(scale_in), SLARG(scale_out), SLARG(flip), SLARG(t), SLARG(k),
+                                   SLARG(m), SLARG(k_space), SLARG(ka), SLARG(maa), SLARG(mbb),
+                                   SLARG(kwidth), SLARG(lanczos));
 }
 #endif
 

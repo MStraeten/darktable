@@ -21,6 +21,7 @@
 #include "common/imagebuf.h"     // for dt_iop_image_copy_by_size
 #include "common/mipmap_cache.h" // for dt_mipmap_buffer_t, dt_mipmap_cach...
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"      // for dt_control_log
 #include "develop/develop.h"      // for dt_develop_t, dt_develop_t::(anony...
 #include "develop/imageop.h"      // for dt_iop_module_t, dt_iop_roi_t, dt_...
@@ -346,6 +347,111 @@ error:
   dt_opencl_release_mem_object(dev_raw);
   dt_mipmap_cache_release(&buf);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_rawoverexposed_data_t *const d = piece->data;
+  dt_develop_t *dev = self->dev;
+  const dt_image_t *const image = &dev->image_storage;
+  if(piece->colors != 4) return FALSE;
+
+  dt_mipmap_buffer_t buf;
+  dt_mipmap_cache_get(&buf, image->id, DT_MIPMAP_FULL, DT_MIPMAP_BLOCKING, 'r');
+  // the raw goes up as pairs of uint16 values, so an odd count would read
+  // past its end
+  if(!buf.buf || ((size_t)buf.width * buf.height) % 2)
+  {
+    dt_mipmap_cache_release(&buf);
+    return FALSE;
+  }
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const int iwidth = dt_slang_gpu_image_width(dev_in);
+  const int iheight = dt_slang_gpu_image_height(dev_in);
+  const int zero = 0;
+
+  _process_common_setup(self, piece);
+
+  // NOT FROM THE PIPE !!!
+  const uint32_t filters = image->buf_dsc.filters;
+  const int raw_width = buf.width;
+  const int raw_height = buf.height;
+  const size_t raw_size = (size_t)raw_width * raw_height * sizeof(uint16_t);
+
+  const size_t coordbufsize = (size_t)height * width * 2 * sizeof(float);
+  float *coordbuf = dt_alloc_aligned(coordbufsize);
+  if(!coordbuf)
+  {
+    dt_mipmap_cache_release(&buf);
+    return FALSE;
+  }
+
+  DT_OMP_FOR()
+  for(int j = 0; j < height; j++)
+  {
+    float *bufptr = coordbuf + (size_t)2 * j * width;
+
+    // here are all the pixels of this row
+    for(int i = 0; i < roi_out->width; i++)
+    {
+      bufptr[2 * i] = (float)(roi_out->x + i) / roi_in->scale;
+      bufptr[2 * i + 1] = (float)(roi_out->y + j) / roi_in->scale;
+    }
+
+    // where did they come from?
+    dt_dev_distort_backtransform_plus(self->dev, self->dev->full.pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL, bufptr, roi_out->width);
+  }
+
+  // the kernels only write the pixels they mark
+  int err = dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(zero), SLARG(zero));
+  if(!err)
+  {
+    switch(dev->rawoverexposed.mode)
+    {
+      case DT_DEV_RAWOVEREXPOSED_MODE_MARK_CFA:
+        err = dt_slang_gpu_run_2d_args("basic", "rawoverexposed_mark_cfa", width, height,
+                SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLBUF(coordbuf, coordbufsize),
+                SLARG(width), SLARG(height),
+                SLBUF(buf.buf, raw_size), SLARG(raw_width), SLARG(raw_height), SLARG(filters),
+                SLBUF(image->buf_dsc.xtrans, sizeof(image->buf_dsc.xtrans)),
+                SLBUF(d->threshold, sizeof(d->threshold)),
+                SLBUF(dt_iop_rawoverexposed_colors, sizeof(dt_iop_rawoverexposed_colors)));
+        break;
+      case DT_DEV_RAWOVEREXPOSED_MODE_MARK_SOLID:
+        err = dt_slang_gpu_run_2d_args("basic", "rawoverexposed_mark_solid", width, height,
+                SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLBUF(coordbuf, coordbufsize),
+                SLARG(width), SLARG(height),
+                SLBUF(buf.buf, raw_size), SLARG(raw_width), SLARG(raw_height), SLARG(filters),
+                SLBUF(image->buf_dsc.xtrans, sizeof(image->buf_dsc.xtrans)),
+                SLBUF(d->threshold, sizeof(d->threshold)),
+                SLARG(dt_iop_rawoverexposed_colors[dev->rawoverexposed.colorscheme]));
+        break;
+      case DT_DEV_RAWOVEREXPOSED_MODE_FALSECOLOR:
+      default:
+        err = dt_slang_gpu_run_2d_args("basic", "rawoverexposed_falsecolor", width, height,
+                SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLBUF(coordbuf, coordbufsize),
+                SLARG(width), SLARG(height),
+                SLBUF(buf.buf, raw_size), SLARG(raw_width), SLARG(raw_height), SLARG(filters),
+                SLBUF(image->buf_dsc.xtrans, sizeof(image->buf_dsc.xtrans)),
+                SLBUF(d->threshold, sizeof(d->threshold)));
+        break;
+    }
+  }
+
+  dt_free_align(coordbuf);
+  dt_mipmap_cache_release(&buf);
+  return !err;
 }
 #endif
 

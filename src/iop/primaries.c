@@ -18,6 +18,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/custom_primaries.h"
 #include "common/math.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "iop/iop_api.h"
@@ -182,6 +183,31 @@ int process_cl(dt_iop_module_t *self,
                                                 CLARG(dev_matrix));
   dt_opencl_release_mem_object(dev_matrix);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_primaries_params_t *params = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const dt_iop_order_iccprofile_info_t *pipe_work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  dt_colormatrix_t transposed_matrix, matrix;
+  _calculate_adjustment_matrix(params, pipe_work_profile, transposed_matrix);
+  transpose_3xSSE(transposed_matrix, matrix);
+
+  return !dt_slang_gpu_run_2d_args("extended", "primaries", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLBUF(matrix, sizeof(matrix)));
 }
 #endif
 

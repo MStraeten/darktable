@@ -179,6 +179,19 @@ int dt_interpolation_resample_roi_cl(const dt_interpolation_t *itor, int devid, 
                                      const dt_iop_roi_t *const roi_in);
 #endif
 
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+
+/** Like dt_interpolation_resample_cl(), with device images of the Slang
+ *  kernels. Returns 0 on success.
+ */
+int dt_interpolation_resample_slang(const dt_interpolation_t *itor,
+                                    dt_slang_gpu_image_t *dev_out,
+                                    const dt_iop_roi_t *const roi_out,
+                                    dt_slang_gpu_image_t *dev_in,
+                                    const dt_iop_roi_t *const roi_in);
+#endif
+
 void dt_interpolation_resample_mask(const dt_interpolation_t *itor,
                                   float *out, const dt_iop_roi_t *const roi_out,
                                   const float *const in, const dt_iop_roi_t *const roi_in);

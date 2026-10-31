@@ -29,6 +29,7 @@
 
 #include "bauhaus/bauhaus.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop_gui.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
@@ -163,6 +164,25 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 
   return dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_relight, width, height,
     CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(center), CLARG(wings), CLARG(ev));
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_relight_data_t *data = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  return !dt_slang_gpu_run_2d_args("extended", "relight", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(data->center), SLARG(data->width), SLARG(data->ev));
 }
 #endif
 

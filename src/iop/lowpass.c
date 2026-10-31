@@ -24,6 +24,7 @@
 #include "common/imagebuf.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -322,6 +323,64 @@ error:
   dt_opencl_release_mem_object(dev_ccoeffs);
   dt_opencl_release_mem_object(dev_cm);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_lowpass_data_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const float radius = fmax(0.1f, d->radius);
+  const float sigma = radius * roi_in->scale / piece->iscale;
+  const float saturation = d->saturation;
+  const int unbound = d->unbound;
+
+  // the blurred image goes to tmp, which the mix then reads
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  int err = !tmp;
+
+  if(!err && d->lowpass_algo == LOWPASS_ALGO_GAUSSIAN)
+  {
+    float Labmax[] = { 100.0f, 128.0f, 128.0f, 1.0f };
+    float Labmin[] = { 0.0f, -128.0f, -128.0f, 0.0f };
+    if(unbound)
+    {
+      for(int k = 0; k < 4; k++) Labmax[k] = FLT_MAX;
+      for(int k = 0; k < 4; k++) Labmin[k] = -FLT_MAX;
+    }
+    err = dt_gaussian_blur_4c_slang(dev_in, tmp, width, height, sigma, d->order, Labmax, Labmin);
+  }
+  else if(!err)
+  {
+    const float sigma_r = 100.0f; // does not depend on scale
+    const float detail = -1.0f;   // we want the bilateral base layer
+    dt_bilateral_slang_t *b = dt_bilateral_init_slang(width, height, sigma, sigma_r);
+    err = !b
+      || dt_bilateral_splat_slang(b, dev_in)
+      || dt_bilateral_blur_slang(b)
+      || dt_bilateral_slice_slang(b, dev_in, tmp, detail);
+    dt_bilateral_free_slang(b);
+  }
+
+  err = err
+    || dt_slang_gpu_run_2d_args("gaussian", "lowpass_mix", width, height,
+         SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(saturation),
+         SLIMG_IN(d->ctable, 256, 256, 1), SLBUF(d->cunbounded_coeffs, sizeof(float) * 3),
+         SLIMG_IN(d->ltable, 256, 256, 1), SLBUF(d->lunbounded_coeffs, sizeof(float) * 3),
+         SLARG(unbound));
+
+  dt_slang_gpu_image_free(tmp);
+  return !err;
 }
 #endif
 

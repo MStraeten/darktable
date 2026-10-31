@@ -32,6 +32,7 @@
 #include "common/file_location.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/utility.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -3505,6 +3506,259 @@ int process_cl(dt_iop_module_t *self,
   if(data != dev_in)
     dt_opencl_release_mem_object(data);
   return err;
+}
+#endif
+
+
+#ifdef HAVE_SLANG_GPU
+// the top left width x height of src, where it has them, to dst
+static int _slang_copy(dt_slang_gpu_image_t *src,
+                       dt_slang_gpu_image_t *dst,
+                       const int width,
+                       const int height)
+{
+  const int iwidth = dt_slang_gpu_image_width(src);
+  const int iheight = dt_slang_gpu_image_height(src);
+  const int zero = 0;
+  return dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                  SLIMG_DEV(src), SLIMG_DEV(dst), SLARG(width), SLARG(height),
+                                  SLARG(iwidth), SLARG(iheight), SLARG(zero), SLARG(zero));
+}
+
+static int _process_slang_lf(dt_iop_module_t *self,
+                             dt_dev_pixelpipe_iop_t *piece,
+                             dt_slang_gpu_image_t *dev_in,
+                             dt_slang_gpu_image_t *dev_out,
+                             const dt_iop_roi_t *const roi_in,
+                             const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_lens_data_t *d = (dt_iop_lens_data_t *)piece->data;
+
+  const gboolean raw_monochrome = dt_image_is_monochrome(&self->dev->image_storage);
+  const gboolean pass_mode = piece->pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+  const int used_lf_mask = (raw_monochrome || pass_mode)
+    ? LF_MODIFY_ALL & ~LF_MODIFY_TCA
+    : LF_MODIFY_ALL;
+
+  const int iwidth = roi_in->width;
+  const int iheight = roi_in->height;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+  const int roi_in_x = roi_in->x;
+  const int roi_in_y = roi_in->y;
+  const int width = MAX(iwidth, owidth);
+  const int height = MAX(iheight, oheight);
+  const int do_nan_checks = d->do_nan_checks;
+
+  const float orig_w = roi_in->scale * piece->buf_in.width;
+  const float orig_h = roi_in->scale * piece->buf_in.height;
+
+  if(!d->lens || !d->lens->Maker || d->crop <= 0.0f)
+  {
+    dt_print_pipe(DT_DEBUG_PIPE, "lensfun bypass", piece->pipe, self, DT_DEVICE_NONE, roi_in, roi_out);
+    return _slang_copy(dev_in, dev_out, owidth, oheight);
+  }
+  if(piece->colors != 4) return 1;
+
+  const char *ldkernel = NULL;
+  switch(dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP)->id)
+  {
+    case DT_INTERPOLATION_BILINEAR:
+      ldkernel = "lens_distort_bilinear";
+      break;
+    case DT_INTERPOLATION_BICUBIC:
+      ldkernel = "lens_distort_bicubic";
+      break;
+    case DT_INTERPOLATION_LANCZOS2:
+      ldkernel = "lens_distort_lanczos2";
+      break;
+    case DT_INTERPOLATION_LANCZOS3:
+      ldkernel = "lens_distort_lanczos3";
+      break;
+    default:
+      return 1;
+  }
+
+  int err = 1;
+  int modflags;
+  const dt_iop_lens_grid_cache_t *grids = NULL;
+  int coord_step = 0, coord_gwidth = 0, vig_step = 0, vig_gwidth = 0;
+  size_t coords_size = 0, vig_size = 0;
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  lfModifier *modifier = NULL;
+  if(!dev_tmp) goto error;
+
+  dt_pthread_mutex_lock(&darktable.plugin_threadsafe);
+  modifier = _get_modifier(&modflags, orig_w, orig_h, d, used_lf_mask, FALSE);
+  dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
+
+  grids = _lens_grids(d, modifier, modflags, roi_in, roi_out,
+                      orig_w, orig_h, used_lf_mask, pass_mode, TRUE);
+  if(!grids) goto error;
+  coord_step = grids->coords.step;
+  coord_gwidth = grids->coords.gwidth;
+  vig_step = grids->vig.step;
+  vig_gwidth = grids->vig.gwidth;
+  coords_size = sizeof(float) * 6 * grids->coords.gwidth * grids->coords.gheight;
+  vig_size = sizeof(float) * 4 * grids->vig.gwidth * grids->vig.gheight;
+
+  if(d->inverse)
+  {
+    // reverse direction (useful for renderings)
+    if(grids->coords.data)
+      err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
+                                     SLBUF(grids->coords.data, coords_size), SLARG(do_nan_checks),
+                                     SLARG(coord_step), SLARG(coord_gwidth));
+    else
+      err = _slang_copy(dev_in, dev_tmp, owidth, oheight);
+    if(err) goto error;
+
+    if(grids->vig.data)
+      err = dt_slang_gpu_run_2d_args("basic", "lens_vignette", owidth, oheight,
+                                     SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLBUF(grids->vig.data, vig_size), SLARG(vig_step), SLARG(vig_gwidth));
+    else
+      err = _slang_copy(dev_tmp, dev_out, owidth, oheight);
+  }
+  else // correct distortions:
+  {
+    if(grids->vig.data)
+      err = dt_slang_gpu_run_2d_args("basic", "lens_vignette", iwidth, iheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(iwidth), SLARG(iheight),
+                                     SLBUF(grids->vig.data, vig_size), SLARG(vig_step), SLARG(vig_gwidth));
+    else
+      err = _slang_copy(dev_in, dev_tmp, iwidth, iheight);
+    if(err) goto error;
+
+    if(grids->coords.data)
+      err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
+                                     SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
+                                     SLBUF(grids->coords.data, coords_size), SLARG(do_nan_checks),
+                                     SLARG(coord_step), SLARG(coord_gwidth));
+    else
+      err = _slang_copy(dev_tmp, dev_out, owidth, oheight);
+  }
+
+error:
+  // SLBUF copies the grids to the device when the kernel is started
+  dt_slang_gpu_image_free(dev_tmp);
+  _lens_grid_cache_release(d);
+  if(modifier != NULL) delete modifier;
+  return err;
+}
+
+static int _process_slang_md(dt_iop_module_t *self,
+                             dt_dev_pixelpipe_iop_t *piece,
+                             dt_slang_gpu_image_t *dev_in,
+                             dt_slang_gpu_image_t *dev_out,
+                             const dt_iop_roi_t *const roi_in,
+                             const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_lens_data_t *d = (dt_iop_lens_data_t *)piece->data;
+
+  if(!d->nc || d->modify_flags == DT_IOP_LENS_MODFLAG_NONE)
+    return _slang_copy(dev_in, dev_out, roi_out->width, roi_out->height);
+
+  const float w2 = 0.5f * roi_in->scale * piece->buf_in.width;
+  const float h2 = 0.5f * roi_in->scale * piece->buf_in.height;
+  const float r = 1.0f / dt_fast_hypotf(w2, h2);
+  const int knots = d->nc;
+
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+  const int itor_id = itor->id;
+  const int itor_width = itor->width;
+  const int pass_mode = piece->pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+
+  dt_slang_gpu_image_t *data = dev_in;
+  int err = 0;
+
+  // correct vignetting
+  if(!pass_mode && (d->modify_flags & DT_IOP_LENS_MODIFY_FLAG_VIGNETTING))
+  {
+    data = dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, NULL);
+    if(!data) return 1;
+    err = dt_slang_gpu_run_2d_args("basic", "md_vignette", roi_in->width, roi_in->height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(data),
+                                   SLBUF(d->knots_vig, sizeof(d->knots_vig)), SLBUF(d->vig, sizeof(d->vig)),
+                                   SLARG(roi_in->width), SLARG(roi_in->height),
+                                   SLARG(w2), SLARG(h2), SLARG(r), SLARG(roi_in->x), SLARG(roi_in->y),
+                                   SLARG(knots));
+  }
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("basic", "md_lens_correction", roi_out->width, roi_out->height,
+                                   SLIMG_DEV(data), SLIMG_DEV(dev_out),
+                                   SLBUF(d->knots_dist, sizeof(d->knots_dist)), SLBUF(d->cor_rgb, sizeof(d->cor_rgb)),
+                                   SLARG(roi_out->width), SLARG(roi_out->height),
+                                   SLARG(roi_in->width), SLARG(roi_in->height),
+                                   SLARG(w2), SLARG(h2), SLARG(r), SLARG(d->scale_md),
+                                   SLARG(roi_in->x), SLARG(roi_in->y), SLARG(roi_out->x), SLARG(roi_out->y),
+                                   SLARG(knots), SLARG(itor_id), SLARG(itor_width), SLARG(pass_mode));
+
+  if(data != dev_in) dt_slang_gpu_image_free(data);
+  return err;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_lens_data_t *d = (dt_iop_lens_data_t *)piece->data;
+  dt_iop_lens_gui_data_t *g = (dt_iop_lens_gui_data_t *)self->gui_data;
+
+  gboolean mask = FALSE;
+  if(g && dt_pipe_is_full(piece->pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    mask = g->vig_masking;
+    dt_iop_gui_leave_critical_section(self);
+  }
+  const gboolean pre_vignette = mask || (d->v_strength > 0.0f);
+  const gboolean pass_mode = piece->pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+
+  if(mask)
+    piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK;
+
+  dt_slang_gpu_image_t *data = dev_in;
+  int err = 0;
+  if(pre_vignette && !pass_mode)
+  {
+    _init_vignette_spline(d);
+
+    const float w2 = 0.5f * roi_in->scale * piece->buf_in.width;
+    const float h2 = 0.5f * roi_in->scale * piece->buf_in.height;
+    const float inv_maxr = 1.0f / dt_fast_hypotf(w2, h2);
+    const float strength = 2.0f * d->v_strength;
+    const int splinesize = VIGSPLINES;
+    const int vigmask = mask;
+
+    data = dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, NULL);
+    if(!data) return FALSE;
+    err = dt_slang_gpu_run_2d_args("basic", "lens_man_vignette", roi_in->width, roi_in->height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(data), SLBUF(d->vigspline, sizeof(d->vigspline)),
+                                   SLARG(roi_in->width), SLARG(roi_in->height), SLARG(w2), SLARG(h2),
+                                   SLARG(roi_in->x), SLARG(roi_in->y), SLARG(inv_maxr), SLARG(strength),
+                                   SLARG(splinesize), SLARG(vigmask));
+  }
+
+  if(!err)
+  {
+    if(d->method == DT_IOP_LENS_METHOD_LENSFUN)
+      err = _process_slang_lf(self, piece, data, dev_out, roi_in, roi_out);
+    else if(d->method == DT_IOP_LENS_METHOD_EMBEDDED_METADATA)
+      err = _process_slang_md(self, piece, data, dev_out, roi_in, roi_out);
+    else
+      err = _slang_copy(data, dev_out, roi_in->width, roi_in->height);
+  }
+
+  if(data != dev_in) dt_slang_gpu_image_free(data);
+  return !err;
 }
 #endif
 

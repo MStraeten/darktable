@@ -662,6 +662,175 @@ static cl_int process_opposed_cl(dt_iop_module_t *self,
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// process_opposed_cl() on the Slang kernels. Returns TRUE on success.
+static gboolean process_opposed_slang(dt_iop_module_t *self,
+                                      dt_dev_pixelpipe_iop_t *piece,
+                                      dt_slang_gpu_image_t *dev_in,
+                                      dt_slang_gpu_image_t *dev_out,
+                                      const dt_iop_roi_t *const roi_in,
+                                      const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_highlights_data_t *d = piece->data;
+  dt_iop_highlights_gui_data_t *g = self->gui_data;
+  const uint32_t filters = piece->filters;
+
+  const float clipval = highlights_clip_magics[DT_IOP_HIGHLIGHTS_OPPOSED] * d->clip;
+  const dt_iop_buffer_dsc_t *dsc = &piece->pipe->dsc;
+  const gboolean wbon = dsc->temperature.enabled;
+  const dt_aligned_pixel_t icoeffs = { wbon ? dsc->temperature.coeffs[0] : 1.0f,
+                                       wbon ? dsc->temperature.coeffs[1] : 1.0f,
+                                       wbon ? dsc->temperature.coeffs[2] : 1.0f,
+                                       1.0f };
+
+  const dt_aligned_pixel_t clips = { clipval * icoeffs[0], clipval * icoeffs[1], clipval * icoeffs[2], 1.0f};
+  const dt_aligned_pixel_t lo_clips = { 0.2f * clips[0], 0.2f * clips[1], 0.2f * clips[2], 1.0f };
+
+  const dt_dev_chroma_t *chr = &self->dev->chroma;
+  const gboolean late = chr->late_correction;
+  const dt_aligned_pixel_t correction = { late ? (float)(chr->D65coeffs[0] / chr->as_shot[0]) : 1.0f,
+                                          late ? (float)(chr->D65coeffs[1] / chr->as_shot[1]) : 1.0f,
+                                          late ? (float)(chr->D65coeffs[2] / chr->as_shot[2]) : 1.0f,
+                                          1.0f };
+
+  dt_aligned_pixel_t chrominance = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  const dt_hash_t opphash = _opposed_hash(piece);
+  const gboolean fullpipe = dt_pipe_is_full(piece->pipe);
+
+  gboolean is_hashed = FALSE;
+  gboolean unclipped = FALSE;
+  if(self->dev->gui_attached && g)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    is_hashed = opphash == g->opphash;
+    unclipped = !g->oppclipped;
+    if(is_hashed)
+    {
+      for_three_channels(c)
+        chrominance[c] = g->oppchroma[c];
+    }
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  if(is_hashed && unclipped)
+  {
+    // a copy, as clipping at FLT_MAX changes nothing
+    const dt_aligned_pixel_t noclip = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+    const int dx = roi_out->x;
+    const int dy = roi_out->y;
+    return !dt_slang_gpu_run_2d_args("basic", "highlights_1f_clip", roi_out->width, roi_out->height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                     SLARG(roi_in->width), SLARG(roi_in->height),
+                                     SLARG(roi_out->width), SLARG(roi_out->height),
+                                     SLARG(noclip), SLARG(dx), SLARG(dy),
+                                     SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+  }
+
+  gboolean ok = TRUE;
+  if(!is_hashed)
+  {
+    // We don't have valid chrominance correction so go the hard way
+    const int iwidth = roi_in->width;
+    const int iheight = roi_in->height;
+    const int mwidth  = iwidth / 3;
+    const int mheight = iheight / 3;
+    const int msize = mwidth * mheight;
+    // three byte planes, packed four to a word in the Slang buffers
+    const size_t mbufsize = 3 * (size_t)msize;
+    const int mwords = (mbufsize + 3) / 4;
+    const int clear_width = 4096;
+    const int clear_height = (mwords + clear_width - 1) / clear_width;
+
+    dt_slang_gpu_buffer_t *inmask = dt_slang_gpu_buffer_new(sizeof(uint32_t) * mwords, NULL);
+    dt_slang_gpu_buffer_t *outmask = dt_slang_gpu_buffer_new(sizeof(uint32_t) * mwords, NULL);
+    char *mask = dt_alloc_aligned(sizeof(uint32_t) * mwords);
+    float *indata = dt_alloc_align_float((size_t)iwidth * iheight);
+
+    // as process_opposed_cl(), the chrominance is summed in double on the
+    // host, from the dilated mask and the input read back
+    ok = inmask && outmask && mask && indata
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_clearmask", clear_width, clear_height,
+                                   SLBUF_DEV(inmask), SLARG(clear_width), SLARG(mwords))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_clearmask", clear_width, clear_height,
+                                   SLBUF_DEV(outmask), SLARG(clear_width), SLARG(mwords))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_initmask", mwidth, mheight,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(inmask),
+                                   SLARG(msize), SLARG(mwidth), SLARG(mheight), SLARG(iwidth), SLARG(iheight),
+                                   SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)),
+                                   SLBUF(clips, sizeof(clips)))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_dilatemask", mwidth, mheight,
+                                   SLBUF_DEV(inmask), SLBUF_DEV(outmask),
+                                   SLARG(msize), SLARG(mwidth), SLARG(mheight))
+      && !dt_slang_gpu_image_read(dev_in, indata)
+      && !dt_slang_gpu_buffer_read(outmask, mask, sizeof(uint32_t) * mwords);
+
+    if(ok)
+    {
+      const uint8_t(*const xtrans)[6] = (const uint8_t(*const)[6])piece->xtrans;
+
+      double sums[3] = { 0.0, 0.0, 0.0 };
+      int cnts[3] = { 0, 0, 0 };
+      gboolean anyclipped = FALSE;
+
+      DT_OMP_FOR(reduction(+ : sums, cnts) reduction( | : anyclipped) collapse(2))
+      for(size_t row = 0; row < iheight; row++)
+      {
+        for(size_t col = 0; col < iwidth; col++)
+        {
+          const size_t idx = row * iwidth + col;
+          const int color = fcol(row, col, filters, xtrans);
+          const float inval = indata[idx];
+
+          if((inval < clips[color])
+              && (inval > lo_clips[color])
+              && (mask[color * msize + _raw_to_cmap(mwidth, mheight, row, col)]))
+          {
+            sums[color] += (double)(inval - _calc_refavg(indata, xtrans, filters, row, col, roi_in, correction, TRUE));
+            cnts[color] += 1;
+          }
+          anyclipped |= inval >= clips[color];
+        }
+      }
+
+      for_three_channels(c)
+        chrominance[c] = cnts[c] > 100 ? (float)(sums[c] / (double)cnts[c]) : 0.0f;
+
+      if(self->dev->gui_attached && g && fullpipe)
+      {
+        dt_iop_gui_enter_critical_section(self);
+        for_three_channels(c)
+          g->oppchroma[c] = chrominance[c];
+        g->opphash = opphash;
+        g->oppclipped = anyclipped;
+        g->oppresult = TRUE;
+        dt_iop_gui_leave_critical_section(self);
+      }
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
+          "opposed chroma", piece->pipe, self, DT_DEVICE_NONE, NULL, NULL,
+          "%12.7f (%d)%12.7f (%d)%12.7f (%d) clipped=%s",
+          chrominance[0], cnts[0],
+          chrominance[1], cnts[1],
+          chrominance[2], cnts[2],
+          STR_YESNO(anyclipped));
+    }
+    dt_slang_gpu_buffer_free(inmask);
+    dt_slang_gpu_buffer_free(outmask);
+    dt_free_align(mask);
+    dt_free_align(indata);
+  }
+
+  return ok
+    && !dt_slang_gpu_run_2d_args("basic", "highlights_opposed", roi_out->width, roi_out->height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                 SLARG(roi_out->width), SLARG(roi_out->height),
+                                 SLARG(roi_in->width), SLARG(roi_in->height),
+                                 SLARG(roi_out->x), SLARG(roi_out->y),
+                                 SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)),
+                                 SLBUF(clips, sizeof(clips)), SLBUF(chrominance, sizeof(chrominance)), SLBUF(correction, sizeof(correction)));
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

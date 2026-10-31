@@ -25,6 +25,7 @@
 
 #include "bauhaus/bauhaus.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/rgb_norms.h"
 #include "control/control.h"
@@ -373,6 +374,46 @@ error:
   dt_ioppr_free_iccprofile_params_cl(&profile_info_cl,
                                      &profile_lut_cl, &dev_profile_info, &dev_profile_lut);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_tonecurve_data_t *d = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int autoscale_ab = d->autoscale_ab;
+  const int unbound_ab = d->unbound_ab;
+  const float low_approximation = d->table[0][(int)(0.01f * 0x10000ul)];
+  const int preserve_colors = d->preserve_colors;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile
+    = dt_ioppr_add_profile_info_to_list(self->dev, DT_COLORSPACE_PROPHOTO_RGB, "",
+                                        INTENT_PERCEPTUAL);
+
+  dt_colorspaces_iccprofile_info_slang_t profile_info;
+  int lut_width, lut_height;
+  float *profile_lut = dt_ioppr_build_iccprofile_params_slang(work_profile, &profile_info,
+                                                              &lut_width, &lut_height);
+  if(!profile_lut) return FALSE;
+
+  const int err = dt_slang_gpu_run_2d_args("basic", "tonecurve", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLIMG_IN(d->table[ch_L], 256, 256, 1), SLIMG_IN(d->table[ch_a], 256, 256, 1),
+    SLIMG_IN(d->table[ch_b], 256, 256, 1), SLARG(autoscale_ab), SLARG(unbound_ab),
+    SLBUF(d->unbounded_coeffs_L, sizeof(float) * 3), SLBUF(d->unbounded_coeffs_ab, sizeof(float) * 12),
+    SLARG(low_approximation), SLARG(preserve_colors), SLBUF(&profile_info, sizeof(profile_info)),
+    SLIMG_IN(profile_lut, lut_width, lut_height, 1));
+
+  free(profile_lut);
+  return !err;
 }
 #endif
 /*

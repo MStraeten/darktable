@@ -12,3 +12,7 @@ if(WIN32)
 endif(WIN32)
 
 add_subdirectory(unittests)
+
+if(USE_SLANG)
+  add_subdirectory(slang)
+endif(USE_SLANG)

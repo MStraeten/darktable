@@ -1395,6 +1395,55 @@ int dt_interpolation_resample_roi_cl(const dt_interpolation_t *itor,
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+int dt_interpolation_resample_slang(const dt_interpolation_t *itor,
+                                    dt_slang_gpu_image_t *dev_out,
+                                    const dt_iop_roi_t *const roi_out,
+                                    dt_slang_gpu_image_t *dev_in,
+                                    const dt_iop_roi_t *const roi_in)
+{
+  const int dx = MAX(0, roi_out->x);
+  const int dy = MAX(0, roi_out->y);
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  if(roi_out->scale == 1.0f)
+    return dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                    SLARG(roi_in->width), SLARG(roi_in->height), SLARG(dx), SLARG(dy));
+
+  int *hindex = NULL, *hlength = NULL, *hmeta = NULL;
+  int *vindex = NULL, *vlength = NULL, *vmeta = NULL;
+  float *hkernel = NULL, *vkernel = NULL;
+  int err = 1;
+  if(_prepare_resampling_plan(itor, roi_in->width, width, dx, roi_out->scale,
+                              &hlength, &hkernel, &hindex, &hmeta)
+     || _prepare_resampling_plan(itor, roi_in->height, height, dy, roi_out->scale,
+                                 &vlength, &vkernel, &vindex, &vmeta))
+    goto error;
+
+  int hmaxtaps = 0, vmaxtaps = 0;
+  for(int k = 0; k < width; k++) hmaxtaps = MAX(hmaxtaps, hlength[k]);
+  for(int k = 0; k < height; k++) vmaxtaps = MAX(vmaxtaps, vlength[k]);
+
+  // the same buffer sizes as dt_interpolation_resample_cl() copies
+  err = dt_slang_gpu_run_2d_args("basic", "interpolation_resample", width, height,
+          SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+          SLBUF(hmeta, sizeof(int) * width * 3), SLBUF(vmeta, sizeof(int) * height * 3),
+          SLBUF(hlength, sizeof(int) * width), SLBUF(vlength, sizeof(int) * height),
+          SLBUF(hindex, sizeof(int) * width * (hmaxtaps + 1)),
+          SLBUF(vindex, sizeof(int) * height * (vmaxtaps + 1)),
+          SLBUF(hkernel, sizeof(float) * width * (hmaxtaps + 1)),
+          SLBUF(vkernel, sizeof(float) * height * (vmaxtaps + 1)),
+          SLARG(hmaxtaps), SLARG(vmaxtaps));
+
+error:
+  dt_free_align(hlength);
+  dt_free_align(vlength);
+  return err;
+}
+#endif
+
 /** Applies resampling (re-scaling) on *full* input and output buffers.
  *  roi_in and roi_out define the part of the buffers that is affected.
  */

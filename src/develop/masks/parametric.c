@@ -180,7 +180,7 @@ static int _parametric_get_mask_roi(const dt_iop_module_t *const module,
   // its device images instead, and the form is evaluated there
   const float *const a = piece->blend_refine_guide_in;
   const float *const b = piece->blend_refine_guide_out;
-  const gboolean on_device = piece->blend_refine_cl != NULL;
+  const gboolean on_device = piece->blend_refine_cl != NULL || piece->blend_refine_slang != NULL;
   if(!on_device && (!a || !b))
   {
     dt_print(DT_DEBUG_MASKS,
@@ -237,10 +237,17 @@ static int _parametric_get_mask_roi(const dt_iop_module_t *const module,
     piece->blend_refine_roi_out ? piece->blend_refine_roi_out : roi;
 
   dt_print(DT_DEBUG_MASKS, "[masks] parametric form %d: make_mask csp=%d blendif=0x%x%s",
-           form->formid, saved->blend_cst, p->blendif, on_device ? " (OpenCL)" : "");
+           form->formid, saved->blend_cst, p->blendif, piece->blend_refine_slang ? " (Slang)" : on_device ? " (OpenCL)" : "");
 
+#ifdef HAVE_SLANG_GPU
+  if(piece->blend_refine_slang)
+  {
+    dt_develop_blendif_make_mask_slang(pc, &tmp, buffer);
+    return 1;
+  }
+#endif
 #ifdef HAVE_OPENCL
-  if(on_device)
+  if(piece->blend_refine_cl)
   {
     dt_develop_blendif_make_mask_cl(pc, &tmp, buffer);
     return 1;

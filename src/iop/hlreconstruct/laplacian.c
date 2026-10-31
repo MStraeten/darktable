@@ -914,6 +914,185 @@ error:
 
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// wavelets_process() on the Slang kernels. Returns 0 on success.
+static int _wavelets_process_slang(dt_slang_gpu_image_t *in,
+                                   dt_slang_gpu_image_t *reconstructed,
+                                   dt_slang_gpu_image_t *clipping_mask,
+                                   const int width,
+                                   const int height,
+                                   const int scales,
+                                   dt_slang_gpu_image_t *HF,
+                                   dt_slang_gpu_image_t *LF_odd,
+                                   dt_slang_gpu_image_t *LF_even,
+                                   dt_slang_gpu_image_t *acc_odd,
+                                   dt_slang_gpu_image_t *acc_even,
+                                   dt_slang_gpu_image_t *tmp,
+                                   const diffuse_reconstruct_variant_t variant,
+                                   const float noise_level,
+                                   const int salt,
+                                   const float first_order_factor)
+{
+  int err = 0;
+  for(int s = 0; s < scales && !err; ++s)
+  {
+    const int mult = 1 << s;
+
+    // ping-pong buffer_in/out and the accumulator. On the first scale the
+    // accumulator is not read, and binding a distinct image for it keeps one
+    // image from being sampled and written by the same dispatch
+    dt_slang_gpu_image_t *buffer_in = in;
+    dt_slang_gpu_image_t *buffer_out = LF_odd;
+    dt_slang_gpu_image_t *acc_in = acc_even;
+    dt_slang_gpu_image_t *acc_out = acc_odd;
+    if(s % 2 != 0)
+    {
+      buffer_in = LF_odd;
+      buffer_out = LF_even;
+      acc_in = acc_odd;
+      acc_out = acc_even;
+    }
+    else if(s > 0)
+    {
+      buffer_in = LF_even;
+      buffer_out = LF_odd;
+      acc_in = acc_even;
+      acc_out = acc_odd;
+    }
+
+    // vertical pass first, as decompose_2D_Bspline() does
+    err = dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_vertical", width, height,
+                                   SLIMG_DEV(buffer_in), SLIMG_DEV(tmp),
+                                   SLARG(width), SLARG(height), SLARG(mult))
+       || dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_horizontal", width, height,
+                                   SLIMG_DEV(tmp), SLIMG_DEV(buffer_out),
+                                   SLARG(width), SLARG(height), SLARG(mult))
+       || dt_slang_gpu_run_2d_args("bspline", "wavelets_detail_level", width, height,
+                                   SLIMG_DEV(buffer_in), SLIMG_DEV(buffer_out), SLIMG_DEV(HF),
+                                   SLARG(width), SLARG(height));
+    if(err) break;
+
+    const unsigned int current_scale_type = scale_type(s, scales);
+    const float radius = sqf(equivalent_sigma_at_step(B_SPLINE_SIGMA, s * DS_FACTOR));
+    dt_slang_gpu_image_t *out_target = (current_scale_type & LAST_SCALE) ? reconstructed : acc_out;
+
+    if(variant == DIFFUSE_RECONSTRUCT_RGB)
+      err = dt_slang_gpu_run_2d_args("highlights", "hl_guide_laplacians", width, height,
+                                     SLIMG_DEV(HF), SLIMG_DEV(buffer_out), SLIMG_DEV(clipping_mask),
+                                     SLIMG_DEV(acc_in), SLIMG_DEV(out_target),
+                                     SLARG(width), SLARG(height), SLARG(mult), SLARG(noise_level),
+                                     SLARG(salt), SLARG(current_scale_type), SLARG(radius));
+    else
+      err = dt_slang_gpu_run_2d_args("highlights", "hl_diffuse_color", width, height,
+                                     SLIMG_DEV(HF), SLIMG_DEV(buffer_out), SLIMG_DEV(clipping_mask),
+                                     SLIMG_DEV(acc_in), SLIMG_DEV(out_target),
+                                     SLARG(width), SLARG(height), SLARG(mult),
+                                     SLARG(current_scale_type), SLARG(first_order_factor));
+  }
+  return err;
+}
+
+// process_laplacian_bayer() on the Slang kernels. Returns TRUE on success.
+static gboolean process_laplacian_bayer_slang(dt_iop_module_t *self,
+                                              dt_dev_pixelpipe_iop_t *piece,
+                                              dt_slang_gpu_image_t *dev_in,
+                                              dt_slang_gpu_image_t *dev_out,
+                                              const dt_iop_roi_t *const roi_in,
+                                              const dt_aligned_pixel_t clips_in)
+{
+  dt_iop_highlights_data_t *data = piece->data;
+  // a local copy, as SLARG() takes the size of its argument
+  const dt_aligned_pixel_t clips = { clips_in[0], clips_in[1], clips_in[2], clips_in[3] };
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int ds_width = width / DS_FACTOR;
+  const int ds_height = height / DS_FACTOR;
+  if(ds_width < 1 || ds_height < 1) return FALSE;
+
+  const int filters = piece->filters;
+  dt_aligned_pixel_t wb = { 1.f, 1.f, 1.f, 1.f };
+  if(piece->pipe->dsc.temperature.coeffs[0] != 0.f)
+  {
+    wb[0] = piece->pipe->dsc.temperature.coeffs[0];
+    wb[1] = piece->pipe->dsc.temperature.coeffs[1];
+    wb[2] = piece->pipe->dsc.temperature.coeffs[2];
+  }
+
+  const float scale = fmaxf(DS_FACTOR * piece->iscale / (roi_in->scale), 1.f);
+  const float final_radius = (float)((int)(1 << data->scales)) / scale;
+  const int scales = CLAMP((int)ceilf(log2f(final_radius)), 1, MAX_NUM_SCALES);
+  const float noise_level = data->noise_level / scale;
+
+  // [R, G, B, norm] for each pixel
+  dt_slang_gpu_image_t *interpolated = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *clipping_mask = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *temp = dt_slang_gpu_image_new(width, height, 4, NULL);
+
+  // all downscaled
+  dt_slang_gpu_image_t *LF_odd = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *LF_even = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *HF = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_tmp = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_reconstructed = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_interpolated = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_clipping_mask = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_acc_odd = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_acc_even = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+
+  gboolean ok = interpolated && clipping_mask && temp && LF_odd && LF_even && HF && ds_tmp
+                && ds_reconstructed && ds_interpolated && ds_clipping_mask && ds_acc_odd && ds_acc_even;
+
+  ok = ok
+    && !dt_slang_gpu_run_2d_args("highlights", "hl_interpolate_and_mask", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(interpolated), SLIMG_DEV(clipping_mask),
+                                 SLARG(clips), SLARG(wb), SLARG(filters), SLARG(width), SLARG(height))
+    && !dt_box_mean_slang(clipping_mask, temp, width, height, 4, 2, 1)
+    // downsample
+    && !dt_slang_gpu_run_2d_args("highlights", "hl_bilinear", ds_width, ds_height,
+                                 SLIMG_DEV(clipping_mask), SLARG(width), SLARG(height),
+                                 SLIMG_DEV(ds_clipping_mask), SLARG(ds_width), SLARG(ds_height))
+    && !dt_slang_gpu_run_2d_args("highlights", "hl_bilinear", ds_width, ds_height,
+                                 SLIMG_DEV(interpolated), SLARG(width), SLARG(height),
+                                 SLIMG_DEV(ds_interpolated), SLARG(ds_width), SLARG(ds_height));
+
+  for(int i = 0; ok && i < data->iterations; i++)
+  {
+    const int salt = (i == data->iterations - 1); // add noise on the last iteration only
+    ok = !_wavelets_process_slang(ds_interpolated, ds_reconstructed, ds_clipping_mask, ds_width, ds_height,
+                                  scales, HF, LF_odd, LF_even, ds_acc_odd, ds_acc_even, ds_tmp,
+                                  DIFFUSE_RECONSTRUCT_RGB, noise_level, salt, data->solid_color)
+      && !_wavelets_process_slang(ds_reconstructed, ds_interpolated, ds_clipping_mask, ds_width, ds_height,
+                                  scales, HF, LF_odd, LF_even, ds_acc_odd, ds_acc_even, ds_tmp,
+                                  DIFFUSE_RECONSTRUCT_CHROMA, noise_level, salt, data->solid_color);
+  }
+
+  // upsample, and remosaic with the full resolution mask as the CPU does
+  ok = ok
+    && !dt_slang_gpu_run_2d_args("highlights", "hl_bilinear", width, height,
+                                 SLIMG_DEV(ds_interpolated), SLARG(ds_width), SLARG(ds_height),
+                                 SLIMG_DEV(interpolated), SLARG(width), SLARG(height))
+    && !dt_slang_gpu_run_2d_args("highlights", "hl_remosaic_and_replace", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(interpolated), SLIMG_DEV(clipping_mask),
+                                 SLIMG_DEV(dev_out), SLARG(wb), SLARG(filters),
+                                 SLARG(width), SLARG(height));
+
+  dt_slang_gpu_image_free(interpolated);
+  dt_slang_gpu_image_free(clipping_mask);
+  dt_slang_gpu_image_free(temp);
+  dt_slang_gpu_image_free(LF_odd);
+  dt_slang_gpu_image_free(LF_even);
+  dt_slang_gpu_image_free(HF);
+  dt_slang_gpu_image_free(ds_tmp);
+  dt_slang_gpu_image_free(ds_reconstructed);
+  dt_slang_gpu_image_free(ds_interpolated);
+  dt_slang_gpu_image_free(ds_clipping_mask);
+  dt_slang_gpu_image_free(ds_acc_odd);
+  dt_slang_gpu_image_free(ds_acc_even);
+  return ok;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

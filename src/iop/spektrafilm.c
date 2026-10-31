@@ -3580,6 +3580,737 @@ cleanup:
 }
 #endif /* HAVE_OPENCL */
 
+#ifdef HAVE_SLANG_GPU
+/* The Slang twin of process_cl(), on the kernels of
+   data/kernels/slang/spektrafilm.slang. Same stages, same buffers and the same
+   sigma expressions, so the comments in process_cl() hold here too. */
+
+/* _sf_yvv_blur_cl() */
+static int _sf_yvv_blur_slang(dt_slang_gpu_buffer_t *buf,
+                              dt_slang_gpu_buffer_t *tmp,
+                              const int w,
+                              const int h,
+                              const float sigma,
+                              const int ch)
+{
+  float b[4];
+  float pass_sigma = sigma;
+  const int passes = sf_gauss_iir_passes(sigma, &pass_sigma);
+  sf_gauss_yvv_coeffs(pass_sigma, b);
+  const char *krow = (ch == 4) ? "spektrafilm_yvv_row_4c" : "spektrafilm_yvv_row_1c";
+  const char *kcol = (ch == 4) ? "spektrafilm_yvv_col_4c" : "spektrafilm_yvv_col_1c";
+  int err = 0;
+  for(int pass = 0; pass < passes && !err; pass++)
+  {
+    err = dt_slang_gpu_run_1d_args("spektrafilm", krow, h, SLBUF_DEV(buf), SLBUF_DEV(tmp),
+                                   SLARG(w), SLARG(h), SLARG(b[0]), SLARG(b[2]), SLARG(b[3]));
+    if(!err)
+      err = dt_slang_gpu_run_1d_args("spektrafilm", kcol, w, SLBUF_DEV(tmp), SLBUF_DEV(buf),
+                                     SLARG(w), SLARG(h), SLARG(b[0]), SLARG(b[2]), SLARG(b[3]));
+    // one pass per device submission, as in _sf_yvv_blur_cl()
+    if(!err && passes > 1) dt_slang_gpu_wait();
+  }
+  return err;
+}
+
+/* _sf_blur_wide_cl() */
+static int _sf_blur_wide_slang(dt_slang_gpu_buffer_t *buf,
+                               const int w,
+                               const int h,
+                               const int roi_x,
+                               const int roi_y,
+                               const float sigma,
+                               int *const done)
+{
+  int k, lw, lh, ox, oy;
+  float sigma_low;
+  *done = 0;
+  if(!sf_wide_blur_plan(sigma, w, h, roi_x, roi_y, &k, &sigma_low, &lw, &lh, &ox, &oy))
+    return 0;
+  *done = 1;
+  float *inv = dt_alloc_align_float((size_t)k + 1);
+  float kw[2 * SF_GAUSS_MAX_RADIUS + 1];
+  const int kr = dt_gaussian_kernel_1d(sigma_low, kw, SF_GAUSS_MAX_RADIUS);
+  if(inv) sf_wide_blur_inv_table(k, inv);
+  dt_slang_gpu_buffer_t *rows = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * lw * h);
+  dt_slang_gpu_buffer_t *low = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * lw * lh);
+  dt_slang_gpu_buffer_t *lowtmp = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * lw * lh);
+  dt_slang_gpu_buffer_t *inv_dev = inv ? dt_slang_gpu_buffer_new(sizeof(float) * (k + 1), inv) : NULL;
+  dt_slang_gpu_buffer_t *kw_dev = dt_slang_gpu_buffer_new(sizeof(float) * (2 * kr + 1), kw);
+  int err = 1;
+  if(inv && rows && low && lowtmp && inv_dev && kw_dev)
+  {
+    const float inv2k = 1.0f / (float)(2 * k);
+    err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_wide_rows", lw, h,
+                                   SLBUF_DEV(buf), SLBUF_DEV(rows), SLARG(w), SLARG(h),
+                                   SLARG(k), SLARG(lw), SLARG(ox));
+    if(!err)
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_wide_down", lw, lh,
+                                     SLBUF_DEV(rows), SLBUF_DEV(low), SLARG(w), SLARG(h),
+                                     SLARG(k), SLARG(lw), SLARG(lh), SLARG(ox), SLARG(oy),
+                                     SLBUF_DEV(inv_dev));
+    if(!err)
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_gauss_row_4c", lw, lh,
+                                     SLBUF_DEV(low), SLBUF_DEV(lowtmp), SLARG(lw), SLARG(lh),
+                                     SLBUF_DEV(kw_dev), SLARG(kr));
+    if(!err)
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_gauss_col_4c", lw, lh,
+                                     SLBUF_DEV(lowtmp), SLBUF_DEV(low), SLARG(lw), SLARG(lh),
+                                     SLBUF_DEV(kw_dev), SLARG(kr));
+    if(!err)
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_wide_up", w, h,
+                                     SLBUF_DEV(low), SLBUF_DEV(buf), SLARG(w), SLARG(h),
+                                     SLARG(k), SLARG(lw), SLARG(lh), SLARG(ox), SLARG(oy),
+                                     SLARG(inv2k));
+  }
+  dt_free_align(inv);
+  dt_slang_gpu_buffer_free(rows);
+  dt_slang_gpu_buffer_free(low);
+  dt_slang_gpu_buffer_free(lowtmp);
+  dt_slang_gpu_buffer_free(inv_dev);
+  dt_slang_gpu_buffer_free(kw_dev);
+  return err;
+}
+
+/* the exact separable Gaussian of the SF_GAUSS_BLUR* macros in process_cl():
+   rows of src into tmp, then columns of tmp into dst, which may be src */
+static int _sf_gauss_exact_slang(dt_slang_gpu_buffer_t *src,
+                                 dt_slang_gpu_buffer_t *dst,
+                                 dt_slang_gpu_buffer_t *tmp,
+                                 const int w,
+                                 const int h,
+                                 const float sigma,
+                                 const int ch)
+{
+  float kw[2 * SF_GAUSS_MAX_RADIUS + 1];
+  const int kr = dt_gaussian_kernel_1d(sigma, kw, SF_GAUSS_MAX_RADIUS);
+  dt_slang_gpu_buffer_t *kw_dev = dt_slang_gpu_buffer_new(sizeof(float) * (2 * kr + 1), kw);
+  if(!kw_dev) return 1;
+  const char *krow = (ch == 4) ? "spektrafilm_gauss_row_4c" : "spektrafilm_gauss_row_1c";
+  const char *kcol = (ch == 4) ? "spektrafilm_gauss_col_4c" : "spektrafilm_gauss_col_1c";
+  int err = dt_slang_gpu_run_2d_args("spektrafilm", krow, w, h, SLBUF_DEV(src), SLBUF_DEV(tmp),
+                                     SLARG(w), SLARG(h), SLBUF_DEV(kw_dev), SLARG(kr));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("spektrafilm", kcol, w, h, SLBUF_DEV(tmp), SLBUF_DEV(dst),
+                                   SLARG(w), SLARG(h), SLBUF_DEV(kw_dev), SLARG(kr));
+  dt_slang_gpu_buffer_free(kw_dev);
+  return err;
+}
+
+static int _sf_copy_slang(dt_slang_gpu_buffer_t *src,
+                          dt_slang_gpu_buffer_t *dst,
+                          const int w,
+                          const int h)
+{
+  return dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_copy", w, h, SLBUF_DEV(src),
+                                  SLBUF_DEV(dst), SLARG(w), SLARG(h));
+}
+
+/* SF_GAUSS_BLUR4_OP_L */
+static int _sf_blur4_op_slang(dt_slang_gpu_buffer_t *src,
+                              dt_slang_gpu_buffer_t *dst,
+                              dt_slang_gpu_buffer_t *tmp,
+                              const int w,
+                              const int h,
+                              const float sigma)
+{
+  if(sigma >= SF_GAUSS_EXACT_MAX_SIGMA)
+    return _sf_copy_slang(src, dst, w, h) || _sf_yvv_blur_slang(dst, tmp, w, h, sigma, 4);
+  return _sf_gauss_exact_slang(src, dst, tmp, w, h, sigma, 4);
+}
+
+/* SF_BLUR4_WIDE_OP_L */
+static int _sf_blur4_wide_op_slang(dt_slang_gpu_buffer_t *src,
+                                   dt_slang_gpu_buffer_t *dst,
+                                   dt_slang_gpu_buffer_t *tmp,
+                                   const int w,
+                                   const int h,
+                                   const int roi_x,
+                                   const int roi_y,
+                                   const float sigma)
+{
+  if(sigma >= SF_WIDE_BLUR_EFFECT_SIGMA)
+  {
+    int wide = 0;
+    return _sf_copy_slang(src, dst, w, h)
+           || _sf_blur_wide_slang(dst, w, h, roi_x, roi_y, sigma, &wide);
+  }
+  return _sf_blur4_op_slang(src, dst, tmp, w, h, sigma);
+}
+
+/* SF_GAUSS_BLUR1_L, and SF_GAUSS_BLUR4_FAST for ch == 4 */
+static int _sf_blur_fast_slang(dt_slang_gpu_buffer_t *buf,
+                               dt_slang_gpu_buffer_t *tmp,
+                               const int w,
+                               const int h,
+                               const float sigma,
+                               const int ch)
+{
+  if(sigma >= SF_GAUSS_EXACT_MAX_SIGMA) return _sf_yvv_blur_slang(buf, tmp, w, h, sigma, ch);
+  return _sf_gauss_exact_slang(buf, buf, tmp, w, h, sigma, ch);
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_spektrafilm_data_t *const d = (dt_iop_spektrafilm_data_t *)piece->data;
+  const int w = roi_in->width, h = roi_in->height;
+  const int ow = roi_out->width, oh = roi_out->height;
+  const int ox = roi_out->x - roi_in->x, oy = roi_out->y - roi_in->y;
+  const int roi_x = roi_in->x, roi_y = roi_in->y;
+  const size_t npix = (size_t)w * h;
+  int err = 1;
+#define SF_SL_STEP(label)                                                                          \
+  do                                                                                               \
+  {                                                                                                \
+    if(err)                                                                                        \
+    {                                                                                              \
+      dt_print(DT_DEBUG_SLANG, "[spektrafilm] GPU step FAILED: %s", (label));                     \
+      goto cleanup;                                                                                \
+    }                                                                                              \
+  } while(0)
+
+  const dt_iop_order_iccprofile_info_t *const work_profile
+      = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  sf_sim_t *sim = work_profile ? _ensure_sim(d, work_profile) : NULL;
+  const sf_sim_gpu_t *g = d->gpu;
+
+  if(!sim) /* no data pack / profiles: crop passthrough */
+    return !dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_passthrough", ow, oh,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(ow), SLARG(oh),
+                                     SLARG(ox), SLARG(oy));
+  if(!g) return FALSE; /* no GPU tables -> CPU fallback */
+
+  /* film_format_mm is the long-edge dimension, see modify_roi_in */
+  const float full_long_edge
+    = fmaxf(fmaxf((float)piece->buf_in.width, (float)piece->buf_in.height) * roi_in->scale, 1.0f);
+  const float pixel_um = d->p.film_format_mm * 1000.0f / full_long_edge;
+  const float preview_scale = fminf(roi_in->scale, 1.0f);
+
+  /* ---- table uploads ------------------------------------------------------ */
+  float mats[93]; /* SF_M_* layout in spektrafilm.slang */
+  memcpy(mats + 0, g->m_in, 9 * sizeof(float));
+  memcpy(mats + 9, g->m_out, 9 * sizeof(float));
+  memcpy(mats + 18, g->couplers_M, 9 * sizeof(float));
+  memcpy(mats + 27, g->out_rgb2xyz, 9 * sizeof(float));
+  memcpy(mats + 36, g->out_xyz2rgb, 9 * sizeof(float));
+  memcpy(mats + 45, g->oklab_m1, 9 * sizeof(float));
+  memcpy(mats + 54, g->oklab_m2, 9 * sizeof(float));
+  memcpy(mats + 63, g->oklab_m1inv, 9 * sizeof(float));
+  memcpy(mats + 72, g->oklab_m2inv, 9 * sizeof(float));
+  memcpy(mats + 81, g->couplers_donor_K, 3 * sizeof(float));
+  memcpy(mats + 84, g->couplers_donor_Dref, 3 * sizeof(float));
+  memcpy(mats + 87, g->couplers_recv_Kr, 3 * sizeof(float));
+  memcpy(mats + 90, g->couplers_recv_cref, 3 * sizeof(float));
+
+  const int steps = g->steps;
+  const size_t n3 = (size_t)steps * steps * steps * 3;
+  const size_t m3 = (size_t)(steps - 1) * (steps - 1) * (steps - 1) * 3;
+  const size_t f = sizeof(float);
+  const int nsub = g->grain_n_sublayers, nle = SF_NLE, maxsub = SF_GRAIN_MAX_SUBLAYERS;
+  dt_slang_gpu_buffer_t *mats_d = dt_slang_gpu_buffer_new(93 * f, mats);
+  dt_slang_gpu_buffer_t *tc_d = dt_slang_gpu_buffer_new((size_t)g->tc_n * g->tc_n * 3 * f, g->tc_lut);
+  dt_slang_gpu_buffer_t *cn_d = dt_slang_gpu_buffer_new(256 * 3 * f, g->curves_norm);
+  dt_slang_gpu_buffer_t *cb_d = dt_slang_gpu_buffer_new(
+      256 * 3 * f, g->couplers_active ? g->curves_before : g->curves_norm);
+  dt_slang_gpu_buffer_t *el_d = NULL, *ex_d = NULL, *ey_d = NULL, *ez_d = NULL, *en_d = NULL,
+                        *em_d = NULL, *pc_d = NULL;
+  if(g->has_print)
+  {
+    el_d = dt_slang_gpu_buffer_new(n3 * f, g->enl_lut);
+    ex_d = dt_slang_gpu_buffer_new(n3 * f, g->enl_sx);
+    ey_d = dt_slang_gpu_buffer_new(n3 * f, g->enl_sy);
+    ez_d = dt_slang_gpu_buffer_new(n3 * f, g->enl_sz);
+    en_d = dt_slang_gpu_buffer_new(m3 * f, g->enl_cmin);
+    em_d = dt_slang_gpu_buffer_new(m3 * f, g->enl_cmax);
+    pc_d = dt_slang_gpu_buffer_new(256 * 3 * f, g->print_curves);
+  }
+  dt_slang_gpu_buffer_t *sl_d = dt_slang_gpu_buffer_new(n3 * f, g->scan_lut);
+  dt_slang_gpu_buffer_t *sx_d = dt_slang_gpu_buffer_new(n3 * f, g->scan_sx);
+  dt_slang_gpu_buffer_t *sy_d = dt_slang_gpu_buffer_new(n3 * f, g->scan_sy);
+  dt_slang_gpu_buffer_t *sz_d = dt_slang_gpu_buffer_new(n3 * f, g->scan_sz);
+  dt_slang_gpu_buffer_t *sn_d = dt_slang_gpu_buffer_new(m3 * f, g->scan_cmin);
+  dt_slang_gpu_buffer_t *sm_d = dt_slang_gpu_buffer_new(m3 * f, g->scan_cmax);
+  /* cmax_table is only used in oklch mode but the kernel arg must be valid */
+  dt_slang_gpu_buffer_t *cm_d = dt_slang_gpu_buffer_new(
+      (g->cmax_table ? (size_t)g->cmax_nl * g->cmax_nh : 1) * f,
+      g->cmax_table ? (const void *)g->cmax_table : (const void *)mats);
+
+  dt_slang_gpu_buffer_t *plane = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
+  dt_slang_gpu_buffer_t *plane2 = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
+  dt_slang_gpu_buffer_t *tmpa = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
+  dt_slang_gpu_buffer_t *acc = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
+  dt_slang_gpu_buffer_t *plane1 = dt_slang_gpu_buffer_new_uninit(npix * f);
+  dt_slang_gpu_buffer_t *gtmp4 = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
+  dt_slang_gpu_buffer_t *gtmp1 = dt_slang_gpu_buffer_new_uninit(npix * f);
+  /* the grain tables, which process_cl() keeps across calls in
+     d->grain_cl_*: uploads here are cheap next to the rest of the stage */
+  dt_slang_gpu_buffer_t *gr_dmax = NULL, *gr_npart = NULL, *gr_dmin = NULL, *gr_total = NULL,
+                        *gr_curve = NULL, *gr_acc = NULL;
+  dt_slang_gpu_buffer_t *gr_raw[SF_GRAIN_MAX_SUBLAYERS] = { NULL };
+  if(!mats_d || !tc_d || !cn_d || !cb_d || !sl_d || !sx_d || !sy_d || !sz_d || !sn_d || !sm_d
+     || !cm_d || !plane || !plane2 || !tmpa || !acc || !plane1 || !gtmp4 || !gtmp1
+     || (g->has_print && (!el_d || !ex_d || !ey_d || !ez_d || !en_d || !em_d || !pc_d)))
+  {
+    err = 1;
+    SF_SL_STEP("allocation");
+  }
+
+  /* ---- 1) expose: input image -> linear film raw exposure ---------------- */
+  err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_expose", w, h, SLIMG_DEV(dev_in),
+                                 SLBUF_DEV(plane), SLARG(w), SLARG(h), SLBUF_DEV(mats_d),
+                                 SLBUF_DEV(tc_d), SLARG(g->tc_n), SLARG(g->ev_scale));
+  SF_SL_STEP("expose");
+
+  /* ---- 2) pre-film spatial effects on linear exposure -------------------- */
+  {
+    sf_boost_plan_t bp;
+    if(sf_boost_build_plan(d->p.boost_ev, d->p.boost_range, d->p.protect_ev, &bp))
+    {
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_boost", w, h, SLBUF_DEV(plane),
+                                     SLARG(w), SLARG(h), SLARG(bp.raw_x0), SLARG(bp.xmax),
+                                     SLARG(bp.inv_max), SLARG(bp.a), SLARG(bp.a_log2e),
+                                     SLARG(bp.scale), SLARG(bp.ext), SLARG(bp.slope));
+      SF_SL_STEP("boost");
+    }
+  }
+
+  if(d->p.diffusion_on)
+  {
+    sf_diffusion_plan_t plan;
+    if(sf_diffusion_build_plan((int)d->p.diffusion_filter_family, d->p.diffusion_strength,
+                               d->p.diffusion_warmth, &plan)
+       && plan.p_s > 0.0f)
+    {
+      const double dsc = fmax((double)d->p.diffusion_scale, 1e-6);
+      for(int j = 0; j < plan.n && !err; j++)
+      {
+        const float sigma
+            = (float)((double)plan.sigma_um[j] * dsc / fmax((double)pixel_um, 1e-3));
+        err = _sf_blur4_wide_op_slang(plane, tmpa, gtmp4, w, h, roi_x, roi_y, sigma);
+        const int reset = (j == 0);
+        const float wr = plan.wr[j], wg = plan.wg[j], wb = plan.wb[j];
+        if(!err)
+          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
+                                         SLBUF_DEV(tmpa), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                         SLARG(wr), SLARG(wg), SLARG(wb), SLARG(reset));
+      }
+      const float ps = plan.p_s;
+      if(!err)
+        err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_mix", w, h,
+                                       SLBUF_DEV(plane), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                       SLARG(ps));
+      SF_SL_STEP("diffusion");
+    }
+  }
+
+  /* see "sigma parity with the CPU" in process_cl() */
+  double hal_strength[3], hal_sigma_um = 0.0;
+  double sc_core[3], sc_tail[3], sc_w[3];
+  if(d->p.halation_on)
+  {
+    sf_sim_halation_params(sim, hal_strength, &hal_sigma_um);
+    hal_sigma_um = fmin(hal_sigma_um, (double)SF_HALATION_FIRST_SIGMA_UM);
+    sf_sim_scatter_params(sim, sc_core, sc_tail, sc_w);
+    for(int c = 0; c < 3; c++)
+    {
+      sc_core[c] = fmin(sc_core[c], (double)SF_SCATTER_CORE_CLAMP_UM);
+      sc_tail[c] = fmin(sc_tail[c], (double)SF_SCATTER_TAIL_CLAMP_UM);
+    }
+  }
+  if(d->p.halation_on && (d->p.scatter_amount > 0.0f || d->p.halation_amount > 0.0f))
+  {
+    if(d->p.scatter_amount > 0.0f)
+    {
+      const float sscl = fmaxf(d->p.scatter_scale, 1e-3f);
+      const float amp[3] = { 0.1633f, 0.6496f, 0.1870f }, rat[3] = { 0.5360f, 1.5236f, 2.7684f };
+      for(int c = 0; c < 3; c++)
+      {
+        err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_channel_extract", w, h,
+                                       SLBUF_DEV(plane), SLBUF_DEV(plane1), SLARG(w), SLARG(h),
+                                       SLARG(c));
+        if(!err)
+          err = _sf_blur_fast_slang(plane1, gtmp1, w, h,
+                                    fmaxf((float)(sc_core[c] * (double)sscl / (double)pixel_um),
+                                          1e-6f), 1);
+        const float core_weight = 1.0f;
+        const int core_reset = (c == 0);
+        if(!err)
+          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_channel_accum", w, h,
+                                         SLBUF_DEV(plane1), SLBUF_DEV(tmpa), SLARG(w), SLARG(h),
+                                         SLARG(core_weight), SLARG(c), SLARG(core_reset));
+        SF_SL_STEP("scatter core blur");
+      }
+      for(int g3 = 0; g3 < 3; g3++)
+        for(int c = 0; c < 3; c++)
+        {
+          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_channel_extract", w, h,
+                                         SLBUF_DEV(plane), SLBUF_DEV(plane1), SLARG(w), SLARG(h),
+                                         SLARG(c));
+          const float sigma = fmaxf((float)((double)rat[g3]
+                                            * (sc_tail[c] * (double)sscl / (double)pixel_um)),
+                                    1e-6f);
+          if(!err) err = _sf_blur_fast_slang(plane1, gtmp1, w, h, sigma, 1);
+          const int reset = (g3 == 0 && c == 0);
+          const float a = amp[g3];
+          if(!err)
+            err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_channel_accum", w, h,
+                                           SLBUF_DEV(plane1), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                           SLARG(a), SLARG(c), SLARG(reset));
+          SF_SL_STEP("scatter tail accum");
+        }
+      const float ws_r = (float)sc_w[0], ws_g = (float)sc_w[1], ws_b = (float)sc_w[2];
+      const float s_amount = CLAMP(d->p.scatter_amount, 0.0f, 1.0f);
+      /* `plane` is both the raw input and the output: a per-pixel op */
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_scatter_combine", w, h,
+                                     SLBUF_DEV(plane), SLBUF_DEV(tmpa), SLBUF_DEV(acc),
+                                     SLBUF_DEV(plane), SLARG(w), SLARG(h), SLARG(s_amount),
+                                     SLARG(ws_r), SLARG(ws_g), SLARG(ws_b));
+      SF_SL_STEP("scatter combine");
+    }
+
+    if(d->p.halation_amount > 0.0f)
+    {
+      const float hscl = fmaxf(d->p.halation_scale, 1e-3f);
+      const int N = 3;
+      const float dec[3] = { 1.0f/1.75f, 0.5f/1.75f, 0.25f/1.75f };
+      for(int k = 1; k <= N; k++)
+      {
+        err = _sf_blur4_wide_op_slang(plane, plane2, gtmp4, w, h, roi_x, roi_y,
+                                      fmaxf((float)((hal_sigma_um * (double)hscl
+                                                     / (double)pixel_um) * sqrt((double)k)),
+                                            1e-6f));
+        const int reset = (k == 1);
+        if(!err)
+          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_accum", w, h,
+                                         SLBUF_DEV(plane2), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                         SLARG(dec[k - 1]), SLARG(reset));
+        SF_SL_STEP("halation bounce accum");
+      }
+      const float h_eff = d->p.halation_amount;
+      const float a_r = (float)(hal_strength[0] * (double)h_eff),
+                  a_g = (float)(hal_strength[1] * (double)h_eff),
+                  a_b = (float)(hal_strength[2] * (double)h_eff);
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_halation_apply", w, h,
+                                     SLBUF_DEV(plane), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                     SLARG(a_r), SLARG(a_g), SLARG(a_b));
+      SF_SL_STEP("halation apply");
+    }
+  }
+
+  /* ---- 3) film development ------------------------------------------------ */
+  err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_lograw", w, h, SLBUF_DEV(plane),
+                                 SLARG(w), SLARG(h), SLARG(g->raw_scale));
+  SF_SL_STEP("lograw");
+
+  const int use_corr = g->couplers_active;
+  if(use_corr)
+  {
+    err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_develop_corr", w, h,
+                                   SLBUF_DEV(plane), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                   SLBUF_DEV(cn_d), SLBUF_DEV(mats_d), SLARG(g->le0),
+                                   SLARG(g->inv_le_step), SLARG(g->film_dmax[0]),
+                                   SLARG(g->film_dmax[1]), SLARG(g->film_dmax[2]),
+                                   SLARG(g->film_positive), SLARG(g->couplers_donor_lm));
+    SF_SL_STEP("develop_corr");
+    const float csigma = g->coupler_diff_um / fmaxf(pixel_um, 1e-3f);
+    if(g->coupler_tail_w > 0.0f)
+    {
+      const float ea[3] = { SF_EXPTAIL_A0, SF_EXPTAIL_A1, SF_EXPTAIL_A2 };
+      const float er[3] = { SF_EXPTAIL_R0, SF_EXPTAIL_R1, SF_EXPTAIL_R2 };
+      const float amp[4] = { 1.0f - g->coupler_tail_w, g->coupler_tail_w * ea[0],
+                             g->coupler_tail_w * ea[1], g->coupler_tail_w * ea[2] };
+      const float tail_px = g->coupler_tail_um / fmaxf(pixel_um, 1e-3f);
+      const float sig[4] = { csigma, er[0] * tail_px, er[1] * tail_px, er[2] * tail_px };
+      for(int g3 = 0; g3 < 4; g3++)
+      {
+        /* the same three cuts as process_cl() */
+        if(sig[g3] >= SF_WIDE_BLUR_MIN_SIGMA)
+        {
+          int wide = 0;
+          err = _sf_copy_slang(acc, plane2, w, h)
+                || _sf_blur_wide_slang(plane2, w, h, roi_x, roi_y, sig[g3], &wide);
+        }
+        else if(sig[g3] >= SF_GAUSS_MIN_SIGMA)
+          err = _sf_blur4_op_slang(acc, plane2, gtmp4, w, h, sig[g3]);
+        else
+          err = _sf_copy_slang(acc, plane2, w, h);
+        const int reset = (g3 == 0);
+        const float a = amp[g3];
+        if(!err)
+          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
+                                         SLBUF_DEV(plane2), SLBUF_DEV(tmpa), SLARG(w), SLARG(h),
+                                         SLARG(a), SLARG(a), SLARG(a), SLARG(reset));
+        SF_SL_STEP("coupler tail accum");
+      }
+    }
+    else if(csigma > 0.1f)
+    {
+      if(csigma >= SF_WIDE_BLUR_MIN_SIGMA)
+      {
+        int wide = 0;
+        err = _sf_blur_wide_slang(acc, w, h, roi_x, roi_y, csigma, &wide);
+        SF_SL_STEP("coupler blur");
+      }
+      else if(csigma >= SF_GAUSS_MIN_SIGMA)
+      {
+        err = _sf_blur_fast_slang(acc, gtmp4, w, h, csigma, 4);
+        SF_SL_STEP("coupler blur");
+      }
+    }
+  }
+  dt_slang_gpu_buffer_t *corr_buf = (g->coupler_tail_w > 0.0f) ? tmpa : acc;
+  err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_develop", w, h, SLBUF_DEV(plane),
+                                 SLBUF_DEV(corr_buf), SLARG(use_corr), SLBUF_DEV(plane2),
+                                 SLARG(w), SLARG(h), SLBUF_DEV(cb_d), SLBUF_DEV(mats_d),
+                                 SLARG(g->le0), SLARG(g->inv_le_step),
+                                 SLARG(g->couplers_recv_lm));
+  SF_SL_STEP("develop");
+
+  /* ---- 4) grain on the developed CMY density ----------------------------- */
+  if(d->p.grain_on && d->p.grain_amount > 0.0f)
+  {
+    const uint32_t salt = _grain_salt(piece);
+    const float amount = d->p.grain_amount;
+    const int mono = g->film_bw;
+    gr_dmax = dt_slang_gpu_buffer_new((size_t)maxsub * 3 * f, g->grain_layer_dmax);
+    gr_npart = dt_slang_gpu_buffer_new((size_t)maxsub * 3 * f, g->grain_layer_npart);
+    gr_dmin = dt_slang_gpu_buffer_new((size_t)maxsub * 3 * f, g->grain_layer_dmin);
+    gr_total = dt_slang_gpu_buffer_new((size_t)nle * 3 * f, g->grain_layer_curve_total);
+    gr_curve = dt_slang_gpu_buffer_new((size_t)nle * maxsub * 3 * f, g->grain_layer_curve);
+    gr_acc = dt_slang_gpu_buffer_new_uninit(npix * f);
+    gboolean ok = gr_dmax && gr_npart && gr_dmin && gr_total && gr_curve && gr_acc;
+    for(int sl = 0; sl < nsub; sl++)
+    {
+      gr_raw[sl] = dt_slang_gpu_buffer_new_uninit(npix * f);
+      if(!gr_raw[sl]) ok = FALSE;
+    }
+    err = !ok;
+    SF_SL_STEP("grain allocation");
+
+    const float npart_scale = (pixel_um * pixel_um) / (SF_GRAIN_REF_UM * SF_GRAIN_REF_UM);
+    float dye_sigma[3][SF_GRAIN_MAX_SUBLAYERS];
+    for(int c = 0; c < 3; c++)
+      for(int sl = 0; sl < nsub; sl++)
+      {
+        const float npart_c = g->grain_layer_npart[sl][c] * npart_scale;
+        const float od_particle = g->grain_layer_dmax[sl][c] / fmaxf(npart_c, 1e-6f);
+        dye_sigma[c][sl] = SF_GRAIN_DYE_BLUR_UM * d->p.grain_dye_cloud
+                         * sqrtf(fmaxf(od_particle, 0.0f)) * preview_scale;
+      }
+
+    const int n_out_ch = mono ? 1 : 3;
+    for(int oc = 0; oc < n_out_ch && !err; oc++)
+    {
+      const int channel_idx = mono ? 1 : oc;
+      const int seed_ch = mono ? 0 : oc;
+      const float unif_ch = g->grain_uniformity[channel_idx];
+      for(int sl = 0; sl < nsub && !err; sl++)
+      {
+        err = dt_slang_gpu_run_2d_args(
+            "spektrafilm", "spektrafilm_grain_gen_raw_sl", w, h, SLBUF_DEV(plane2),
+            SLBUF_DEV(gr_raw[sl]), SLARG(w), SLARG(h), SLARG(roi_x), SLARG(roi_y), SLARG(mono),
+            SLARG(channel_idx), SLARG(seed_ch), SLARG(sl), SLARG(nle), SLARG(maxsub),
+            SLARG(unif_ch), SLARG(npart_scale), SLARG(salt), SLBUF_DEV(gr_dmax),
+            SLBUF_DEV(gr_npart), SLBUF_DEV(gr_dmin), SLBUF_DEV(gr_total), SLBUF_DEV(gr_curve));
+        /* exact only, as SF_GAUSS_BLUR1_EXACT */
+        if(!err && dye_sigma[channel_idx][sl] > 1e-6f)
+          err = _sf_gauss_exact_slang(gr_raw[sl], gr_raw[sl], gtmp1, w, h,
+                                      dye_sigma[channel_idx][sl], 1);
+      }
+      for(int sl = 0; sl < nsub && !err; sl++)
+      {
+        const int reset = sl == 0;
+        err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_grain_accumulate_1c", w, h,
+                                       SLBUF_DEV(gr_acc), SLBUF_DEV(gr_raw[sl]), SLARG(w),
+                                       SLARG(h), SLARG(reset));
+      }
+      if(!err)
+      {
+        const float dmin_ch = g->grain_dmin[channel_idx];
+        err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_grain_finalize_channel", w, h,
+                                       SLBUF_DEV(tmpa), SLBUF_DEV(gr_acc), SLBUF_DEV(plane2),
+                                       SLARG(w), SLARG(h), SLARG(mono), SLARG(channel_idx),
+                                       SLARG(oc), SLARG(dmin_ch), SLARG(amount));
+      }
+    }
+    SF_SL_STEP("grain gen");
+    err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_grain_add", w, h, SLBUF_DEV(plane2),
+                                   SLBUF_DEV(tmpa), SLARG(w), SLARG(h));
+    SF_SL_STEP("grain add");
+    const float gsigma = d->p.grain_blur_base * fmaxf(d->p.grain_blur, SF_GRAIN_BLUR_MIN)
+                          * preview_scale;
+    if(gsigma >= SF_GAUSS_MIN_SIGMA)
+    {
+      err = _sf_gauss_exact_slang(plane2, plane2, gtmp4, w, h, gsigma, 4);
+      SF_SL_STEP("grain blur");
+    }
+    if(d->p.grain_usm_sigma > 0.0f && d->p.grain_usm_amount > 0.0f)
+    {
+      err = _sf_copy_slang(plane2, acc, w, h);
+      SF_SL_STEP("grain USM copy");
+      const float usig = d->p.grain_usm_sigma * preview_scale;
+      if(usig >= SF_GAUSS_MIN_SIGMA)
+      {
+        err = _sf_gauss_exact_slang(plane2, plane2, gtmp4, w, h, usig, 4);
+        SF_SL_STEP("grain USM blur");
+      }
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_grain_usm", w, h,
+                                     SLBUF_DEV(plane2), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                     SLARG(d->p.grain_usm_amount), SLARG(g->grain_dmin[0]),
+                                     SLARG(g->grain_dmin[1]), SLARG(g->grain_dmin[2]));
+      SF_SL_STEP("grain USM");
+    }
+  }
+
+  /* ---- 5) print ----------------------------------------------------------- */
+  if(g->has_print)
+  {
+    err = dt_slang_gpu_run_2d_args(
+        "spektrafilm", "spektrafilm_print_expose", w, h, SLBUF_DEV(plane2), SLBUF_DEV(plane),
+        SLARG(w), SLARG(h), SLBUF_DEV(el_d), SLBUF_DEV(ex_d), SLBUF_DEV(ey_d), SLBUF_DEV(ez_d),
+        SLBUF_DEV(en_d), SLBUF_DEV(em_d), SLARG(steps), SLARG(g->enl_lo[0]), SLARG(g->enl_lo[1]),
+        SLARG(g->enl_lo[2]), SLARG(g->enl_inv_range[0]), SLARG(g->enl_inv_range[1]),
+        SLARG(g->enl_inv_range[2]), SLARG(g->log10_print_exposure));
+    SF_SL_STEP("print_expose");
+    if(d->p.print_diffusion_on)
+    {
+      sf_diffusion_plan_t pplan;
+      if(sf_diffusion_build_plan((int)d->p.print_diffusion_filter_family,
+                                 d->p.print_diffusion_strength,
+                                 d->p.print_diffusion_warmth, &pplan)
+         && pplan.p_s > 0.0f)
+      {
+        err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_pow10", w, h, SLBUF_DEV(plane),
+                                       SLARG(w), SLARG(h));
+        SF_SL_STEP("print_diffusion pow10");
+        const double pdsc = fmax((double)d->p.print_diffusion_scale, 1e-6);
+        for(int j = 0; j < pplan.n && !err; j++)
+        {
+          const float sigma
+              = (float)((double)pplan.sigma_um[j] * pdsc / fmax((double)pixel_um, 1e-3));
+          err = _sf_blur4_wide_op_slang(plane, tmpa, gtmp4, w, h, roi_x, roi_y, sigma);
+          const int reset = (j == 0);
+          const float wr = pplan.wr[j], wg = pplan.wg[j], wb = pplan.wb[j];
+          if(!err)
+            err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
+                                           SLBUF_DEV(tmpa), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                           SLARG(wr), SLARG(wg), SLARG(wb), SLARG(reset));
+        }
+        const float ps = pplan.p_s;
+        if(!err)
+          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_mix", w, h,
+                                         SLBUF_DEV(plane), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                         SLARG(ps));
+        SF_SL_STEP("print_diffusion");
+        err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_log10", w, h, SLBUF_DEV(plane),
+                                       SLARG(w), SLARG(h));
+        SF_SL_STEP("print_diffusion log10");
+      }
+    }
+    err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_print_develop", w, h,
+                                   SLBUF_DEV(plane), SLBUF_DEV(plane2), SLARG(w), SLARG(h),
+                                   SLBUF_DEV(pc_d), SLARG(g->le0), SLARG(g->inv_le_step));
+    SF_SL_STEP("print_develop");
+  }
+
+  /* ---- 6) scan over the full padded ROI into `plane` ---------------------- */
+  const int glare_on = !d->p.scan_film && d->p.glare_percent > 0.0f;
+  if(glare_on)
+  {
+    const float gmean = d->p.glare_percent * 0.01f;
+    const float sigma2 = logf(1.0f + SF_GLARE_ROUGHNESS * SF_GLARE_ROUGHNESS);
+    const float gs = sqrtf(sigma2), gbias = -0.5f * sigma2;
+    const uint32_t salt = _grain_salt(piece);
+    err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_glare_gen", w, h, SLBUF_DEV(tmpa),
+                                   SLARG(w), SLARG(h), SLARG(roi_x), SLARG(roi_y), SLARG(gmean),
+                                   SLARG(gs), SLARG(gbias), SLARG(salt));
+    SF_SL_STEP("glare gen");
+    err = _sf_gauss_exact_slang(tmpa, tmpa, gtmp4, w, h, SF_GLARE_BLUR_PX * preview_scale, 4);
+    SF_SL_STEP("glare blur");
+  }
+  err = dt_slang_gpu_run_2d_args(
+      "spektrafilm", "spektrafilm_scan", w, h, SLBUF_DEV(plane2), SLBUF_DEV(plane), SLARG(w),
+      SLARG(h), SLBUF_DEV(sl_d), SLBUF_DEV(sx_d), SLBUF_DEV(sy_d), SLBUF_DEV(sz_d),
+      SLBUF_DEV(sn_d), SLBUF_DEV(sm_d), SLARG(steps), SLARG(g->scan_lo[0]), SLARG(g->scan_lo[1]),
+      SLARG(g->scan_lo[2]), SLARG(g->scan_inv_range[0]), SLARG(g->scan_inv_range[1]),
+      SLARG(g->scan_inv_range[2]), SLBUF_DEV(mats_d), SLBUF_DEV(cm_d), SLARG(g->cmax_nl),
+      SLARG(g->cmax_nh), SLARG(g->out_compress), SLARG(g->out_luminance_boost),
+      SLARG(g->out_scale), SLARG(g->scan_bw_on), SLARG(g->scan_bw_m), SLARG(g->scan_bw_q),
+      SLBUF_DEV(tmpa), SLARG(glare_on), SLARG(g->glare_xyz[0]), SLARG(g->glare_xyz[1]),
+      SLARG(g->glare_xyz[2]));
+  SF_SL_STEP("scan");
+
+  /* ---- 6b) scanner optics ------------------------------------------------- */
+  if(d->p.scan_blur > 0.0f && d->p.scan_blur * preview_scale >= SF_GAUSS_MIN_SIGMA)
+  {
+    err = _sf_gauss_exact_slang(plane, plane, gtmp4, w, h, d->p.scan_blur * preview_scale, 4);
+    SF_SL_STEP("scanner blur");
+  }
+  if(d->p.scan_usm_sigma > 0.0f && d->p.scan_usm_amount > 0.0f)
+  {
+    err = _sf_copy_slang(plane, acc, w, h);
+    SF_SL_STEP("scanner USM copy");
+    if(d->p.scan_usm_sigma * preview_scale >= SF_GAUSS_MIN_SIGMA)
+    {
+      err = _sf_gauss_exact_slang(plane, plane, gtmp4, w, h,
+                                  d->p.scan_usm_sigma * preview_scale, 4);
+      SF_SL_STEP("scanner USM blur");
+    }
+    err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_scan_usm", w, h, SLBUF_DEV(plane),
+                                   SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                   SLARG(d->p.scan_usm_amount));
+    SF_SL_STEP("scanner USM");
+  }
+
+  /* ---- 7) crop the roi_out window into dev_out ----------------------------- */
+  err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_crop_out", ow, oh, SLBUF_DEV(plane),
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(w), SLARG(ow),
+                                 SLARG(oh), SLARG(ox), SLARG(oy));
+  SF_SL_STEP("crop out");
+#undef SF_SL_STEP
+
+cleanup:
+  dt_slang_gpu_buffer_free(mats_d);
+  dt_slang_gpu_buffer_free(tc_d);
+  dt_slang_gpu_buffer_free(cn_d);
+  dt_slang_gpu_buffer_free(cb_d);
+  dt_slang_gpu_buffer_free(el_d);
+  dt_slang_gpu_buffer_free(ex_d);
+  dt_slang_gpu_buffer_free(ey_d);
+  dt_slang_gpu_buffer_free(ez_d);
+  dt_slang_gpu_buffer_free(en_d);
+  dt_slang_gpu_buffer_free(em_d);
+  dt_slang_gpu_buffer_free(pc_d);
+  dt_slang_gpu_buffer_free(sl_d);
+  dt_slang_gpu_buffer_free(sx_d);
+  dt_slang_gpu_buffer_free(sy_d);
+  dt_slang_gpu_buffer_free(sz_d);
+  dt_slang_gpu_buffer_free(sn_d);
+  dt_slang_gpu_buffer_free(sm_d);
+  dt_slang_gpu_buffer_free(cm_d);
+  dt_slang_gpu_buffer_free(plane);
+  dt_slang_gpu_buffer_free(plane2);
+  dt_slang_gpu_buffer_free(tmpa);
+  dt_slang_gpu_buffer_free(acc);
+  dt_slang_gpu_buffer_free(plane1);
+  dt_slang_gpu_buffer_free(gtmp4);
+  dt_slang_gpu_buffer_free(gtmp1);
+  dt_slang_gpu_buffer_free(gr_dmax);
+  dt_slang_gpu_buffer_free(gr_npart);
+  dt_slang_gpu_buffer_free(gr_dmin);
+  dt_slang_gpu_buffer_free(gr_total);
+  dt_slang_gpu_buffer_free(gr_curve);
+  dt_slang_gpu_buffer_free(gr_acc);
+  for(int sl = 0; sl < SF_GRAIN_MAX_SUBLAYERS; sl++) dt_slang_gpu_buffer_free(gr_raw[sl]);
+  return !err;
+}
+#endif /* HAVE_SLANG_GPU */
+
 /* ---------------------------------------------------------------------- */
 /* GUI                                                                    */
 /* ---------------------------------------------------------------------- */

@@ -1074,3 +1074,126 @@ static int _capture_sharpen_cl(dt_iop_module_t *self,
   return err;
 }
 #endif // OpenCL
+
+#ifdef HAVE_SLANG_GPU
+
+// _capture_radius_cl() for the Slang kernels: the radius is estimated on the host
+static float _capture_radius_slang(dt_iop_module_t *self,
+                                   dt_dev_pixelpipe_iop_t *const piece,
+                                   dt_slang_gpu_image_t *dev_in,
+                                   const dt_iop_roi_t *const roi,
+                                   const uint8_t (*const xtrans)[6],
+                                   const uint32_t filters)
+{
+  float *in = dt_iop_image_alloc(roi->width, roi->height, 1);
+  float radius = 0.5f;
+  if(in && !dt_slang_gpu_image_read(dev_in, in))
+    radius = _capture_radius(self, piece, in, roi, xtrans, filters);
+  else
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, filters == 9u ? "xtrans autoradius" : "bayer autoradius",
+                  piece->pipe, self, DT_DEVICE_NONE, roi, NULL, "Slang calculation failed");
+  dt_free_align(in);
+  return radius;
+}
+
+// _capture_sharpen_cl() on the Slang kernels, sharpening dev_out in place
+// from the raw data in dev_in. The mask views are left to the other paths.
+// Returns TRUE on success.
+static gboolean _capture_sharpen_slang(dt_iop_module_t *self,
+                                       dt_dev_pixelpipe_iop_t *const piece,
+                                       dt_slang_gpu_image_t *dev_in,
+                                       dt_slang_gpu_image_t *dev_out,
+                                       const int width,
+                                       const int height,
+                                       const int dx,
+                                       const int dy,
+                                       const uint8_t (*const xtrans)[6],
+                                       const uint32_t filters)
+{
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const dt_iop_demosaic_data_t *const d = piece->data;
+  const dt_iop_demosaic_global_data_t *const gd = self->global_data;
+
+  if(dt_pipe_is_thumb(pipe) && !_get_thumb_quality(pipe->final_width, pipe->final_height))
+    return TRUE;
+  if(!d->cs_enabled) return TRUE;
+
+  const int pixels = width * height;
+  const size_t bsize = sizeof(float) * pixels;
+
+  const dt_iop_buffer_dsc_t *dsc = &pipe->dsc;
+  const gboolean wbon = dsc->temperature.enabled;
+  const dt_aligned_pixel_t icoeffs = { wbon ? CAPTURE_CFACLIP * dsc->temperature.coeffs[0] : CAPTURE_CFACLIP,
+                                       wbon ? CAPTURE_CFACLIP * dsc->temperature.coeffs[1] : CAPTURE_CFACLIP,
+                                       wbon ? CAPTURE_CFACLIP * dsc->temperature.coeffs[2] : CAPTURE_CFACLIP,
+                                       0.0f };
+
+  // the per-pixel kernel index, one byte each, padded to whole words
+  const size_t table_size = ((size_t)pixels + 3) & ~(size_t)3;
+  unsigned char *f_gauss_idx = _cs_precalc_gauss_idx(self, width, height, dx, dy, d->cs_radius, d->cs_boost, d->cs_center);
+  unsigned char *table = f_gauss_idx ? calloc(table_size, 1) : NULL;
+  if(table) memcpy(table, f_gauss_idx, pixels);
+  dt_free_align(f_gauss_idx);
+
+  float *ones = dt_alloc_align_float(pixels);
+  if(ones) dt_iop_image_fill(ones, 1.0f, width, height, 1);
+
+  dt_slang_gpu_buffer_t *blendmask = dt_slang_gpu_buffer_new_uninit(bsize);
+  dt_slang_gpu_buffer_t *luminance = dt_slang_gpu_buffer_new_uninit(bsize);
+  dt_slang_gpu_buffer_t *tmp2 = ones ? dt_slang_gpu_buffer_new(bsize, ones) : NULL;
+  dt_slang_gpu_buffer_t *tmp1 = dt_slang_gpu_buffer_new_uninit(bsize);
+  dt_slang_gpu_buffer_t *gcoeffs =
+    dt_slang_gpu_buffer_new(sizeof(float) * (UCHAR_MAX + 1) * CAPTURE_KERNEL_ALIGN, gd->gauss_coeffs);
+  dt_slang_gpu_buffer_t *gauss_idx = table ? dt_slang_gpu_buffer_new(table_size, table) : NULL;
+  dt_slang_gpu_image_t *dev_rgb = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_free_align(ones);
+  free(table);
+
+  const int zero = 0;
+  const float thrs = d->cs_thrs;
+  int err = !blendmask || !luminance || !tmp2 || !tmp1 || !gcoeffs || !gauss_idx || !dev_rgb;
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                   SLIMG_DEV(dev_out), SLIMG_DEV(dev_rgb), SLARG(width), SLARG(height),
+                                   SLARG(width), SLARG(height), SLARG(zero), SLARG(zero));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("capture", "prepare_blend", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_rgb), SLARG(filters),
+                                   SLBUF(xtrans, 36), SLBUF_DEV(tmp2), SLBUF_DEV(tmp1),
+                                   SLARG(icoeffs), SLARG(width), SLARG(height));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("capture", "modify_blend", width, height,
+                                   SLBUF_DEV(tmp2), SLBUF_DEV(tmp1), SLBUF_DEV(luminance), SLARG(thrs),
+                                   SLARG(width), SLARG(height));
+  if(!err)
+    err = dt_gaussian_fast_blur_slang_buffer(tmp2, blendmask, width, height, 2.0f, 0.0f, 1.0f);
+  if(!err)
+    err = dt_slang_gpu_run_1d_args("capture", "final_blend", pixels,
+                                   SLBUF_DEV(blendmask), SLBUF_DEV(tmp2), SLARG(pixels));
+
+  for(int iter = 0; iter < d->cs_iter && !err; iter++)
+  {
+    err = dt_slang_gpu_run_2d_args("capture", "kernel_9x9_div", width, height,
+                                   SLBUF_DEV(tmp1), SLBUF_DEV(tmp2), SLBUF_DEV(luminance), SLBUF_DEV(blendmask),
+                                   SLBUF_DEV(gcoeffs), SLBUF_DEV(gauss_idx), SLARG(width), SLARG(height));
+    if(!err)
+      err = dt_slang_gpu_run_2d_args("capture", "kernel_9x9_mul", width, height,
+                                     SLBUF_DEV(tmp2), SLBUF_DEV(tmp1), SLBUF_DEV(blendmask),
+                                     SLBUF_DEV(gcoeffs), SLBUF_DEV(gauss_idx), SLARG(width), SLARG(height));
+  }
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("capture", "capture_result", width, height,
+                                   SLIMG_DEV(dev_rgb), SLIMG_DEV(dev_out), SLBUF_DEV(blendmask),
+                                   SLBUF_DEV(luminance), SLBUF_DEV(tmp1), SLARG(width), SLARG(height));
+
+  dt_slang_gpu_buffer_free(blendmask);
+  dt_slang_gpu_buffer_free(luminance);
+  dt_slang_gpu_buffer_free(tmp2);
+  dt_slang_gpu_buffer_free(tmp1);
+  dt_slang_gpu_buffer_free(gcoeffs);
+  dt_slang_gpu_buffer_free(gauss_idx);
+  dt_slang_gpu_image_free(dev_rgb);
+  return !err;
+}
+#endif // HAVE_SLANG_GPU

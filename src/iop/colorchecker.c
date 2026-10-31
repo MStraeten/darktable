@@ -22,6 +22,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/exif.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -721,6 +722,50 @@ error:
   free(params);
   dt_opencl_release_mem_object(dev_params);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorchecker_data_t *d = piece->data;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const int num_patches = d->num_patches;
+
+  // the same layout as in process_cl(): source patches, then coefficients
+  const size_t params_size = (size_t)(4 * (2 * num_patches + 4)) * sizeof(float);
+  float *params = malloc(params_size);
+  if(!params) return FALSE;
+  float *idx = params;
+
+  for(int n = 0; n < num_patches; n++, idx += 4)
+  {
+    idx[0] = d->source_Lab[3 * n];
+    idx[1] = d->source_Lab[3 * n + 1];
+    idx[2] = d->source_Lab[3 * n + 2];
+    idx[3] = 0.0f;
+  }
+
+  for(int n = 0; n < num_patches + 4; n++, idx += 4)
+  {
+    idx[0] = d->coeff_L[n];
+    idx[1] = d->coeff_a[n];
+    idx[2] = d->coeff_b[n];
+    idx[3] = 0.0f;
+  }
+
+  const int err = dt_slang_gpu_run_2d_args("extended", "colorchecker", width, height,
+                                           SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                           SLARG(num_patches), SLBUF(params, params_size));
+  free(params);
+  return !err;
 }
 #endif
 

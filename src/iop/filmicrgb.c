@@ -34,6 +34,7 @@
 #include "common/image.h"
 #include "common/dttypes.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -2588,6 +2589,273 @@ error:
   dt_opencl_release_mem_object(norms);
   dt_opencl_release_mem_object(clipped);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// reconstruct_highlights_cl() on the Slang GPU path. Returns the reconstructed
+// image, which replaces *reconstructed, or NULL on failure.
+static dt_slang_gpu_image_t *_reconstruct_highlights_slang(dt_slang_gpu_image_t *in,
+                                                           dt_slang_gpu_image_t *mask,
+                                                           dt_slang_gpu_image_t *reconstructed,
+                                                           const dt_iop_filmicrgb_reconstruction_type_t variant,
+                                                           const dt_iop_filmicrgb_data_t *const data,
+                                                           const dt_dev_pixelpipe_iop_t *piece,
+                                                           const dt_iop_roi_t *const roi_in)
+{
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int scales = get_scales(roi_in, piece);
+
+  dt_slang_gpu_image_t *LF_even = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *LF_odd = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *HF_RGB = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *HF_grey = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *temp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *reconstructed_out = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *reconstructed_in = reconstructed;
+
+  int err = !LF_even || !LF_odd || !HF_RGB || !HF_grey || !temp || !reconstructed_out;
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("filmic", "init_reconstruct", width, height,
+      SLIMG_DEV(in), SLIMG_DEV(mask), SLIMG_DEV(reconstructed_in), SLARG(width), SLARG(height));
+
+  const float gamma = data->reconstruct_structure_vs_texture;
+  const float gamma_comp = 1.0f - data->reconstruct_structure_vs_texture;
+  const float beta = data->reconstruct_grey_vs_color;
+  const float beta_comp = 1.f - data->reconstruct_grey_vs_color;
+  const float delta = data->reconstruct_bloom_vs_details;
+  const int one = 1;
+
+  for(int s = 0; s < scales && !err; ++s)
+  {
+    dt_slang_gpu_image_t *detail = s == 0 ? in : s % 2 != 0 ? LF_odd : LF_even;
+    dt_slang_gpu_image_t *LF = s % 2 != 0 ? LF_even : LF_odd;
+    const int mult = 1 << s;
+
+    // the high frequencies go to HF_grey, and a blurred copy of them to
+    // HF_RGB, which spares the copy reconstruct_highlights_cl() makes
+    err = dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_horizontal", width, height,
+            SLIMG_DEV(detail), SLIMG_DEV(temp), SLARG(width), SLARG(height), SLARG(mult))
+       || dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_vertical", width, height,
+            SLIMG_DEV(temp), SLIMG_DEV(LF), SLARG(width), SLARG(height), SLARG(mult))
+       || dt_slang_gpu_run_2d_args("bspline", "wavelets_detail_level", width, height,
+            SLIMG_DEV(detail), SLIMG_DEV(LF), SLIMG_DEV(HF_grey), SLARG(width), SLARG(height))
+       || dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_vertical", width, height,
+            SLIMG_DEV(HF_grey), SLIMG_DEV(temp), SLARG(width), SLARG(height), SLARG(one))
+       || dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_horizontal", width, height,
+            SLIMG_DEV(temp), SLIMG_DEV(HF_RGB), SLARG(width), SLARG(height), SLARG(one))
+       || dt_slang_gpu_run_2d_args("filmic", "wavelets_reconstruct", width, height,
+            SLIMG_DEV(HF_RGB), SLIMG_DEV(LF), SLIMG_DEV(HF_grey), SLIMG_DEV(mask),
+            SLIMG_DEV(reconstructed_in), SLIMG_DEV(reconstructed_out), SLARG(width), SLARG(height),
+            SLARG(gamma), SLARG(gamma_comp), SLARG(beta), SLARG(beta_comp), SLARG(delta), SLARG(s),
+            SLARG(scales), SLARG(variant));
+
+    dt_slang_gpu_image_t *swap = reconstructed_in;
+    reconstructed_in = reconstructed_out;
+    reconstructed_out = swap;
+  }
+
+  dt_slang_gpu_image_free(LF_even);
+  dt_slang_gpu_image_free(LF_odd);
+  dt_slang_gpu_image_free(HF_RGB);
+  dt_slang_gpu_image_free(HF_grey);
+  dt_slang_gpu_image_free(temp);
+  dt_slang_gpu_image_free(reconstructed_out);
+  if(err)
+  {
+    dt_slang_gpu_image_free(reconstructed_in);
+    return NULL;
+  }
+  return reconstructed_in;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_filmicrgb_data_t *const d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  const dt_iop_order_iccprofile_info_t *const export_profile = dt_ioppr_get_pipe_output_profile_info(piece->pipe);
+  const int use_work_profile = (work_profile == NULL) ? 0 : 1;
+
+  // the same matrices as process_cl()
+  dt_colormatrix_t input_matrix_trans;
+  dt_colormatrix_t output_matrix;
+  dt_colormatrix_t output_matrix_trans;
+  dt_colormatrix_t export_input_matrix_trans;
+  dt_colormatrix_t export_output_matrix;
+  dt_colormatrix_t export_output_matrix_trans;
+  const int use_output_profile
+    = filmic_v4_prepare_matrices(input_matrix_trans, output_matrix, output_matrix_trans,
+                                 export_input_matrix_trans, export_output_matrix, export_output_matrix_trans,
+                                 work_profile, export_profile);
+  dt_colormatrix_t input_matrix;
+  dt_colormatrix_transpose(input_matrix, input_matrix_trans);
+  // the kernels take the export matrices either way
+  dt_colormatrix_t export_input_matrix;
+  if(use_output_profile)
+    dt_colormatrix_transpose(export_input_matrix, export_input_matrix_trans);
+  else
+  {
+    memcpy(export_input_matrix, input_matrix, sizeof(input_matrix));
+    memcpy(export_output_matrix, output_matrix, sizeof(output_matrix));
+  }
+
+  const float norm_min = exp_tonemapping_v2(0.f, d->grey_source, d->black_source, d->dynamic_range);
+  const float norm_max = exp_tonemapping_v2(1.f, d->grey_source, d->black_source, d->dynamic_range);
+
+  dt_colorspaces_iccprofile_info_slang_t profile_info;
+  int lut_width, lut_height;
+  float *profile_lut = dt_ioppr_build_iccprofile_params_slang(work_profile, &profile_info,
+                                                              &lut_width, &lut_height);
+  if(!profile_lut) return FALSE;
+
+  // used to adjust noise level depending on size. Don't amplify noise if magnified > 100%
+  const float scale = MAX(piece->iscale / roi_in->scale, 1.f);
+
+  dt_slang_gpu_image_t *in = dev_in;
+  dt_slang_gpu_image_t *reconstructed = NULL;
+  dt_slang_gpu_image_t *inpainted = NULL;
+  dt_slang_gpu_image_t *ratios = NULL;
+  dt_slang_gpu_image_t *norms = NULL;
+  dt_slang_gpu_image_t *mask = dt_slang_gpu_image_new(width, height, 1, NULL);
+  dt_slang_gpu_buffer_t *clipped = dt_slang_gpu_buffer_new(sizeof(int), NULL);
+  int err = !mask || !clipped;
+
+  // build a mask of clipped pixels, and count them
+  int cnt_clipped = 0;
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("filmic", "filmic_mask_clipped_pixels", width, height,
+            SLIMG_DEV(in), SLIMG_DEV(mask), SLARG(width), SLARG(height), SLARG(d->normalize),
+            SLARG(d->reconstruct_feather), SLBUF_DEV(clipped))
+       || dt_slang_gpu_buffer_read(clipped, &cnt_clipped, sizeof(cnt_clipped));
+  dt_slang_gpu_buffer_free(clipped);
+
+  gboolean show_mask = FALSE;
+  if(self->dev->gui_attached && dt_pipe_is_full(piece->pipe))
+  {
+    const dt_iop_filmicrgb_gui_data_t *g = self->gui_data;
+    dt_iop_gui_enter_critical_section(self);
+    show_mask = g->show_mask;
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  // display mask and exit
+  if(!err && show_mask)
+    err = dt_slang_gpu_run_2d_args("filmic", "filmic_show_mask", width, height,
+            SLIMG_DEV(mask), SLIMG_DEV(dev_out), SLARG(width), SLARG(height));
+
+  if(!err && !show_mask && !dt_pipe_is_fast(piece->pipe) && cnt_clipped > 9
+     && d->enable_highlight_reconstruction)
+  {
+    // inpaint noise
+    const float noise_level = d->noise_level / scale;
+    const int noise_distribution = d->noise_distribution;
+    inpainted = dt_slang_gpu_image_new(width, height, 4, NULL);
+    reconstructed = dt_slang_gpu_image_new(width, height, 4, NULL);
+    err = !inpainted || !reconstructed
+       || dt_slang_gpu_run_2d_args("filmic", "filmic_inpaint_noise", width, height,
+            SLIMG_DEV(in), SLIMG_DEV(mask), SLIMG_DEV(inpainted), SLARG(width), SLARG(height),
+            SLARG(noise_level), SLARG(d->reconstruct_threshold), SLARG(noise_distribution));
+
+    // first step of highlight reconstruction in RGB
+    if(!err)
+    {
+      reconstructed = _reconstruct_highlights_slang(inpainted, mask, reconstructed, DT_FILMIC_RECONSTRUCT_RGB,
+                                                    d, piece, roi_in);
+      err = !reconstructed;
+    }
+    dt_slang_gpu_image_free(inpainted);
+    inpainted = NULL;
+
+    if(!err && d->high_quality_reconstruction > 0)
+    {
+      ratios = dt_slang_gpu_image_new(width, height, 4, NULL);
+      norms = dt_slang_gpu_image_new(width, height, 1, NULL);
+      err = !ratios || !norms;
+
+      for(int i = 0; i < d->high_quality_reconstruction && !err; i++)
+      {
+        // break ratios and norms
+        const int preserve_color = d->preserve_color;
+        err = dt_slang_gpu_run_2d_args("filmic", "compute_ratios", width, height,
+                SLIMG_DEV(reconstructed), SLIMG_DEV(norms), SLIMG_DEV(ratios), SLARG(preserve_color),
+                SLARG(width), SLARG(height));
+
+        // second step of reconstruction over ratios, into a new image since
+        // restoring the ratios can't write the image it reads
+        dt_slang_gpu_image_t *restored = err ? NULL : dt_slang_gpu_image_new(width, height, 4, NULL);
+        if(!err)
+        {
+          restored = _reconstruct_highlights_slang(ratios, mask, restored, DT_FILMIC_RECONSTRUCT_RATIOS,
+                                                   d, piece, roi_in);
+          err = !restored;
+        }
+
+        // restore ratios to RGB
+        if(!err)
+          err = dt_slang_gpu_run_2d_args("filmic", "restore_ratios", width, height,
+                  SLIMG_DEV(restored), SLIMG_DEV(norms), SLIMG_DEV(reconstructed), SLARG(width),
+                  SLARG(height));
+        dt_slang_gpu_image_free(restored);
+      }
+    }
+
+    in = reconstructed;
+  }
+
+  if(!err && !show_mask)
+  {
+    const dt_iop_filmic_rgb_spline_t spline = (dt_iop_filmic_rgb_spline_t)d->spline;
+    const float white_display = powf(spline.y[4], d->output_power);
+    const float black_display = powf(spline.y[0], d->output_power);
+    const int version = d->version;
+    const int preserve_color = d->preserve_color;
+    const int type_1 = spline.type[0];
+    const int type_2 = spline.type[1];
+
+    if(d->preserve_color == DT_FILMIC_METHOD_NONE && d->version != DT_FILMIC_COLORSCIENCE_V5)
+      err = dt_slang_gpu_run_2d_args("filmic", "filmicrgb_split", width, height,
+        SLIMG_DEV(in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(d->dynamic_range),
+        SLARG(d->black_source), SLARG(d->grey_source), SLBUF(&profile_info, sizeof(profile_info)),
+        SLIMG_IN(profile_lut, lut_width, lut_height, 1), SLARG(use_work_profile), SLARG(d->sigma_toe),
+        SLARG(d->sigma_shoulder), SLARG(d->saturation), SLARG(spline.M1), SLARG(spline.M2), SLARG(spline.M3),
+        SLARG(spline.M4), SLARG(spline.M5), SLARG(spline.latitude_min), SLARG(spline.latitude_max),
+        SLARG(d->output_power), SLARG(version), SLARG(type_1), SLARG(type_2),
+        SLBUF(input_matrix, 12 * sizeof(float)), SLBUF(output_matrix, 12 * sizeof(float)),
+        SLARG(black_display), SLARG(white_display), SLARG(use_output_profile),
+        SLBUF(export_input_matrix, 12 * sizeof(float)), SLBUF(export_output_matrix, 12 * sizeof(float)));
+    else
+      err = dt_slang_gpu_run_2d_args("filmic", "filmicrgb_chroma", width, height,
+        SLIMG_DEV(in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(d->dynamic_range),
+        SLARG(d->black_source), SLARG(d->grey_source), SLBUF(&profile_info, sizeof(profile_info)),
+        SLIMG_IN(profile_lut, lut_width, lut_height, 1), SLARG(use_work_profile), SLARG(d->sigma_toe),
+        SLARG(d->sigma_shoulder), SLARG(d->saturation), SLARG(spline.M1), SLARG(spline.M2), SLARG(spline.M3),
+        SLARG(spline.M4), SLARG(spline.M5), SLARG(spline.latitude_min), SLARG(spline.latitude_max),
+        SLARG(d->output_power), SLARG(preserve_color), SLARG(version), SLARG(type_1), SLARG(type_2),
+        SLBUF(input_matrix, 12 * sizeof(float)), SLBUF(output_matrix, 12 * sizeof(float)),
+        SLARG(black_display), SLARG(white_display), SLARG(use_output_profile),
+        SLBUF(export_input_matrix, 12 * sizeof(float)), SLBUF(export_output_matrix, 12 * sizeof(float)),
+        SLARG(norm_min), SLARG(norm_max));
+  }
+
+  dt_slang_gpu_image_free(mask);
+  dt_slang_gpu_image_free(inpainted);
+  dt_slang_gpu_image_free(reconstructed);
+  dt_slang_gpu_image_free(ratios);
+  dt_slang_gpu_image_free(norms);
+  free(profile_lut);
+  return !err;
 }
 #endif
 

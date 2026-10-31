@@ -251,6 +251,7 @@ Optional dependencies (minimum version):
 * OpenMP 4.5 *(for CPU multi-threading and SIMD vectorization)*
 * LLVM 7 *(for OpenCL checks at compilation time)*
 * OpenCL 1.2 *(for GPU-accelerated computing)*
+* Slang 2026.20 *(experimental Vulkan/Metal GPU kernels, needed at build time only, see [Slang GPU kernels](#slang-gpu-kernels-experimental))*
 * Lua 5.4 *(for plugins and extension scripting)*
 * G'MIC 2.7.0 *(for .gmz compressed LUT files support)*
 * libgphoto2 2.5 *(for camera tethering)*
@@ -384,6 +385,33 @@ This builds the software for your architecture only, with:
 * OpenMP support (multi-threading and vectorization) if detected,
 * OpenCL support (GPU offloading) if detected,
 * Lua scripting support if detected.
+
+#### Slang GPU kernels (experimental)
+
+darktable can also run some modules on the GPU through kernels written in
+[Slang](https://shader-slang.org), compiled to SPIR-V for Vulkan (Linux,
+Windows) or to Metal libraries (macOS). This is off unless built with
+`--enable-slang` (`-DUSE_SLANG=ON`), and even then off at run time unless
+`slang_gpu=TRUE` is set in darktablerc.
+
+The Slang compiler is not packaged by the distributions, Homebrew or MSYS2
+yet. `.ci/install-slangc.sh` downloads the release darktable is tested with
+and prints the path of `slangc`:
+
+```bash
+SLANGC=$(.ci/install-slangc.sh ~/slang)
+./build.sh --prefix /opt/darktable --build-type Release --enable-slang --install --sudo -- -DSLANGC_EXECUTABLE=$SLANGC
+```
+
+The build also needs:
+
+* on Linux and Windows, the Vulkan headers and loader (`libvulkan-dev` on Debian and Ubuntu,
+  `vulkan-headers` and `vulkan-loader` in MSYS2),
+* on macOS, Xcode rather than only the Command Line Tools, with its Metal toolchain
+  (`xcodebuild -downloadComponent MetalToolchain` on Xcode 26 and later).
+
+`slangc` is not needed at run time; the compiled kernels are installed in
+`share/darktable/kernels/slang`.
 
 #### System Integration / fixing missing icon on wayland
 

@@ -484,6 +484,108 @@ void dt_bilateral_free(dt_bilateral_t *b)
   free(b);
 }
 
+#ifdef HAVE_SLANG_GPU
+dt_bilateral_slang_t *dt_bilateral_init_slang(const int width,
+                                              const int height,
+                                              const float sigma_s,
+                                              const float sigma_r)
+{
+  dt_bilateral_t b2;
+  dt_bilateral_grid_size(&b2, width, height, 100.0f, sigma_s, sigma_r);
+
+  dt_bilateral_slang_t *b = calloc(1, sizeof(dt_bilateral_slang_t));
+  if(!b) return NULL;
+  b->width = width;
+  b->height = height;
+  b->size_x = b2.size_x;
+  b->size_y = b2.size_y;
+  b->size_z = b2.size_z;
+  b->sigma_s = b2.sigma_s;
+  b->sigma_r = b2.sigma_r;
+  b->sigma_s_inv = b2.sigma_s_inv;
+  b->sigma_r_inv = b2.sigma_r_inv;
+
+  // the splat writes every grid point, so neither buffer needs clearing
+  const size_t size = sizeof(float) * b->size_x * b->size_y * b->size_z;
+  b->grid = dt_slang_gpu_buffer_new_uninit(size);
+  b->grid_tmp = dt_slang_gpu_buffer_new_uninit(size);
+  if(!b->grid || !b->grid_tmp)
+  {
+    dt_bilateral_free_slang(b);
+    return NULL;
+  }
+  return b;
+}
+
+int dt_bilateral_splat_slang(dt_bilateral_slang_t *b, dt_slang_gpu_image_t *in)
+{
+  return dt_slang_gpu_run_2d_args("bilateral", "bilateral_splat", b->size_x, b->size_y,
+                                  SLIMG_DEV(in), SLBUF_DEV(b->grid_tmp),
+                                  SLARG(b->width), SLARG(b->height),
+                                  SLARG(b->size_x), SLARG(b->size_y), SLARG(b->size_z),
+                                  SLARG(b->sigma_s), SLARG(b->sigma_s_inv), SLARG(b->sigma_r_inv));
+}
+
+// the passes of dt_bilateral_blur_cl(), which first copies the grid to the
+// temporary buffer; the splat already leaves it there
+int dt_bilateral_blur_slang(dt_bilateral_slang_t *b)
+{
+  const int sx = b->size_x, sy = b->size_y, sz = b->size_z;
+  const int sxy = sx * sy, one = 1;
+  return dt_slang_gpu_run_2d_args("bilateral", "bilateral_blur_line", sz, sy,
+                                  SLBUF_DEV(b->grid_tmp), SLBUF_DEV(b->grid),
+                                  SLARG(sxy), SLARG(sx), SLARG(one), SLARG(sz), SLARG(sy), SLARG(sx))
+    || dt_slang_gpu_run_2d_args("bilateral", "bilateral_blur_line", sz, sx,
+                                SLBUF_DEV(b->grid), SLBUF_DEV(b->grid_tmp),
+                                SLARG(sxy), SLARG(one), SLARG(sx), SLARG(sz), SLARG(sx), SLARG(sy))
+    || dt_slang_gpu_run_2d_args("bilateral", "bilateral_blur_line_z", sx, sy,
+                                SLBUF_DEV(b->grid_tmp), SLBUF_DEV(b->grid),
+                                SLARG(one), SLARG(sx), SLARG(sxy), SLARG(sx), SLARG(sy), SLARG(sz));
+}
+
+int dt_bilateral_slice_slang(dt_bilateral_slang_t *b,
+                             dt_slang_gpu_image_t *in,
+                             dt_slang_gpu_image_t *out,
+                             const float detail)
+{
+  return dt_slang_gpu_run_2d_args("bilateral", "bilateral_slice", b->width, b->height,
+                                  SLIMG_DEV(in), SLIMG_DEV(out), SLBUF_DEV(b->grid),
+                                  SLARG(b->width), SLARG(b->height),
+                                  SLARG(b->size_x), SLARG(b->size_y), SLARG(b->size_z),
+                                  SLARG(b->sigma_s_inv), SLARG(b->sigma_r_inv), SLARG(b->sigma_r),
+                                  SLARG(detail));
+}
+
+int dt_bilateral_slice_to_output_slang(dt_bilateral_slang_t *b,
+                                       dt_slang_gpu_image_t *in,
+                                       dt_slang_gpu_image_t *out,
+                                       const float detail)
+{
+  dt_slang_gpu_image_t *target = dt_slang_gpu_image_new(b->width, b->height, 4, NULL);
+  const int zero = 0;
+  const int err = !target
+    || dt_slang_gpu_run_2d_args("basic", "interpolation_copy", b->width, b->height,
+                                SLIMG_DEV(out), SLIMG_DEV(target), SLARG(b->width), SLARG(b->height),
+                                SLARG(b->width), SLARG(b->height), SLARG(zero), SLARG(zero))
+    || dt_slang_gpu_run_2d_args("bilateral", "bilateral_slice_to_output", b->width, b->height,
+                                SLIMG_DEV(in), SLIMG_DEV(target), SLIMG_DEV(out), SLBUF_DEV(b->grid),
+                                SLARG(b->width), SLARG(b->height),
+                                SLARG(b->size_x), SLARG(b->size_y), SLARG(b->size_z),
+                                SLARG(b->sigma_s_inv), SLARG(b->sigma_r_inv), SLARG(b->sigma_r),
+                                SLARG(detail));
+  dt_slang_gpu_image_free(target);
+  return err;
+}
+
+void dt_bilateral_free_slang(dt_bilateral_slang_t *b)
+{
+  if(!b) return;
+  dt_slang_gpu_buffer_free(b->grid);
+  dt_slang_gpu_buffer_free(b->grid_tmp);
+  free(b);
+}
+#endif
+
 #undef DT_COMMON_BILATERAL_MAX_RES_S
 #undef DT_COMMON_BILATERAL_MAX_RES_R
 

@@ -714,6 +714,31 @@ void dt_box_max(float *const buf,
     dt_unreachable_codepath();
 }
 
+#ifdef HAVE_SLANG_GPU
+extern "C" int dt_box_mean_slang(dt_slang_gpu_image_t *buf,
+                                 dt_slang_gpu_image_t *tmp,
+                                 const int width,
+                                 const int height,
+                                 const int ch,
+                                 const int radius,
+                                 const int iterations)
+{
+  if(ch != 1 && ch != 4) return 1;
+  const char *kernel = ch == 1 ? "box_mean_1c" : "box_mean_4c";
+  const int hdir[2] = { 1, 0 };
+  const int vdir[2] = { 0, 1 };
+  int err = 0;
+  for(int i = 0; !err && i < iterations; i++)
+    err = dt_slang_gpu_run_2d_args("box_filters", kernel, width, height,
+                                   SLIMG_DEV(buf), SLIMG_DEV(tmp), SLARG(width), SLARG(height),
+                                   SLARG(radius), SLARG(hdir))
+      || dt_slang_gpu_run_2d_args("box_filters", kernel, width, height,
+                                  SLIMG_DEV(tmp), SLIMG_DEV(buf), SLARG(width), SLARG(height),
+                                  SLARG(radius), SLARG(vdir));
+  return err;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

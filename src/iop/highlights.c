@@ -27,6 +27,7 @@
 #include "common/box_filters.h"
 #include "common/bspline.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/imagebuf.h"
 #include "common/fast_guided_filter.h"
 #include "common/distance_transform.h"
@@ -732,6 +733,103 @@ int process_cl(dt_iop_module_t *self,
 
   dt_opencl_release_mem_object(dev_xtrans);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// the opposed, clip and LCh methods on raw data, as in process_cl(). The mask
+// displays and a raster mask for other modules need the output on the host,
+// and are left to the CPU.
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  dt_iop_highlights_data_t *d = piece->data;
+  dt_iop_highlights_gui_data_t *g = self->gui_data;
+  const uint32_t filters = piece->filters;
+  const dt_iop_highlights_mode_t dmode = d->mode;
+
+  if(!filters
+     || (dmode != DT_IOP_HIGHLIGHTS_OPPOSED && dmode != DT_IOP_HIGHLIGHTS_CLIP
+         && dmode != DT_IOP_HIGHLIGHTS_LCH && dmode != DT_IOP_HIGHLIGHTS_LAPLACIAN)
+     || (dmode == DT_IOP_HIGHLIGHTS_LAPLACIAN && filters == 9u)
+     // process_lch_bayer() reads its input with the output's size
+     || (dmode == DT_IOP_HIGHLIGHTS_LCH
+         && (roi_in->width != roi_out->width || roi_in->height != roi_out->height))
+     || pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU
+     || dt_iop_is_raster_mask_used(self, BLEND_RASTER_ID))
+    return FALSE;
+
+  if(self->dev->gui_attached && g && dt_pipe_is_full(pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    const dt_highlights_mask_t g_hlr_mask_mode = g->hlr_mask_mode;
+    dt_iop_gui_leave_critical_section(self);
+    if(g_hlr_mask_mode != DT_HIGHLIGHTS_MASK_OFF) return FALSE;
+  }
+
+  gboolean ok;
+  if(dmode == DT_IOP_HIGHLIGHTS_OPPOSED)
+    ok = process_opposed_slang(self, piece, dev_in, dev_out, roi_in, roi_out);
+  else if(dmode == DT_IOP_HIGHLIGHTS_LAPLACIAN)
+  {
+    const float clipper = d->clip * highlights_clip_magics[dmode];
+    const dt_aligned_pixel_t clips = { clipper * pipe->dsc.processed_maximum[0],
+                                       clipper * pipe->dsc.processed_maximum[1],
+                                       clipper * pipe->dsc.processed_maximum[2], clipper };
+    ok = process_laplacian_bayer_slang(self, piece, dev_in, dev_out, roi_in, clips);
+  }
+  else if(dmode == DT_IOP_HIGHLIGHTS_LCH)
+  {
+    const float clipper = d->clip * highlights_clip_magics[dmode];
+    const int width = roi_out->width;
+    const int height = roi_out->height;
+    if(filters == 9u)
+      ok = !dt_slang_gpu_run_2d_args("basic", "highlights_1f_lch_xtrans", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(clipper), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+    else
+      ok = !dt_slang_gpu_run_2d_args("basic", "highlights_1f_lch_bayer", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(clipper), SLARG(filters));
+    if(ok)
+    {
+      const float m = dt_iop_get_processed_maximum(piece);
+      for_three_channels(k) pipe->dsc.processed_maximum[k] = m;
+    }
+  }
+  else
+  {
+    const float clipper = d->clip * highlights_clip_magics[dmode];
+    const dt_dev_chroma_t *chr = &self->dev->chroma;
+    dt_aligned_pixel_t clips = { clipper, clipper, clipper, clipper};
+    if(chr->late_correction)
+    {
+      clips[0] *= chr->as_shot[0] / chr->D65coeffs[0];
+      clips[1] *= chr->as_shot[1] / chr->D65coeffs[1];
+      clips[2] *= chr->as_shot[2] / chr->D65coeffs[2];
+    }
+
+    const int dy = roi_out->y - roi_in->y;
+    const int dx = roi_out->x - roi_in->x;
+    ok = !dt_slang_gpu_run_2d_args("basic", "highlights_1f_clip", roi_out->width, roi_out->height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                   SLARG(roi_in->width), SLARG(roi_in->height),
+                                   SLARG(roi_out->width), SLARG(roi_out->height),
+                                   SLARG(clips), SLARG(dx), SLARG(dy),
+                                   SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+    if(ok)
+    {
+      const float m = dt_iop_get_processed_maximum(piece);
+      for_three_channels(k) pipe->dsc.processed_maximum[k] = m;
+    }
+  }
+  if(ok) dt_iop_piece_clear_raster(piece, NULL);
+  return ok;
 }
 #endif
 

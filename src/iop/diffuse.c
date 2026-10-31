@@ -27,6 +27,7 @@
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop_gui.h"
@@ -1781,6 +1782,169 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_filmic_bspline_vertical_detail);
   free(self->data);
   self->data = NULL;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// wavelets_process_cl() on the device images of the Slang kernels
+static int _wavelets_process_slang(dt_slang_gpu_image_t *in,
+                                   dt_slang_gpu_image_t *reconstructed,
+                                   dt_slang_gpu_image_t *mask,
+                                   const int width,
+                                   const int height,
+                                   const dt_iop_diffuse_data_t *const data,
+                                   const float zoom,
+                                   const int scales,
+                                   const int has_mask,
+                                   dt_slang_gpu_image_t *HF[MAX_NUM_SCALES],
+                                   dt_slang_gpu_image_t *LF_odd,
+                                   dt_slang_gpu_image_t *LF_even)
+{
+  const dt_aligned_pixel_t anisotropy
+      = { compute_anisotropy_factor(data->anisotropy_first),
+          compute_anisotropy_factor(data->anisotropy_second),
+          compute_anisotropy_factor(data->anisotropy_third),
+          compute_anisotropy_factor(data->anisotropy_fourth) };
+
+  const int isotropy_type[4]
+      = { check_isotropy_mode(data->anisotropy_first),
+          check_isotropy_mode(data->anisotropy_second),
+          check_isotropy_mode(data->anisotropy_third),
+          check_isotropy_mode(data->anisotropy_fourth) };
+
+  const float regularization = powf(10.f, data->regularization) - 1.f;
+  const float variance_threshold = powf(10.f, data->variance_threshold);
+
+  // à trous wavelet decomposition, as in wavelets_process_cl()
+  dt_slang_gpu_image_t *residual = NULL;
+  for(int s = 0; s < scales; ++s)
+  {
+    const int mult = 1 << s;
+    dt_slang_gpu_image_t *buffer_in = s == 0 ? in : s % 2 != 0 ? LF_odd : LF_even;
+    dt_slang_gpu_image_t *buffer_out = s == 0 ? LF_odd : s % 2 != 0 ? LF_even : LF_odd;
+
+    if(dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_horizontal", width, height,
+         SLIMG_DEV(buffer_in), SLIMG_DEV(HF[s]), SLARG(width), SLARG(height), SLARG(mult))
+       || dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_vertical", width, height,
+         SLIMG_DEV(HF[s]), SLIMG_DEV(buffer_out), SLARG(width), SLARG(height), SLARG(mult))
+       || dt_slang_gpu_run_2d_args("bspline", "wavelets_detail_level", width, height,
+         SLIMG_DEV(buffer_in), SLIMG_DEV(buffer_out), SLIMG_DEV(HF[s]), SLARG(width), SLARG(height)))
+      return 1;
+
+    residual = buffer_out;
+  }
+
+  // the image not holding the last step of blur
+  dt_slang_gpu_image_t *temp = (residual == LF_even) ? LF_odd : LF_even;
+
+  int count = 0;
+  for(int s = scales - 1; s > -1; --s)
+  {
+    const int mult = 1 << s;
+    const float current_radius = equivalent_sigma_at_step(B_SPLINE_SIGMA, s);
+    const float real_radius = current_radius * zoom;
+    const float current_radius_square = sqf(current_radius);
+
+    const float norm =
+      expf(-sqf(real_radius - (float)data->radius_center) / sqf(data->radius));
+    const dt_aligned_pixel_t ABCD = { data->first * KAPPA * norm,
+                                      data->second * KAPPA * norm,
+                                      data->third * KAPPA * norm,
+                                      data->fourth * KAPPA * norm };
+    const float strength = data->sharpness * norm + 1.f;
+
+    dt_slang_gpu_image_t *buffer_in = count == 0 ? residual : count % 2 != 0 ? temp : residual;
+    dt_slang_gpu_image_t *buffer_out = count == 0 ? temp : count % 2 != 0 ? residual : temp;
+    if(s == 0) buffer_out = reconstructed;
+
+    if(dt_slang_gpu_run_2d_args("diffuse", "diffuse_pde", width, height,
+         SLIMG_DEV(HF[s]), SLIMG_DEV(buffer_in), SLIMG_DEV(mask), SLARG(has_mask), SLIMG_DEV(buffer_out),
+         SLARG(width), SLARG(height), SLARG(anisotropy), SLARG(isotropy_type),
+         SLARG(regularization), SLARG(variance_threshold), SLARG(current_radius_square), SLARG(mult),
+         SLARG(ABCD), SLARG(strength)))
+      return 1;
+
+    count++;
+  }
+
+  return 0;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_diffuse_data_t *const data = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // fast mode just copies input to output
+  if(dt_pipe_is_fast(piece->pipe))
+  {
+    const int zero = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+      SLARG(zero), SLARG(zero));
+  }
+
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float final_radius = (data->radius + data->radius_center) * 2.f / scale;
+
+  const int iterations = MAX(data->iterations, 1);
+  const int diffusion_scales = num_steps_to_reach_equivalent_sigma(B_SPLINE_SIGMA, final_radius);
+  const int scales = CLAMP(diffusion_scales, 1, MAX_NUM_SCALES);
+
+  // the device holds 4 + scales images of the full size besides the input
+  // and output; without the memory for them the module runs on the CPU
+  dt_slang_gpu_image_t *temp1 = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *temp2 = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *mask = dt_slang_gpu_image_new(width, height, 1, NULL);
+  dt_slang_gpu_image_t *LF_even = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *LF_odd = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *HF[MAX_NUM_SCALES] = { NULL };
+  int err = !temp1 || !temp2 || !mask || !LF_even || !LF_odd;
+  for(int s = 0; s < scales && !err; s++)
+  {
+    HF[s] = dt_slang_gpu_image_new(width, height, 4, NULL);
+    err = !HF[s];
+  }
+
+  dt_slang_gpu_image_t *in = dev_in;
+  const int has_mask = (data->threshold > 0.f);
+  if(!err && has_mask)
+  {
+    // a mask of the pixels above the threshold, filled with noise to inpaint them
+    const int owidth = roi_out->width;
+    const int oheight = roi_out->height;
+    err = dt_slang_gpu_run_2d_args("diffuse", "build_mask", width, height,
+            SLIMG_DEV(in), SLIMG_DEV(mask), SLARG(data->threshold), SLARG(owidth), SLARG(oheight))
+       || dt_slang_gpu_run_2d_args("diffuse", "inpaint_mask", width, height,
+            SLIMG_DEV(temp1), SLIMG_DEV(in), SLIMG_DEV(mask), SLARG(owidth), SLARG(oheight));
+    in = temp1;
+  }
+
+  for(int it = 0; it < iterations && !err && !dt_dev_piece_shutdown(piece, (iterations - it) > 5); it++)
+  {
+    dt_slang_gpu_image_t *temp_in = it == 0 ? in : it % 2 == 0 ? temp1 : temp2;
+    dt_slang_gpu_image_t *temp_out = it == 0 ? temp2 : it % 2 == 0 ? temp2 : temp1;
+    if(it == iterations - 1) temp_out = dev_out;
+
+    err = _wavelets_process_slang(temp_in, temp_out, mask, width, height, data, scale, scales, has_mask,
+                                  HF, LF_odd, LF_even);
+  }
+
+  if(err) dt_slang_gpu_wait();
+  dt_slang_gpu_image_free(temp1);
+  dt_slang_gpu_image_free(temp2);
+  dt_slang_gpu_image_free(mask);
+  dt_slang_gpu_image_free(LF_even);
+  dt_slang_gpu_image_free(LF_odd);
+  for(int s = 0; s < scales; s++) dt_slang_gpu_image_free(HF[s]);
+  return !err;
 }
 #endif
 

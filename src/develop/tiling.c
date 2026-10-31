@@ -18,6 +18,7 @@
 
 #include "develop/tiling.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/blend.h"
 #include "develop/pixelpipe.h"
@@ -1886,6 +1887,397 @@ int process_tiling_cl_fast(dt_dev_pixelpipe_iop_t *piece,
   return DT_OPENCL_DEFAULT_ERROR;
 }
 #endif
+
+#ifdef HAVE_SLANG_GPU
+// runs process_slang() on one tile: the iw x ih input region at in is packed
+// into a device image, and the ow x oh region at the origin (ox, oy) of the
+// tile's output is copied to out
+static gboolean _slang_tile(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            const char *const in,
+                            const size_t ipitch,
+                            const int in_bpp,
+                            const dt_iop_roi_t *const iroi,
+                            char *const out,
+                            const size_t opitch,
+                            const int out_bpp,
+                            const dt_iop_roi_t *const oroi,
+                            const size_t ox,
+                            const size_t oy,
+                            const size_t ow,
+                            const size_t oh,
+                            char *const tile_in,
+                            char *const tile_out)
+{
+  const size_t irow = (size_t)iroi->width * in_bpp;
+  const size_t orow = (size_t)oroi->width * out_bpp;
+  for(size_t y = 0; y < iroi->height; y++)
+    memcpy(tile_in + y * irow, in + y * ipitch, irow);
+
+  dt_slang_gpu_image_t *dev_in = dt_slang_gpu_image_new(iroi->width, iroi->height,
+                                                        in_bpp / sizeof(float), tile_in);
+  dt_slang_gpu_image_t *dev_out = dev_in
+    ? dt_slang_gpu_image_new(oroi->width, oroi->height, out_bpp / sizeof(float), NULL)
+    : NULL;
+
+  dt_dev_prepare_piece_cfa(piece, iroi);
+  const gboolean ok = dev_out
+    && self->process_slang(self, piece, dev_in, dev_out, iroi, oroi)
+    && !dt_slang_gpu_image_read(dev_out, tile_out);
+  if(!ok) dt_slang_gpu_wait();
+  dt_slang_gpu_image_free(dev_in);
+  dt_slang_gpu_image_free(dev_out);
+  if(!ok) return FALSE;
+
+  for(size_t y = 0; y < oh; y++)
+    memcpy(out + y * opitch, tile_out + (oy + y) * orow + ox * out_bpp, ow * out_bpp);
+  return TRUE;
+}
+
+// the tile size that fits the device, as in the OpenCL variants above
+static void _slang_tile_size(dt_iop_module_t *self,
+                             dt_dev_pixelpipe_iop_t *piece,
+                             const dt_iop_roi_t *const roi_in,
+                             const dt_iop_roi_t *const roi_out,
+                             const int max_bpp,
+                             const unsigned int align,
+                             dt_develop_tiling_t *tiling,
+                             int *width,
+                             int *height)
+{
+  tiling->factor_cl = tiling->maxbuf_cl = -1.0f;
+  self->tiling_callback(self, piece, roi_in, roi_out, tiling);
+  if(tiling->factor_cl < 0.0f) tiling->factor_cl = tiling->factor;
+  if(tiling->maxbuf_cl < 0.0f) tiling->maxbuf_cl = tiling->maxbuf;
+
+  size_t available = 0;
+  int max_dim = 0;
+  dt_slang_gpu_memory_info(&available, &max_dim);
+  const float factor = fmaxf(tiling->factor_cl - 1.0f, 1.0f);
+  const float singlebuffer = fmaxf(((float)available - tiling->overhead) / factor, 0.0f);
+  const float maxbuf = fmaxf(tiling->maxbuf_cl, 1.0f);
+
+  int w = MIN(MAX(roi_in->width, roi_out->width), max_dim);
+  int h = MIN(MAX(roi_in->height, roi_out->height), max_dim);
+  if((float)w * h * max_bpp * maxbuf > singlebuffer)
+  {
+    const float scale = singlebuffer / ((float)w * h * max_bpp * maxbuf);
+    if(w < h && scale >= 0.333f)
+      h = floorf(h * scale);
+    else if(h <= w && scale >= 0.333f)
+      w = floorf(w * scale);
+    else
+    {
+      w = floorf(w * sqrtf(scale));
+      h = floorf(h * sqrtf(scale));
+    }
+  }
+  if(3 * tiling->overlap > w || 3 * tiling->overlap > h)
+    w = h = floorf(sqrtf((float)w * h));
+
+  *width = MAX(_align_down(w, align), (int)align);
+  *height = MAX(_align_down(h, align), (int)align);
+}
+
+static int _default_process_tiling_slang_ptp(dt_iop_module_t *self,
+                                             dt_dev_pixelpipe_iop_t *piece,
+                                             const void *const ivoid,
+                                             void *const ovoid,
+                                             const dt_iop_roi_t *const roi_in,
+                                             const dt_iop_roi_t *const roi_out,
+                                             const int in_bpp,
+                                             const int out_bpp)
+{
+  const size_t ipitch = (size_t)roi_in->width * in_bpp;
+  const size_t opitch = (size_t)roi_out->width * out_bpp;
+  const int max_bpp = MAX(in_bpp, out_bpp);
+
+  dt_develop_tiling_t tiling = { 0 };
+  int width = 0, height = 0;
+  _slang_tile_size(self, piece, roi_in, roi_out, max_bpp, 1, &tiling, &width, &height);
+
+  const int align = MAX(tiling.align, 1);
+  if(width < roi_in->width) width = MAX((width / align) * align, align);
+  if(height < roi_in->height) height = MAX((height / align) * align, align);
+  width = MIN(width, roi_in->width);
+  height = MIN(height, roi_in->height);
+
+  const int overlap = tiling.overlap % align != 0 ? (tiling.overlap / align + 1) * align
+                                                  : tiling.overlap;
+  const int tile_wd = width - 2 * overlap > 0 ? width - 2 * overlap : 1;
+  const int tile_ht = height - 2 * overlap > 0 ? height - 2 * overlap : 1;
+  const int tiles_x = width < roi_in->width ? ceilf(roi_in->width / (float)tile_wd) : 1;
+  const int tiles_y = height < roi_in->height ? ceilf(roi_in->height / (float)tile_ht) : 1;
+
+  if(tiles_x * tiles_y > _maximum_number_tiles())
+  {
+    dt_print(DT_DEBUG_TILING,
+             "[default_process_tiling_slang_ptp] [%s] aborted tiling for module '%s%s'. "
+             "too many tiles: %d x %d",
+             dt_dev_pixelpipe_type_to_str(piece->pipe->type),
+             self->op, dt_iop_get_instance_id(self), tiles_x, tiles_y);
+    return 1;
+  }
+
+  char *tile_in = dt_alloc_aligned((size_t)width * height * in_bpp);
+  char *tile_out = dt_alloc_aligned((size_t)width * height * out_bpp);
+  if(!tile_in || !tile_out)
+  {
+    dt_free_align(tile_in);
+    dt_free_align(tile_out);
+    return 1;
+  }
+
+  dt_aligned_pixel_t processed_maximum_saved;
+  dt_aligned_pixel_t processed_maximum_new = { 1.0f };
+  for_four_channels(k) processed_maximum_saved[k] = piece->pipe->dsc.processed_maximum[k];
+
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_TILING,
+                "  *tiled* slang ptp", piece->pipe, piece->module, DT_DEVICE_NONE, roi_in, roi_out,
+                "%dx%d tiles, size=%dx%d, overlap=%d",
+                tiles_x, tiles_y, tile_wd, tile_ht, overlap);
+
+  gboolean ok = TRUE;
+  piece->pipe->tiling = TRUE;
+  for(size_t tx = 0; tx < tiles_x && ok; tx++)
+  {
+    for(size_t ty = 0; ty < tiles_y && ok; ty++)
+    {
+      const size_t wd = tx * tile_wd + width > roi_in->width ? roi_in->width - tx * tile_wd : width;
+      const size_t ht = ty * tile_ht + height > roi_in->height ? roi_in->height - ty * tile_ht : height;
+
+      // end tiles smaller than the overlap were already covered
+      if((wd <= 2 * overlap && tx > 0) || (ht <= 2 * overlap && ty > 0)) continue;
+
+      const dt_iop_roi_t iroi = { roi_in->x + tx * tile_wd, roi_in->y + ty * tile_ht, wd, ht, roi_in->scale };
+      const dt_iop_roi_t oroi = { roi_out->x + tx * tile_wd, roi_out->y + ty * tile_ht, wd, ht, roi_out->scale };
+      const size_t ioffs = (ty * tile_ht) * ipitch + (tx * tile_wd) * in_bpp;
+
+      // only the good part of the tile is copied back
+      const size_t ox = tx > 0 ? overlap : 0;
+      const size_t oy = ty > 0 ? overlap : 0;
+      const size_t ooffs = (ty * tile_ht + oy) * opitch + (tx * tile_wd + ox) * out_bpp;
+
+      dt_print_pipe(DT_DEBUG_TILING, "    tile", piece->pipe, piece->module, DT_DEVICE_NONE, &iroi, &oroi,
+                    "tile (%zu,%zu)", tx, ty);
+
+      for_four_channels(k) piece->pipe->dsc.processed_maximum[k] = processed_maximum_saved[k];
+      ok = _slang_tile(self, piece, (const char *)ivoid + ioffs, ipitch, in_bpp, &iroi,
+                       (char *)ovoid + ooffs, opitch, out_bpp, &oroi,
+                       ox, oy, wd - ox, ht - oy, tile_in, tile_out);
+      for_four_channels(k) processed_maximum_new[k] = piece->pipe->dsc.processed_maximum[k];
+    }
+  }
+  piece->pipe->tiling = FALSE;
+  dt_free_align(tile_in);
+  dt_free_align(tile_out);
+
+  for_four_channels(k)
+    piece->pipe->dsc.processed_maximum[k] = ok ? processed_maximum_new[k] : processed_maximum_saved[k];
+  return ok ? 0 : 1;
+}
+
+static int _default_process_tiling_slang_roi(dt_iop_module_t *self,
+                                             dt_dev_pixelpipe_iop_t *piece,
+                                             const void *const ivoid,
+                                             void *const ovoid,
+                                             const dt_iop_roi_t *const roi_in,
+                                             const dt_iop_roi_t *const roi_out,
+                                             const int in_bpp,
+                                             const int out_bpp)
+{
+  const size_t ipitch = (size_t)roi_in->width * in_bpp;
+  const size_t opitch = (size_t)roi_out->width * out_bpp;
+  const int max_bpp = MAX(in_bpp, out_bpp);
+
+  const float fullscale = fmaxf(roi_in->scale / roi_out->scale, sqrtf(((float)roi_in->width * roi_in->height)
+                                                              / ((float)roi_out->width * roi_out->height)));
+  const int delta = ceilf(fullscale);
+  const int inacc = RESERVE * delta;
+
+  dt_develop_tiling_t tiling = { 0 };
+  int width = 0, height = 0;
+  // the alignment is only known after the callback, so the size is aligned twice
+  _slang_tile_size(self, piece, roi_in, roi_out, max_bpp, 1, &tiling, &width, &height);
+  const unsigned int align = MAX(tiling.align, 1);
+  width = MAX(_align_down(width, align), (int)align);
+  height = MAX(_align_down(height, align), (int)align);
+
+  const int overlap_in = _align_up(tiling.overlap, align);
+  const int overlap_out = ceilf((float)overlap_in / fullscale);
+
+  int tiles_x = 1, tiles_y = 1;
+  if(roi_in->width > roi_out->width)
+    tiles_x = width < roi_in->width
+                  ? ceilf((float)roi_in->width / (float)MAX(width - 2 * overlap_in - inacc, 1))
+                  : 1;
+  else
+    tiles_x = width < roi_out->width ? ceilf((float)roi_out->width / (float)MAX(width - 2 * overlap_out, 1))
+                                     : 1;
+  if(roi_in->height > roi_out->height)
+    tiles_y = height < roi_in->height
+                  ? ceilf((float)roi_in->height / (float)MAX(height - 2 * overlap_in - inacc, 1))
+                  : 1;
+  else
+    tiles_y = height < roi_out->height
+                  ? ceilf((float)roi_out->height / (float)MAX(height - 2 * overlap_out, 1))
+                  : 1;
+
+  if(tiles_x * tiles_y > _maximum_number_tiles())
+  {
+    dt_print(DT_DEBUG_TILING,
+             "[default_process_tiling_slang_roi] [%s] aborted tiling for module '%s%s'. too many tiles: %dx%d",
+             dt_dev_pixelpipe_type_to_str(piece->pipe->type),
+             self->op, dt_iop_get_instance_id(self), tiles_x, tiles_y);
+    return 1;
+  }
+
+  const int tile_wd = _align_up(
+      roi_out->width % tiles_x == 0 ? roi_out->width / tiles_x : roi_out->width / tiles_x + 1, align);
+  const int tile_ht = _align_up(
+      roi_out->height % tiles_y == 0 ? roi_out->height / tiles_y : roi_out->height / tiles_y + 1, align);
+
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_TILING,
+                "  *tiled* slang roi", piece->pipe, piece->module, DT_DEVICE_NONE, roi_in, roi_out,
+                "%dx%d tiles, size=%dx%d", tiles_x, tiles_y, tile_wd, tile_ht);
+
+  dt_aligned_pixel_t processed_maximum_saved;
+  dt_aligned_pixel_t processed_maximum_new = { 1.0f, 1.0f, 1.0f, 1.0f };
+  for_four_channels(k) processed_maximum_saved[k] = piece->pipe->dsc.processed_maximum[k];
+
+  // the host buffers are sized for the largest tile seen so far
+  char *tile_in = NULL;
+  char *tile_out = NULL;
+  size_t tile_in_size = 0;
+  size_t tile_out_size = 0;
+
+  gboolean ok = TRUE;
+  piece->pipe->tiling = TRUE;
+  for(size_t tx = 0; tx < tiles_x && ok; tx++)
+  {
+    for(size_t ty = 0; ty < tiles_y && ok; ty++)
+    {
+      const size_t wd = (tx + 1) * tile_wd > roi_out->width ? (size_t)roi_out->width - tx * tile_wd : tile_wd;
+      const size_t ht = (ty + 1) * tile_ht > roi_out->height ? (size_t)roi_out->height - ty * tile_ht : tile_ht;
+
+      dt_iop_roi_t iroi_good = { roi_in->x  + tx * tile_wd, roi_in->y  + ty * tile_ht, wd, ht, roi_in->scale };
+      dt_iop_roi_t oroi_good = { roi_out->x + tx * tile_wd, roi_out->y + ty * tile_ht, wd, ht, roi_out->scale };
+      self->modify_roi_in(self, piece, &oroi_good, &iroi_good);
+
+      iroi_good.x = MAX(iroi_good.x, roi_in->x);
+      iroi_good.y = MAX(iroi_good.y, roi_in->y);
+      iroi_good.width = MIN(iroi_good.width, roi_in->width + roi_in->x - iroi_good.x);
+      iroi_good.height = MIN(iroi_good.height, roi_in->height + roi_in->y - iroi_good.y);
+
+      const int x_in = iroi_good.x;
+      const int y_in = iroi_good.y;
+      const int new_x_in = MAX(_align_close(x_in - overlap_in - delta, align), roi_in->x);
+      const int new_y_in = MAX(_align_close(y_in - overlap_in - delta, align), roi_in->y);
+      const int new_width_in = MIN(_align_up(iroi_good.width + overlap_in + delta + (x_in - new_x_in), align),
+                                    roi_in->width + roi_in->x - new_x_in);
+      const int new_height_in = MIN(_align_up(iroi_good.height + overlap_in + delta + (y_in - new_y_in), align),
+                                     roi_in->height + roi_in->y - new_y_in);
+
+      dt_iop_roi_t iroi_full = { new_x_in, new_y_in, new_width_in, new_height_in, iroi_good.scale };
+      dt_iop_roi_t oroi_full = oroi_good;
+
+      if(!_fit_output_to_input_roi(self, piece, &iroi_full, &oroi_full, delta, 10))
+      {
+        dt_print(DT_DEBUG_TILING,
+                 "[default_process_tiling_slang_roi] [%s] can not handle requested roi's tiling "
+                 "for module '%s%s'",
+                 dt_dev_pixelpipe_type_to_str(piece->pipe->type), self->op, dt_iop_get_instance_id(self));
+        ok = FALSE;
+        break;
+      }
+
+      oroi_full.x = MIN(oroi_full.x, oroi_good.x);
+      oroi_full.y = MIN(oroi_full.y, oroi_good.y);
+      oroi_full.width = MAX(oroi_full.width, oroi_good.x + oroi_good.width - oroi_full.x);
+      oroi_full.height = MAX(oroi_full.height, oroi_good.y + oroi_good.height - oroi_full.y);
+
+      oroi_full.x = MAX(oroi_full.x, roi_out->x);
+      oroi_full.y = MAX(oroi_full.y, roi_out->y);
+      oroi_full.width = MIN(oroi_full.width, roi_out->width + roi_out->x - oroi_full.x);
+      oroi_full.height = MIN(oroi_full.height, roi_out->height + roi_out->y - oroi_full.y);
+
+      self->modify_roi_in(self, piece, &oroi_full, &iroi_full);
+
+      iroi_full.x = MAX(iroi_full.x, roi_in->x);
+      iroi_full.y = MAX(iroi_full.y, roi_in->y);
+      iroi_full.width = MIN(iroi_full.width, roi_in->width + roi_in->x - iroi_full.x);
+      iroi_full.height = MIN(iroi_full.height, roi_in->height + roi_in->y - iroi_full.y);
+
+      const size_t ioffs = (size_t)(iroi_full.y - roi_in->y) * ipitch + (size_t)(iroi_full.x - roi_in->x) * in_bpp;
+      const size_t ooffs = (size_t)(oroi_good.y - roi_out->y) * opitch + (size_t)(oroi_good.x - roi_out->x) * out_bpp;
+
+      dt_print_pipe(DT_DEBUG_TILING, "    tile", piece->pipe, piece->module, DT_DEVICE_NONE,
+                    &iroi_full, &oroi_full, "tile (%zu,%zu)", tx, ty);
+
+      const size_t in_size = (size_t)iroi_full.width * iroi_full.height * in_bpp;
+      const size_t out_size = (size_t)oroi_full.width * oroi_full.height * out_bpp;
+      if(in_size > tile_in_size)
+      {
+        dt_free_align(tile_in);
+        tile_in = dt_alloc_aligned(in_size);
+        tile_in_size = tile_in ? in_size : 0;
+      }
+      if(out_size > tile_out_size)
+      {
+        dt_free_align(tile_out);
+        tile_out = dt_alloc_aligned(out_size);
+        tile_out_size = tile_out ? out_size : 0;
+      }
+      if(!tile_in || !tile_out)
+      {
+        ok = FALSE;
+        break;
+      }
+
+      for_four_channels(k) piece->pipe->dsc.processed_maximum[k] = processed_maximum_saved[k];
+      ok = _slang_tile(self, piece, (const char *)ivoid + ioffs, ipitch, in_bpp, &iroi_full,
+                       (char *)ovoid + ooffs, opitch, out_bpp, &oroi_full,
+                       oroi_good.x - oroi_full.x, oroi_good.y - oroi_full.y,
+                       oroi_good.width, oroi_good.height, tile_in, tile_out);
+      for_four_channels(k) processed_maximum_new[k] = piece->pipe->dsc.processed_maximum[k];
+    }
+  }
+  piece->pipe->tiling = FALSE;
+  dt_free_align(tile_in);
+  dt_free_align(tile_out);
+
+  for_four_channels(k)
+    piece->pipe->dsc.processed_maximum[k] = ok ? processed_maximum_new[k] : processed_maximum_saved[k];
+  return ok ? 0 : 1;
+}
+
+/* process_slang() in tiles, for a module whose full-size images don't fit
+   the device. Like the OpenCL variants, it copies each tile from the host
+   input and its result back to the host output; a tile that fails stops the
+   loop. Returns 0 on success, and nonzero if the module has to run on the CPU. */
+int default_process_tiling_slang(dt_iop_module_t *self,
+                                 dt_dev_pixelpipe_iop_t *piece,
+                                 const void *const ivoid,
+                                 void *const ovoid,
+                                 const dt_iop_roi_t *const roi_in,
+                                 const dt_iop_roi_t *const roi_out,
+                                 const int in_bpp)
+{
+  dt_iop_buffer_dsc_t dsc;
+  self->output_format(self, piece->pipe, piece, &dsc);
+  const int out_bpp = dt_iop_buffer_dsc_to_bpp(&dsc);
+  const gboolean float_in = in_bpp == sizeof(float) || in_bpp == 4 * sizeof(float);
+  const gboolean float_out = dsc.datatype == TYPE_FLOAT
+    && (out_bpp == sizeof(float) || out_bpp == 4 * sizeof(float));
+  if(!self->process_slang || !float_in || !float_out) return 1;
+
+  const gboolean use_roi = memcmp(roi_in, roi_out, sizeof(struct dt_iop_roi_t))
+                           || (self->flags() & IOP_FLAGS_TILING_FULL_ROI);
+  return use_roi
+    ? _default_process_tiling_slang_roi(self, piece, ivoid, ovoid, roi_in, roi_out, in_bpp, out_bpp)
+    : _default_process_tiling_slang_ptp(self, piece, ivoid, ovoid, roi_in, roi_out, in_bpp, out_bpp);
+}
+#endif // HAVE_SLANG_GPU
 
 
 /* If a module does not implement tiling_callback() by itself, this function is called instead.

@@ -22,6 +22,7 @@
 #include "common/imagebuf.h"
 #include "common/interpolation.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/imageop.h"
 #include "develop/masks.h"
@@ -751,6 +752,60 @@ error:
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// _feather_form_mask on the Slang blend's device images, as
+// _feather_form_mask_cl
+static void _feather_form_mask_slang(dt_dev_pixelpipe_iop_t *piece,
+                                     float *const mask,
+                                     const dt_iop_roi_t *const roi,
+                                     const gboolean use_out,
+                                     const float radius,
+                                     const float guide_weight,
+                                     const float sqrt_eps)
+{
+  dt_develop_blend_slang_context_t *const c = piece->blend_refine_slang;
+  const int width = roi->width;
+  const int height = roi->height;
+  const int w = _required_w(radius, roi->scale / piece->iscale, MAX(width, height));
+  const dt_iop_roi_t *rin = piece->blend_refine_roi_in;
+
+  int err = 1;
+  dt_slang_gpu_image_t *guide = use_out ? c->dev_out : c->dev_in;
+  dt_slang_gpu_image_t *dev_guide = NULL;
+  dt_slang_gpu_image_t *dev_mask_in = dt_slang_gpu_image_new(width, height, 1, mask);
+  dt_slang_gpu_image_t *dev_mask_out = dt_slang_gpu_image_new(width, height, 1, NULL);
+  if(piece->colors != 4 || !dev_mask_in || !dev_mask_out) goto error;
+
+  if(!use_out && rin && (rin->width != width || rin->height != height))
+  {
+    // the mask's part of the input, as in _feather_form_mask_cl
+    dev_guide = dt_slang_gpu_image_new(width, height, 4, NULL);
+    const int iwidth = rin->width;
+    const int iheight = rin->height;
+    if(!dev_guide
+       || dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+            SLIMG_DEV(guide), SLIMG_DEV(dev_guide), SLARG(width), SLARG(height),
+            SLARG(iwidth), SLARG(iheight), SLARG(c->offs[0]), SLARG(c->offs[1])))
+      goto error;
+    guide = dev_guide;
+  }
+
+  err = guided_filter_slang(guide, dev_mask_in, dev_mask_out, width, height, w, sqrt_eps,
+                            guide_weight, 0.0f, 1.0f)
+        || dt_slang_gpu_image_read(dev_mask_out, mask);
+
+error:
+  if(err)
+  {
+    dt_print(DT_DEBUG_SLANG, "[slang_blendop] element feathering failed");
+    c->failed = TRUE;
+  }
+  dt_slang_gpu_image_free(dev_guide);
+  dt_slang_gpu_image_free(dev_mask_in);
+  dt_slang_gpu_image_free(dev_mask_out);
+}
+#endif
+
 // one guided-filter feathering pass on an element's mask, guided by the input
 // or the output image from the piece's blend_refine_* context, cropped to the
 // mask's roi when the input roi differs
@@ -767,6 +822,13 @@ static void _feather_form_mask(dt_dev_pixelpipe_iop_t *piece,
   const int ch = piece->colors;
   const float scale = roi->scale / piece->iscale;
 
+#ifdef HAVE_SLANG_GPU
+  if(piece->blend_refine_slang)
+  {
+    _feather_form_mask_slang(piece, mask, roi, use_out, radius, guide_weight, sqrt_eps);
+    return;
+  }
+#endif
 #ifdef HAVE_OPENCL
   if(piece->blend_refine_cl)
   {
@@ -2181,6 +2243,458 @@ error:
                                      &dev_work_profile_info,
                                      &dev_work_profile_lut);
   dt_print(DT_DEBUG_OPENCL | DT_DEBUG_PIPE, "[opencl_blendop] error: %s", cl_errstr(err));
+  return FALSE;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean dt_develop_blend_slang_supported(dt_iop_module_t *self,
+                                          dt_dev_pixelpipe_iop_t *piece,
+                                          const dt_iop_roi_t *roi_in,
+                                          const dt_iop_roi_t *roi_out)
+{
+  const dt_develop_blend_params_t *const d = piece->blendop_data;
+
+  // the CPU skips blending outside the input, and the device output would
+  // then have to be the module's own
+  const int dx = roi_out->x - roi_in->x;
+  const int dy = roi_out->y - roi_in->y;
+  if(roi_in->width - dx < roi_out->width || roi_in->height - dy < roi_out->height)
+    return FALSE;
+
+  if(piece->colors != 1 && piece->colors != 4) return FALSE;
+
+  // mask and channel display, of this module or an earlier one
+  const gboolean valid_request = dt_iop_has_focus(self) && (piece->pipe == self->dev->full.pipe);
+  if(piece->pipe->mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE
+     || (valid_request && (self->request_mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE
+                           || self->suppress_mask)))
+    return FALSE;
+
+  // the guided filter of feathering takes an RGB guide
+  const gboolean global_refine_bypass = _flexi_global_refine_bypassed(piece, d);
+  _develop_mask_post_processing post_operations[3];
+  const size_t post_operations_size =
+    global_refine_bypass ? 0 : _get_post_operations(d, piece, post_operations);
+  for(size_t k = 0; k < post_operations_size; k++)
+    if((post_operations[k] == DEVELOP_MASK_POST_FEATHER_IN
+        || post_operations[k] == DEVELOP_MASK_POST_FEATHER_OUT)
+       && piece->colors != 4)
+      return FALSE;
+
+  // the jzczhz mask kernel writes nothing without a profile, in OpenCL too
+  dt_iop_order_iccprofile_info_t profile;
+  if(d->blend_cst == DEVELOP_BLEND_CS_RGB_SCENE
+     && !dt_develop_blendif_init_masking_profile(piece, &profile, d->blend_cst))
+    return FALSE;
+
+  return TRUE;
+}
+
+static int _blend_fill_mask_slang(dt_slang_gpu_image_t *mask,
+                                  const int width,
+                                  const int height,
+                                  const float value)
+{
+  return dt_slang_gpu_run_2d_args("blendop", "blendop_fill_mask", width, height,
+                                  SLIMG_DEV(mask), SLARG(width), SLARG(height), SLARG(value));
+}
+
+void dt_develop_blendif_make_mask_slang(dt_dev_pixelpipe_iop_t *piece,
+                                        const dt_develop_blend_params_t *const d,
+                                        float *const mask)
+{
+  dt_develop_blend_slang_context_t *const c = piece->blend_refine_slang;
+  const int width = piece->blend_refine_roi_out->width;
+  const int height = piece->blend_refine_roi_out->height;
+
+  // as dt_develop_blendif_make_mask_cl(): the mask stays all ones where the
+  // kernel would write nothing
+  const char *kernel;
+  switch(d->blend_cst)
+  {
+    case DEVELOP_BLEND_CS_LAB:
+      kernel = "blendop_mask_Lab";
+      break;
+    case DEVELOP_BLEND_CS_RGB_DISPLAY:
+      kernel = "blendop_mask_rgb_hsl";
+      break;
+    case DEVELOP_BLEND_CS_RGB_SCENE:
+      if(!c->use_profile) return;
+      kernel = "blendop_mask_rgb_jzczhz";
+      break;
+    case DEVELOP_BLEND_CS_RAW:
+      kernel = "blendop_mask_RAW";
+      break;
+    default:
+      return;
+  }
+  if(piece->colors != (d->blend_cst == DEVELOP_BLEND_CS_RAW ? 1 : 4)) return;
+
+  float parameters[DEVELOP_BLENDIF_PARAMETER_ITEMS * DEVELOP_BLENDIF_SIZE] DT_ALIGNED_ARRAY;
+  dt_develop_blendif_process_parameters(parameters, d);
+  const float opacity = CLIP(d->opacity / 100.0f);
+
+  int err = 1;
+  if(!c->dev_ones)
+  {
+    c->dev_ones = dt_slang_gpu_image_new(width, height, 1, NULL);
+    c->dev_mask = dt_slang_gpu_image_new(width, height, 1, NULL);
+    if(!c->dev_ones || !c->dev_mask || _blend_fill_mask_slang(c->dev_ones, width, height, 1.0f))
+      goto error;
+  }
+
+  const int blendif = d->blendif;
+  const unsigned int mode = d->mask_mode;
+  const unsigned int combine = d->mask_combine;
+  err = dt_slang_gpu_run_2d_args("blendop", kernel, width, height,
+          SLIMG_DEV(c->dev_in), SLIMG_DEV(c->dev_out), SLIMG_DEV(c->dev_ones), SLIMG_DEV(c->dev_mask),
+          SLARG(width), SLARG(height), SLARG(opacity), SLARG(blendif),
+          SLBUF(parameters, sizeof(parameters)), SLARG(mode), SLARG(combine), SLARG(c->offs),
+          SLBUF(c->profile_info, sizeof(*c->profile_info)),
+          SLIMG_IN(c->profile_lut, c->lut_w, c->lut_h, 1), SLARG(c->use_profile))
+        || dt_slang_gpu_image_read(c->dev_mask, mask);
+
+error:
+  if(err)
+  {
+    dt_print(DT_DEBUG_SLANG, "[slang_blendop] parametric element failed");
+    c->failed = TRUE;
+  }
+}
+
+gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
+                                        dt_dev_pixelpipe_iop_t *piece,
+                                        dt_slang_gpu_image_t *dev_in,
+                                        dt_slang_gpu_image_t *dev_module,
+                                        dt_slang_gpu_image_t *dev_out,
+                                        const dt_iop_roi_t *roi_in,
+                                        const dt_iop_roi_t *roi_out)
+{
+  const dt_develop_blend_params_t *const d = piece->blendop_data;
+  const dt_develop_mask_mode_t mask_mode = d->mask_mode;
+
+  const int ch = piece->colors;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+  const size_t obuffsize = (size_t)owidth * oheight;
+  const int offs[2] = { roi_out->x - roi_in->x, roi_out->y - roi_in->y };
+
+  const gboolean uniform = mask_mode == DEVELOP_MASK_ENABLED;
+  const gboolean raster = mask_mode & DEVELOP_MASK_RASTER;
+  const gboolean mode_drawn = mask_mode & (DEVELOP_MASK_MASK | DEVELOP_MASK_FLEXI);
+
+  const gboolean global_refine_bypass = _flexi_global_refine_bypassed(piece, d);
+  _develop_mask_post_processing post_operations[3];
+  const size_t post_operations_size =
+    global_refine_bypass ? 0 : _get_post_operations(d, piece, post_operations);
+  const float details = global_refine_bypass ? 0.0f : d->details;
+  const gboolean refine_details = !feqf(details, 0.0f, 1e-6f);
+
+  const float opacity = CLIP(d->opacity / 100.0f);
+
+  const dt_develop_blend_colorspace_t blend_csp = d->blend_cst;
+  const char *kernel = NULL;
+  const char *kernel_mask = NULL;
+  switch(blend_csp)
+  {
+    case DEVELOP_BLEND_CS_RAW:
+      kernel = ch == 1 ? "blendop_RAW" : "blendop_RAW4";
+      kernel_mask = "blendop_mask_RAW";
+      break;
+    case DEVELOP_BLEND_CS_RGB_DISPLAY:
+      kernel = "blendop_rgb_hsl";
+      kernel_mask = "blendop_mask_rgb_hsl";
+      break;
+    case DEVELOP_BLEND_CS_RGB_SCENE:
+      kernel = "blendop_rgb_jzczhz";
+      kernel_mask = "blendop_mask_rgb_jzczhz";
+      break;
+    case DEVELOP_BLEND_CS_LAB:
+    default:
+      kernel = "blendop_Lab";
+      kernel_mask = "blendop_mask_Lab";
+      break;
+  }
+
+  // the mask is built on the host wherever the OpenCL path builds it there:
+  // raster masks, drawn forms and the details threshold
+  float *mask = NULL;
+  dt_slang_gpu_image_t *dev_mask = NULL;
+  dt_slang_gpu_image_t *dev_mask_2 = NULL;
+  float *profile_lut = NULL;
+  dt_iop_order_iccprofile_info_t profile;
+  int use_profile = 0;
+  dt_colorspaces_iccprofile_info_slang_t profile_info;
+  int lut_w = 0, lut_h = 0;
+  const char *what = "";
+
+  if(uniform)
+  {
+    what = "uniform";
+    if(refine_details)
+    {
+      mask = dt_alloc_align_float(obuffsize);
+      if(!mask) goto error;
+      dt_iop_image_fill(mask, opacity, owidth, oheight, 1);
+      _refine_with_detail_mask(self, piece, mask, roi_in, roi_out, details);
+      dev_mask = dt_slang_gpu_image_new(owidth, oheight, 1, mask);
+      if(!dev_mask) goto error;
+    }
+    else
+    {
+      dev_mask = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
+      if(!dev_mask || _blend_fill_mask_slang(dev_mask, owidth, oheight, opacity)) goto error;
+    }
+  }
+  else if(raster)
+  {
+    what = "raster";
+    mask = dt_alloc_align_float(obuffsize);
+    if(!mask) goto error;
+    gboolean free_mask;
+    float *raster_mask = dt_dev_get_raster_mask(piece, _raster_source(piece), d->raster_mask_id,
+                                                self, &free_mask);
+    if(raster_mask)
+    {
+      if(d->raster_mask_invert)
+      {
+        DT_OMP_FOR_SIMD(aligned(mask, raster_mask:64))
+        for(size_t i = 0; i < obuffsize; i++)
+          mask[i] = (1.0f - raster_mask[i]) * opacity;
+      }
+      else
+        dt_iop_image_scaled_copy(mask, raster_mask, opacity, owidth, oheight, 1);
+      if(free_mask) dt_free_align(raster_mask);
+      _refine_with_detail_mask(self, piece, mask, roi_in, roi_out, details);
+    }
+    else
+      dt_iop_image_fill(mask, 0.0f, owidth, oheight, 1);
+
+    dev_mask = dt_slang_gpu_image_new(owidth, oheight, 1, mask);
+    if(!dev_mask) goto error;
+  }
+  else
+  {
+    const gboolean inverted = d->mask_combine & DEVELOP_COMBINE_MASKS_POS;
+    gboolean form_missing = FALSE;
+    // the uniform value of the form part, or -1 for a rendered form
+    float fill = -1.0f;
+    dt_masks_form_t *form =
+      dt_masks_get_from_id_ext(piece->pipe->forms, dt_develop_blend_mask_group_id(self, d));
+
+    if(form && (form->points || !(mask_mode & DEVELOP_MASK_FLEXI)) && mode_drawn
+       && dt_blend_may_render_group(self, mask_mode))
+    {
+      what = "form";
+      mask = dt_alloc_align_float(obuffsize);
+      if(!mask) goto error;
+      // the group renders on the host. What its parametric members and
+      // feathering read from the images is done on the device, through the
+      // context below, as in dt_develop_blend_process_cl()
+      if(!profile_lut)
+      {
+        use_profile = dt_develop_blendif_init_masking_profile(piece, &profile, blend_csp);
+        profile_lut = dt_ioppr_build_iccprofile_params_slang(use_profile ? &profile : NULL, &profile_info,
+                                                             &lut_w, &lut_h);
+        if(!profile_lut) goto error;
+      }
+      dt_develop_blend_slang_context_t slang_context =
+        { .dev_in = dev_in,
+          .dev_out = dev_module,
+          .profile_info = &profile_info,
+          .profile_lut = profile_lut,
+          .lut_w = lut_w,
+          .lut_h = lut_h,
+          .use_profile = use_profile,
+          .offs = { offs[0], offs[1] },
+          .failed = FALSE };
+      piece->blend_refine_roi_in = roi_in;
+      piece->blend_refine_roi_out = roi_out;
+      piece->blend_refine_slang = &slang_context;
+      gboolean pixels_missing = FALSE;
+      const gboolean form_ok = _render_drawn_mask_cached(self, piece, form, roi_in, roi_out,
+                                                         DT_DEVICE_NONE, mask, &pixels_missing);
+      piece->blend_refine_roi_in = NULL;
+      piece->blend_refine_roi_out = NULL;
+      piece->blend_refine_slang = NULL;
+      dt_slang_gpu_image_free(slang_context.dev_ones);
+      dt_slang_gpu_image_free(slang_context.dev_mask);
+
+      // a member that failed on the device rendered opaque or unfeathered
+      if(slang_context.failed) goto error;
+
+      form_missing = !form_ok && (pixels_missing || !(mask_mode & DEVELOP_MASK_FLEXI));
+      if(form_missing)
+      {
+        dt_iop_image_fill(mask, 0.0f, owidth, oheight, 1);
+        _recompute_next_run(self, piece, form);
+      }
+      else if(inverted)
+        dt_iop_image_invert(mask, 1.0f, owidth, oheight, 1);
+    }
+    else if(mode_drawn && dt_blend_may_render_group(self, mask_mode))
+      fill = inverted ? 0.0f : 1.0f;
+    else
+      fill = (d->mask_combine & DEVELOP_COMBINE_INCL) ? 0.0f : 1.0f;
+
+    dev_mask = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
+    if(!dev_mask) goto error;
+
+    if(fill >= 0.0f && !(mask_mode & DEVELOP_MASK_CONDITIONAL) && !refine_details)
+    {
+      // without a parametric mask the mask kernel computes
+      // gopacity * (INV ? 1 - form : form), a constant for a uniform form
+      const float value = opacity * ((d->mask_combine & DEVELOP_COMBINE_INV) ? 1.0f - fill : fill);
+      if(_blend_fill_mask_slang(dev_mask, owidth, oheight, value)) goto error;
+    }
+    else
+    {
+      if(fill >= 0.0f && refine_details)
+      {
+        mask = dt_alloc_align_float(obuffsize);
+        if(!mask) goto error;
+        dt_iop_image_fill(mask, fill, owidth, oheight, 1);
+      }
+      if(mask)
+      {
+        _refine_with_detail_mask(self, piece, mask, roi_in, roi_out, details);
+        dev_mask_2 = dt_slang_gpu_image_new(owidth, oheight, 1, mask);
+        if(!dev_mask_2) goto error;
+      }
+      else
+      {
+        dev_mask_2 = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
+        if(!dev_mask_2 || _blend_fill_mask_slang(dev_mask_2, owidth, oheight, fill)) goto error;
+      }
+
+      float parameters[DEVELOP_BLENDIF_PARAMETER_ITEMS * DEVELOP_BLENDIF_SIZE] DT_ALIGNED_ARRAY;
+      dt_develop_blendif_process_parameters(parameters, d);
+
+      if(!profile_lut)
+      {
+        use_profile = dt_develop_blendif_init_masking_profile(piece, &profile, blend_csp);
+        profile_lut = dt_ioppr_build_iccprofile_params_slang(use_profile ? &profile : NULL, &profile_info,
+                                                             &lut_w, &lut_h);
+        if(!profile_lut) goto error;
+      }
+
+      const int blendif = d->blendif;
+      const unsigned int mode = mask_mode;
+      const unsigned int combine = d->mask_combine;
+      if(dt_slang_gpu_run_2d_args("blendop", kernel_mask, owidth, oheight,
+           SLIMG_DEV(dev_in), SLIMG_DEV(dev_module), SLIMG_DEV(dev_mask_2), SLIMG_DEV(dev_mask),
+           SLARG(owidth), SLARG(oheight), SLARG(opacity), SLARG(blendif),
+           SLBUF(parameters, sizeof(parameters)), SLARG(mode), SLARG(combine), SLARG(offs),
+           SLBUF(&profile_info, sizeof(profile_info)), SLIMG_IN(profile_lut, lut_w, lut_h, 1),
+           SLARG(use_profile)))
+        goto error;
+    }
+
+    // as on the CPU path: the combine inverts for DEVELOP_COMBINE_INV, so
+    // the mask, still 0 on the host, goes over its result
+    if(form_missing && dt_slang_gpu_image_write(dev_mask, mask)) goto error;
+  }
+
+  dt_print_pipe(DT_DEBUG_PIPE, "blend slang", piece->pipe, self, DT_DEVICE_NONE, roi_in, roi_out,
+                "%s, %s%s", _develop_blend_colorspace_to_str(blend_csp), what,
+                (mask_mode & DEVELOP_MASK_CONDITIONAL) ? ", parametric" : "");
+
+  // post processing the mask, which ends up in dev_mask
+  if(!uniform && post_operations_size)
+  {
+    if(!dev_mask_2) dev_mask_2 = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
+    if(!dev_mask_2) goto error;
+    const int featherw = _required_w(d->feathering_radius, roi_out->scale / piece->iscale,
+                                     MAX(owidth, oheight));
+    const float sqrt_eps = _get_feathering_eps(piece);
+    const float guide_weight = _get_guide_weight(piece);
+
+    for(size_t index = 0; index < post_operations_size; index++)
+    {
+      const _develop_mask_post_processing operation = post_operations[index];
+      if(operation == DEVELOP_MASK_POST_FEATHER_IN)
+      {
+        const gboolean rois_equal = roi_in->width == owidth && roi_in->height == oheight;
+        dt_slang_gpu_image_t *dev_guide = dev_in;
+        if(!rois_equal)
+        {
+          dev_guide = dt_slang_gpu_image_new(owidth, oheight, 4, NULL);
+          const int iwidth = roi_in->width;
+          const int iheight = roi_in->height;
+          if(!dev_guide
+             || dt_slang_gpu_run_2d_args("basic", "interpolation_copy", owidth, oheight,
+                  SLIMG_DEV(dev_in), SLIMG_DEV(dev_guide), SLARG(owidth), SLARG(oheight),
+                  SLARG(iwidth), SLARG(iheight), SLARG(offs[0]), SLARG(offs[1])))
+          {
+            dt_slang_gpu_image_free(dev_guide);
+            goto error;
+          }
+        }
+        const int err = guided_filter_slang(dev_guide, dev_mask, dev_mask_2, owidth, oheight, featherw,
+                                            sqrt_eps, guide_weight, 0.0f, 1.0f);
+        if(!rois_equal) dt_slang_gpu_image_free(dev_guide);
+        if(err) goto error;
+      }
+      else if(operation == DEVELOP_MASK_POST_FEATHER_OUT)
+      {
+        if(guided_filter_slang(dev_module, dev_mask, dev_mask_2, owidth, oheight, featherw,
+                               sqrt_eps, guide_weight, 0.0f, 1.0f))
+          goto error;
+      }
+      else if(operation == DEVELOP_MASK_POST_BLUR)
+      {
+        const float sigma = d->blur_radius * roi_out->scale / piece->iscale;
+        if(dt_gaussian_blur_slang(dev_mask, dev_mask_2, owidth, oheight, sigma, 1.0f, 0.0f))
+          goto error;
+      }
+      else if(operation == DEVELOP_MASK_POST_TONE_CURVE)
+      {
+        const float e = expf(3.f * d->contrast);
+        const float brightness = d->brightness;
+        if(dt_slang_gpu_run_2d_args("blendop", "blendop_mask_tone_curve", owidth, oheight,
+             SLIMG_DEV(dev_mask), SLIMG_DEV(dev_mask_2), SLARG(owidth), SLARG(oheight),
+             SLARG(e), SLARG(brightness), SLARG(opacity)))
+          goto error;
+      }
+      dt_slang_gpu_image_t *swap = dev_mask;
+      dev_mask = dev_mask_2;
+      dev_mask_2 = swap;
+    }
+  }
+
+  const int blend_mode = d->blend_mode;
+  const float blend_parameter = exp2f(d->blend_parameter);
+  const int mask_display = piece->pipe->mask_display;
+  if(dt_slang_gpu_run_2d_args("blendop", kernel, owidth, oheight,
+       SLIMG_DEV(dev_in), SLIMG_DEV(dev_module), SLIMG_DEV(dev_mask), SLIMG_DEV(dev_out),
+       SLARG(owidth), SLARG(oheight), SLARG(blend_mode), SLARG(blend_parameter), SLARG(offs),
+       SLARG(mask_display)))
+    goto error;
+
+  // store the final mask for export or for later modules, as the CPU does
+  if(dt_iop_is_raster_mask_stored(piece, BLEND_RASTER_ID))
+  {
+    if(!mask) mask = dt_alloc_align_float(obuffsize);
+    if(!mask || dt_slang_gpu_image_read(dev_mask, mask)) goto error;
+    dt_iop_piece_set_raster(piece, mask, roi_in, roi_out);
+  }
+  else
+    dt_iop_piece_clear_raster(piece, mask);
+
+  dt_slang_gpu_image_free(dev_mask);
+  dt_slang_gpu_image_free(dev_mask_2);
+  free(profile_lut);
+  return TRUE;
+
+error:
+  dt_iop_piece_clear_raster(piece, mask);
+  dt_slang_gpu_wait();
+  dt_slang_gpu_image_free(dev_mask);
+  dt_slang_gpu_image_free(dev_mask_2);
+  free(profile_lut);
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "blend slang failure", piece->pipe, self, DT_DEVICE_NONE, roi_in, roi_out,
+                "blending on the CPU");
   return FALSE;
 }
 #endif

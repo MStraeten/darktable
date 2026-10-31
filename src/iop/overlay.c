@@ -1046,6 +1046,53 @@ cleanup:
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// the overlay is drawn on the CPU as in process_cl(), and blended on the device
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_overlay_data_t *data = piece->data;
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const float opacity = data->opacity / 100.0f;
+  const int dx = 0;
+
+  int err;
+  if(data->compositing == DT_OVERLAY_COMPOSITE_LEGACY)
+  {
+    int stride = 0;
+    guint8 *limage = _get_overlay_argb(self, piece, roi_in, roi_out, &stride);
+    if(limage)
+      err = dt_slang_gpu_run_2d_args("overlay", "overlay_blend_legacy", width, height,
+                                     SLIMG_DEV(dev_in), SLBUF(limage, (size_t)height * stride),
+                                     SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(opacity), SLARG(stride));
+    else
+      err = dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(width), SLARG(height), SLARG(dx), SLARG(dx));
+    g_free(limage);
+    return !err;
+  }
+
+  float *image = _get_overlay_rgba_f(self, piece, roi_in, roi_out);
+  if(image)
+    err = dt_slang_gpu_run_2d_args("overlay", "overlay_blend", width, height,
+                                   SLIMG_DEV(dev_in), SLBUF(image, (size_t)width * height * 4 * sizeof(float)),
+                                   SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(opacity));
+  else
+    err = dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(width), SLARG(height), SLARG(dx), SLARG(dx));
+  dt_free_align(image);
+  return !err;
+}
+#endif
+
 static gboolean _draw_thumb(GtkWidget *area,
                             cairo_t *crf,
                             const dt_iop_module_t *self)

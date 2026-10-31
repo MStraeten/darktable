@@ -100,7 +100,7 @@ for driving cmake by hand. What it does not say:
   the feature name and prefixes `USE_`. The features are `ai`, `camera`,
   `colord`, `gmic`, `graphicsmagick`, `imagemagick`, `jxl`, `kwallet`,
   `libsecret`, `lua`, `mac_integration`, `map`, `mcp`, `opencl`, `opencv`,
-  `openexr`, `openmp`, `unity` and `webp`. Left alone, cmake enables what it
+  `openexr`, `openmp`, `slang`, `unity` and `webp`. Left alone, cmake enables what it
   autodetects; a flag forces one feature either way
 - to check that a change compiles you need neither prefix nor install: drop
   `--install --sudo`, or stop after `cmake --build`

@@ -20,6 +20,7 @@
 #include "common/debug.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -415,6 +416,28 @@ error:
   dt_opencl_release_mem_object(dev_hsl_matrix);
   dt_opencl_release_mem_object(dev_rgb_matrix);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_channelmixer_data_t *data = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const int operation_mode = data->operation_mode;
+
+  return !dt_slang_gpu_run_2d_args("extended", "channelmixer", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(operation_mode), SLBUF(data->hsl_matrix, sizeof(data->hsl_matrix)),
+                                   SLBUF(data->rgb_matrix, sizeof(data->rgb_matrix)));
 }
 #endif
 

@@ -25,6 +25,7 @@ http://www.youtube.com/watch?v=JVoUgR6bhBc
 #include "common/colorspaces_inline_conversions.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "develop/blend.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
@@ -863,6 +864,63 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 
 error:
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorbalance_data_t *d = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const float gain[4] = { d->gain[CHANNEL_RED] * d->gain[CHANNEL_FACTOR],
+                          d->gain[CHANNEL_GREEN] * d->gain[CHANNEL_FACTOR],
+                          d->gain[CHANNEL_BLUE] * d->gain[CHANNEL_FACTOR], 0.0f };
+  const float contrast = (d->contrast != 0.0f) ? 1.0f / d->contrast : 1000000.0f;
+  const float grey = d->grey / 100.0f;
+  const float saturation = d->saturation;
+  const float saturation_out = d->saturation_out;
+
+  if(d->mode == SLOPE_OFFSET_POWER)
+  {
+    const float lift[4] = { (d->lift[CHANNEL_RED] + d->lift[CHANNEL_FACTOR] - 2.0f),
+                            (d->lift[CHANNEL_GREEN] + d->lift[CHANNEL_FACTOR] - 2.0f),
+                            (d->lift[CHANNEL_BLUE] + d->lift[CHANNEL_FACTOR] - 2.0f), 0.0f };
+    const float gamma[4] = { (2.0f - d->gamma[CHANNEL_RED]) * (2.0f - d->gamma[CHANNEL_FACTOR]),
+                             (2.0f - d->gamma[CHANNEL_GREEN]) * (2.0f - d->gamma[CHANNEL_FACTOR]),
+                             (2.0f - d->gamma[CHANNEL_BLUE]) * (2.0f - d->gamma[CHANNEL_FACTOR]), 0.0f };
+    return !dt_slang_gpu_run_2d_args("extended", "colorbalance_cdl", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(lift), SLARG(gain), SLARG(gamma), SLARG(saturation),
+                                     SLARG(contrast), SLARG(grey), SLARG(saturation_out));
+  }
+
+  const float lift[4] = { 2.0f - (d->lift[CHANNEL_RED] * d->lift[CHANNEL_FACTOR]),
+                          2.0f - (d->lift[CHANNEL_GREEN] * d->lift[CHANNEL_FACTOR]),
+                          2.0f - (d->lift[CHANNEL_BLUE] * d->lift[CHANNEL_FACTOR]), 0.0f };
+  const float gamma[4] = { d->gamma[CHANNEL_RED] * d->gamma[CHANNEL_FACTOR],
+                           d->gamma[CHANNEL_GREEN] * d->gamma[CHANNEL_FACTOR],
+                           d->gamma[CHANNEL_BLUE] * d->gamma[CHANNEL_FACTOR], 0.0f };
+  const float gamma_inv[4] = { (gamma[0] != 0.0f) ? 1.0f / gamma[0] : 1000000.0f,
+                               (gamma[1] != 0.0f) ? 1.0f / gamma[1] : 1000000.0f,
+                               (gamma[2] != 0.0f) ? 1.0f / gamma[2] : 1000000.0f, 0.0f };
+
+  if(d->mode == LEGACY)
+    return !dt_slang_gpu_run_2d_args("extended", "colorbalance", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(lift), SLARG(gain), SLARG(gamma_inv));
+
+  return !dt_slang_gpu_run_2d_args("extended", "colorbalance_lgg", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(lift), SLARG(gain), SLARG(gamma_inv), SLARG(saturation),
+                                   SLARG(contrast), SLARG(grey), SLARG(saturation_out));
 }
 #endif
 

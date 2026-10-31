@@ -24,6 +24,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/math.h"
 #include "common/rgb_norms.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "gui/accelerators.h"
@@ -1400,6 +1401,106 @@ cleanup:
 
   dt_free_align(src_buffer);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_iop_work_profile_info(self, self->dev->iop);
+
+  const int ch = piece->colors;
+  dt_iop_basicadj_data_t *d = piece->data;
+  dt_iop_basicadj_params_t *p = &d->params;
+  dt_iop_basicadj_gui_data_t *g = self->gui_data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // process auto levels
+  if(g && dt_pipe_is_preview(piece->pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    if(g->call_auto_exposure == 1 && !DT_IN_GUI_UPDATE())
+    {
+      g->call_auto_exposure = -1;
+      dt_iop_gui_leave_critical_section(self);
+
+      // get the image, this works only in C
+      float *src_buffer = dt_alloc_align_float((size_t)ch * width * height);
+      if(!src_buffer || dt_slang_gpu_image_read(dev_in, src_buffer))
+      {
+        dt_free_align(src_buffer);
+        return FALSE;
+      }
+
+      memcpy(&g->params, p, sizeof(dt_iop_basicadj_params_t));
+
+      int box[4] = { 0 };
+      _get_selected_area(self, piece, g, roi_in, box);
+      _auto_exposure(src_buffer, roi_in->width, roi_in->height, box, g->params.clip, g->params.middle_grey / 100.f,
+                     &g->params.exposure, &g->params.brightness, &g->params.contrast, &g->params.black_point,
+                     &g->params.hlcompr, &g->params.hlcomprthresh);
+
+      dt_free_align(src_buffer);
+
+      dt_iop_gui_enter_critical_section(self);
+      g->call_auto_exposure = 2;
+      dt_iop_gui_leave_critical_section(self);
+    }
+    else
+    {
+      dt_iop_gui_leave_critical_section(self);
+    }
+  }
+
+  const int use_work_profile = (work_profile == NULL) ? 0 : 1;
+
+  const int plain_contrast = (!p->preserve_colors && p->contrast != 0.f);
+  const int preserve_colors = (p->contrast != 0.f) ? p->preserve_colors : 0;
+  const int process_gamma = (p->brightness != 0.f);
+  const int process_saturation_vibrance = (p->saturation != 0.f)||(p->vibrance != 0.f);
+  const int process_hlcompr = (p->hlcompr > 0.f);
+
+  const float black_point = p->black_point;
+  const float hlcompr = p->hlcompr;
+  const float hlcomprthresh = p->hlcomprthresh;
+  const float saturation = p->saturation + 1.0f;
+  const float vibrance = p->vibrance / 1.4f;
+  const float contrast = p->contrast + 1.0f;
+  const float white = exposure2white(p->exposure);
+  const float scale = 1.0f / (white - p->black_point);
+  const float middle_grey = (p->middle_grey > 0.f) ? (p->middle_grey / 100.f) : 0.1842f;
+  const float inv_middle_grey = 1.f / middle_grey;
+  const float brightness = p->brightness * 2.f;
+  const float gamma = (brightness >= 0.0f) ? 1.0f / (1.0f + brightness) : (1.0f - brightness);
+
+  const float hlcomp = hlcompr / 100.0f;
+  const float shoulder = ((hlcomprthresh / 100.f) / 8.0f) + 0.1f;
+  const float hlrange = 1.0f - shoulder;
+
+  dt_colorspaces_iccprofile_info_slang_t profile_info;
+  int lut_width, lut_height;
+  float *profile_lut = dt_ioppr_build_iccprofile_params_slang(work_profile, &profile_info,
+                                                              &lut_width, &lut_height);
+  if(!profile_lut) return FALSE;
+
+  const int err = dt_slang_gpu_run_2d_args("basicadj", "basicadj", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLIMG_IN(d->lut_gamma, 256, 256, 1), SLIMG_IN(d->lut_contrast, 256, 256, 1),
+    SLARG(black_point), SLARG(scale), SLARG(process_gamma), SLARG(gamma), SLARG(plain_contrast),
+    SLARG(preserve_colors), SLARG(contrast), SLARG(process_saturation_vibrance), SLARG(saturation),
+    SLARG(vibrance), SLARG(process_hlcompr), SLARG(hlcomp), SLARG(hlrange), SLARG(middle_grey),
+    SLARG(inv_middle_grey), SLBUF(&profile_info, sizeof(profile_info)),
+    SLIMG_IN(profile_lut, lut_width, lut_height, 1), SLARG(use_work_profile));
+
+  free(profile_lut);
+  return !err;
 }
 #endif
 

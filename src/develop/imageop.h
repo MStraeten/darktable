@@ -137,6 +137,9 @@ enum
   DT_ACTION_ELEMENT_INSTANCE = 5,
 };
 
+// for process_slang() in iop_api.h, which is included inside the structs below
+struct dt_slang_gpu_image_t;
+
 /** part of the module which only contains the cached dlopen stuff. */
 typedef struct dt_iop_module_so_t
 {

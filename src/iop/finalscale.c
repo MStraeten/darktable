@@ -169,6 +169,25 @@ int process_cl(dt_iop_module_t *self,
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  // like process_cl(), which leaves upscaling to the CPU
+  if(roi_out->scale > 1.0f) return FALSE;
+
+  // the export pipe's buffers hold exactly the rois, as in dt_iop_clip_and_zoom_roi()
+  dt_iop_roi_t iroi = *roi_in, oroi = *roi_out;
+  if(dt_pipe_is_export(piece->pipe)) iroi.x = iroi.y = oroi.x = oroi.y = 0;
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  return !dt_interpolation_resample_slang(itor, dev_out, &oroi, dev_in, &iroi);
+}
+#endif
+
 void process(dt_iop_module_t *self,
              dt_dev_pixelpipe_iop_t *piece,
              const void *const ivoid,

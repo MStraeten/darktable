@@ -471,6 +471,76 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   }
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_rawdenoise_data_t *const d = piece->data;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  if(!(d->threshold > 0.0f))
+    return !dt_slang_gpu_run_2d_args("rawdenoise", "rawdenoise_copy", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height));
+
+  // the X-Trans planes are built sequentially, see wavelet_denoise_xtrans()
+  const uint32_t filters = piece->filters;
+  if(filters == 9u) return FALSE;
+
+  const int maxhalfwidth = width / 2 + (width & 1);
+  const int maxhalfheight = height / 2 + (height & 1);
+  const size_t size = (size_t)maxhalfwidth * maxhalfheight * sizeof(float);
+  dt_slang_gpu_buffer_t *fimg = dt_slang_gpu_buffer_new_uninit(size);
+  dt_slang_gpu_buffer_t *interm = dt_slang_gpu_buffer_new_uninit(size);
+  dt_slang_gpu_buffer_t *accum = dt_slang_gpu_buffer_new_uninit(size);
+  gboolean ok = fimg && interm && accum;
+
+  for(int c = 0; c < 4 && ok; c++)
+  {
+    const int color = FC(c % 2, c / 2, filters);
+    float noise[DT_IOP_RAWDENOISE_BANDS];
+    compute_channel_noise(noise, color, d);
+
+    // as in wavelet_denoise()
+    const int halfwidth = width / 2 + (width & (~(c >> 1)) & 1);
+    const int halfheight = height / 2 + (height & (~c) & 1);
+
+    ok = !dt_slang_gpu_run_2d_args("rawdenoise", "rawdenoise_extract", halfwidth, halfheight,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(fimg),
+                                   SLARG(c), SLARG(halfwidth), SLARG(halfheight))
+      && !dt_slang_gpu_run_2d_args("rawdenoise", "rawdenoise_clear", halfwidth, halfheight,
+                                   SLBUF_DEV(accum), SLARG(halfwidth), SLARG(halfheight));
+
+    for(int lev = 0; lev < DT_IOP_RAWDENOISE_BANDS && ok; lev++)
+    {
+      const int last = lev + 1 == DT_IOP_RAWDENOISE_BANDS;
+      const int vscale = MIN(1 << lev, halfheight - 1);
+      const int hscale = MIN(1 << lev, halfwidth - 1);
+      ok = !dt_slang_gpu_run_2d_args("rawdenoise", "dwt_denoise_vert", halfwidth, halfheight,
+                                     SLBUF_DEV(fimg), SLBUF_DEV(interm),
+                                     SLARG(halfwidth), SLARG(halfheight), SLARG(vscale))
+        && !dt_slang_gpu_run_2d_args("rawdenoise", "dwt_denoise_horiz", halfwidth, halfheight,
+                                     SLBUF_DEV(interm), SLBUF_DEV(fimg), SLBUF_DEV(accum),
+                                     SLARG(halfwidth), SLARG(halfheight), SLARG(hscale),
+                                     SLARG(noise[lev]), SLARG(last));
+    }
+
+    ok = ok && !dt_slang_gpu_run_2d_args("rawdenoise", "rawdenoise_scatter", halfwidth, halfheight,
+                                         SLBUF_DEV(fimg), SLIMG_DEV(dev_out),
+                                         SLARG(c), SLARG(halfwidth), SLARG(halfheight));
+  }
+
+  dt_slang_gpu_buffer_free(fimg);
+  dt_slang_gpu_buffer_free(interm);
+  dt_slang_gpu_buffer_free(accum);
+  return ok;
+}
+#endif
+
 void init(dt_iop_module_t *self)
 {
   dt_iop_default_init(self);

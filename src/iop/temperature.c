@@ -25,6 +25,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/darktable.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/wb_presets.h"
 #include "control/control.h"
 #include "control/conf.h"
@@ -680,6 +681,33 @@ error:
   dt_opencl_release_mem_object(dev_coeffs);
   dt_opencl_release_mem_object(dev_xtrans);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_temperature_data_t *d = piece->data;
+  const uint32_t filters = piece->filters;
+  const char *kernel = filters == 9u ? "whitebalance_1f_xtrans"
+                     : filters       ? "whitebalance_1f"
+                                     : "whitebalance_4f";
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  if(dt_slang_gpu_run_2d_args("basic", kernel, width, height,
+                              SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                              SLBUF(d->coeffs, sizeof(float) * 4), SLARG(filters),
+                              SLBUF(piece->xtrans, sizeof(piece->xtrans))))
+    return FALSE;
+
+  _publish_chroma(piece);
+  return TRUE;
 }
 #endif
 

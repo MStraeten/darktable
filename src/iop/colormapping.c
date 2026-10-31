@@ -22,6 +22,7 @@
 #include "common/colorspaces.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/points.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -690,6 +691,98 @@ error:
   dt_opencl_release_mem_object(dev_var_ratio);
   dt_opencl_release_mem_object(dev_mapio);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_colormapping_data_t *data = piece->data;
+  dt_iop_colormapping_gui_data_t *g = self->gui_data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int ch = piece->colors;
+  const int zero = 0;
+
+  const float scale = piece->iscale / roi_in->scale;
+  const float sigma_s = 50.0f / scale;
+  const float sigma_r = 8.0f; // does not depend on scale
+
+  const float dominance = data->dominance / 100.0f;
+  const float equalization = data->equalization / 100.0f;
+
+  // save a copy of preview input buffer so we can get histogram and color statistics out of it
+  if(self->dev->gui_attached && g && dt_pipe_is_preview(piece->pipe) && (data->flag & ACQUIRE))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    dt_free_align(g->buffer);
+
+    g->buffer = dt_iop_image_alloc(width, height, ch);
+    g->width = width;
+    g->height = height;
+    g->ch = ch;
+
+    const int err = !g->buffer || dt_slang_gpu_image_read(dev_in, g->buffer);
+    dt_iop_gui_leave_critical_section(self);
+    if(err) return FALSE;
+  }
+
+  // without both sets of clusters, the image passes through
+  if(!(data->flag & HAS_TARGET && data->flag & HAS_SOURCE))
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+      SLARG(zero), SLARG(zero));
+
+  // get mapping from input clusters to target clusters
+  int mapio[MAXN];
+  get_cluster_mapping(data->n, data->target_mean, data->target_weight, data->source_mean,
+                      data->source_weight, dominance, mapio);
+
+  float2 var_ratio[MAXN];
+  for(int i = 0; i < data->n; i++)
+  {
+    var_ratio[i][0]
+        = (data->target_var[i][0] > 0.0f) ? data->source_var[mapio[i]][0] / data->target_var[i][0] : 0.0f;
+    var_ratio[i][1]
+        = (data->target_var[i][1] > 0.0f) ? data->source_var[mapio[i]][1] / data->target_var[i][1] : 0.0f;
+  }
+
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  int err = !tmp
+    || dt_slang_gpu_run_2d_args("extended", "colormapping_histogram", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(equalization),
+         SLBUF(data->target_hist, sizeof(int) * HISTN), SLBUF(data->source_ihist, sizeof(float) * HISTN));
+
+  if(!err && equalization > 0.001f)
+  {
+    dt_bilateral_slang_t *b = dt_bilateral_init_slang(width, height, sigma_s, sigma_r);
+    err = !b
+      || dt_bilateral_splat_slang(b, dev_out)
+      || dt_bilateral_blur_slang(b)
+      || dt_bilateral_slice_slang(b, dev_out, tmp, -1.0f);
+    dt_bilateral_free_slang(b);
+  }
+  else if(!err)
+    err = dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+      SLIMG_DEV(dev_out), SLIMG_DEV(tmp), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+      SLARG(zero), SLARG(zero));
+
+  err = err
+    || dt_slang_gpu_run_2d_args("extended", "colormapping_mapping", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+         SLARG(data->n), SLBUF(data->target_mean, sizeof(float) * MAXN * 2),
+         SLBUF(data->source_mean, sizeof(float) * MAXN * 2), SLBUF(var_ratio, sizeof(float) * MAXN * 2),
+         SLBUF(mapio, sizeof(int) * MAXN));
+
+  dt_slang_gpu_image_free(tmp);
+  return !err;
 }
 #endif
 

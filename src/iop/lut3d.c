@@ -24,6 +24,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/file_location.h"
 #include "common/iop_profile.h"
+#include "common/slang_gpu.h"
 #include "common/utility.h"
 #include "develop/imageop.h"
 #include "develop/tiling.h"
@@ -1104,6 +1105,69 @@ cleanup:
   dt_opencl_release_mem_object(clut_cl);
   dt_opencl_release_mem_object(scratch);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_lut3d_data_t *d = piece->data;
+  const float *const clut = (float *)d->clut;
+  const int level = d->level;
+  const int interpolation = d->params.interpolation;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  if(!clut || !level)
+  {
+    const int dx = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(width), SLARG(height), SLARG(dx), SLARG(dx));
+  }
+
+  const int colorspace
+    = (d->params.colorspace == DT_IOP_SRGB) ? DT_COLORSPACE_SRGB
+    : (d->params.colorspace == DT_IOP_REC709) ? DT_COLORSPACE_REC709
+    : (d->params.colorspace == DT_IOP_ARGB) ? DT_COLORSPACE_ADOBERGB
+    : (d->params.colorspace == DT_IOP_LIN_PROPHOTO) ? DT_COLORSPACE_PROPHOTO_RGB
+    : (d->params.colorspace == DT_IOP_LIN_REC709) ? DT_COLORSPACE_LIN_REC709
+    : DT_COLORSPACE_LIN_REC2020;
+  const dt_iop_order_iccprofile_info_t *const lut_profile
+    = dt_ioppr_add_profile_info_to_list(self->dev, colorspace, "", INTENT_PERCEPTUAL);
+  const dt_iop_order_iccprofile_info_t *const work_profile
+    = dt_ioppr_get_iop_work_profile_info(self, self->dev->iop);
+  const gboolean transform = work_profile != NULL && lut_profile != NULL;
+  const size_t clut_size = sizeof(float) * (3 * level * level * level + 1);
+
+  if(!transform)
+    return !dt_slang_gpu_run_2d_args("lut3d", "lut3d", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLBUF(clut, clut_size), SLARG(level), SLARG(interpolation));
+
+  // the profile conversions go through tmp, as in process_cl(). A conversion
+  // the device can't do (a profile without a matrix) declines the module, as
+  // process() would still convert.
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  const int dx = 0;
+  const gboolean ok = tmp
+    && dt_ioppr_transform_image_colorspace_rgb_slang(dev_in, tmp, width, height,
+                                                     work_profile, lut_profile, "work profile to LUT profile")
+    && !dt_slang_gpu_run_2d_args("lut3d", "lut3d", width, height,
+                                 SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLBUF(clut, clut_size), SLARG(level), SLARG(interpolation))
+    && dt_ioppr_transform_image_colorspace_rgb_slang(dev_out, tmp, width, height,
+                                                     lut_profile, work_profile, "LUT profile to work profile")
+    && !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                 SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLARG(width), SLARG(height), SLARG(dx), SLARG(dx));
+  dt_slang_gpu_image_free(tmp);
+  return ok;
 }
 #endif
 

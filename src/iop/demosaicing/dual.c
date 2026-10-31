@@ -146,6 +146,59 @@ int dual_demosaic_cl(const dt_iop_module_t *self,
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// dual_demosaic_cl() on the Slang kernels. Returns TRUE on success.
+static gboolean dual_demosaic_slang(const dt_dev_pixelpipe_iop_t *const piece,
+                                    dt_slang_gpu_image_t *high_image,
+                                    dt_slang_gpu_image_t *low_image,
+                                    dt_slang_gpu_image_t *out,
+                                    const int width,
+                                    const int height)
+{
+  const dt_dev_pixelpipe_t *p = piece->pipe;
+  const dt_iop_demosaic_data_t *data = piece->data;
+
+  const float contrastf = _slider2contrast(data->dual_thrs);
+  const size_t bsize = sizeof(float) * width * height;
+
+  const gboolean wboff = !p->dsc.temperature.enabled;
+  const dt_aligned_pixel_t wb =
+      { wboff ? 1.0f : 1.0f / p->dsc.temperature.coeffs[0],
+        wboff ? 1.0f : 1.0f / p->dsc.temperature.coeffs[1],
+        wboff ? 1.0f : 1.0f / p->dsc.temperature.coeffs[2], 1.0f };
+
+  dt_slang_gpu_buffer_t *tmp = dt_slang_gpu_buffer_new_uninit(bsize);
+  dt_slang_gpu_buffer_t *mask = dt_slang_gpu_buffer_new_uninit(bsize);
+  const int detail = 1;
+  const int showmask = 0;
+  int err = !tmp || !mask;
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("blendop", "calc_Y0_mask", width, height,
+                                   SLBUF_DEV(mask), SLIMG_DEV(high_image), SLARG(width), SLARG(height),
+                                   SLARG(wb));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("blendop", "calc_scharr_mask", width, height,
+                                   SLBUF_DEV(mask), SLBUF_DEV(tmp), SLARG(width), SLARG(height));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("blendop", "calc_detail_blend", width, height,
+                                   SLBUF_DEV(tmp), SLBUF_DEV(mask), SLARG(width), SLARG(height),
+                                   SLARG(contrastf), SLARG(detail));
+  if(!err)
+    err = dt_gaussian_fast_blur_slang_buffer(mask, tmp, width, height, 2.0f, 0.0f, 1.0f);
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("demosaic_rcd", "write_blended_dual", width, height,
+                                   SLIMG_DEV(high_image), SLIMG_DEV(low_image), SLIMG_DEV(out),
+                                   SLARG(width), SLARG(height), SLBUF_DEV(tmp), SLARG(showmask));
+
+  if(err)
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "dual demosaic", p, NULL, DT_DEVICE_NONE, NULL, NULL,
+                  "Slang kernels failed");
+  dt_slang_gpu_buffer_free(mask);
+  dt_slang_gpu_buffer_free(tmp);
+  return !err;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

@@ -868,6 +868,222 @@ cl_int dwt_decompose_cl(dwt_params_cl_t *p, _dwt_layer_func_cl layer_func)
 }
 
 #endif
+
+#ifdef HAVE_SLANG_GPU
+dwt_params_slang_t *dt_dwt_init_slang(dt_slang_gpu_image_t *image, const int width, const int height,
+                                      const int scales, const int return_layer, const int merge_from_scale,
+                                      void *user_data, const float preview_scale)
+{
+  dwt_params_slang_t *p = malloc(sizeof(dwt_params_slang_t));
+  if(!p) return NULL;
+
+  p->image = image;
+  p->width = width;
+  p->height = height;
+  p->scales = scales;
+  p->return_layer = return_layer;
+  p->merge_from_scale = merge_from_scale;
+  p->user_data = user_data;
+  p->preview_scale = preview_scale;
+
+  return p;
+}
+
+void dt_dwt_free_slang(dwt_params_slang_t *p)
+{
+  free(p);
+}
+
+int dwt_get_max_scale_slang(dwt_params_slang_t *p)
+{
+  return _get_max_scale(p->width / p->preview_scale, p->height / p->preview_scale, p->preview_scale);
+}
+
+int dt_dwt_first_scale_visible_slang(dwt_params_slang_t *p)
+{
+  return _first_scale_visible(p->scales, p->preview_scale);
+}
+
+static int _dwt_copy_slang(dt_slang_gpu_image_t *from, dt_slang_gpu_image_t *to, const dwt_params_slang_t *const p)
+{
+  if(from == to) return 0;
+  const int zero = 0;
+  return dt_slang_gpu_run_2d_args("basic", "interpolation_copy", p->width, p->height,
+                                  SLIMG_DEV(from), SLIMG_DEV(to), SLARG(p->width), SLARG(p->height),
+                                  SLARG(p->width), SLARG(p->height), SLARG(zero), SLARG(zero));
+}
+
+// *acc += add, through spare: a kernel can't read and write the same image.
+// An empty *acc starts as a copy of add, which is what adding to the
+// zeroed buffer of the CPU code gives.
+static int _dwt_accumulate_slang(dt_slang_gpu_image_t **acc, gboolean *acc_empty, dt_slang_gpu_image_t *add,
+                                 dt_slang_gpu_image_t **spare, const dwt_params_slang_t *const p)
+{
+  if(*acc_empty)
+  {
+    *acc_empty = FALSE;
+    return _dwt_copy_slang(add, *acc, p);
+  }
+  const int err = dt_slang_gpu_run_2d_args("dwt", "dwt_add", p->width, p->height,
+                                           SLIMG_DEV(*acc), SLIMG_DEV(add), SLIMG_DEV(*spare),
+                                           SLARG(p->width), SLARG(p->height));
+  dt_slang_gpu_image_t *t = *acc;
+  *acc = *spare;
+  *spare = t;
+  return err;
+}
+
+/* dwt_wavelet_decompose() on the device */
+static int _dwt_wavelet_decompose_slang(dwt_params_slang_t *const p, _dwt_layer_func_slang layer_func)
+{
+  int err = 0;
+  const int width = p->width;
+  const int height = p->height;
+
+  if(layer_func) err = layer_func(p->image, p, 0);
+  if(err || p->scales <= 0) return err;
+
+  // the kernels write their results to other images than they read, so the
+  // images rotate between these slots. p->image is one of them, and only
+  // needs to hold the result at the end.
+  const int do_merge = p->merge_from_scale > 0;
+  dt_slang_gpu_image_t *own[6] = { NULL };
+  for(int k = 0; k < (do_merge ? 6 : 5); k++)
+  {
+    own[k] = dt_slang_gpu_image_new(width, height, 4, NULL);
+    if(!own[k])
+    {
+      for(int i = 0; i < k; i++) dt_slang_gpu_image_free(own[i]);
+      dt_print(DT_DEBUG_ALWAYS, "[dwt] unable to alloc working memory, skipping wavelet decomposition");
+      return 1;
+    }
+  }
+
+  dt_slang_gpu_image_t *buffer[2] = { p->image, own[0] };
+  dt_slang_gpu_image_t *vsum = own[1];
+  dt_slang_gpu_image_t *detail = own[2];
+  dt_slang_gpu_image_t *layers = own[3];
+  dt_slang_gpu_image_t *spare = own[4];
+  dt_slang_gpu_image_t *merged_layers = own[5];
+  gboolean layers_empty = TRUE;
+  gboolean merged_empty = TRUE;
+
+  unsigned int hpass = 0;
+  gboolean bcontinue = TRUE;
+  for(unsigned int lev = 0; lev < p->scales && bcontinue && !err; lev++)
+  {
+    const unsigned int lpass = (1 - (lev & 1));
+    const int vscale = MIN(1 << lev, height - 1);
+    const int hscale = MIN(1 << lev, width - 1);
+
+    // coarse goes to buffer[lpass], the details replace buffer[hpass]
+    err = dt_slang_gpu_run_2d_args("dwt", "dwt_decompose_vert", width, height,
+                                   SLIMG_DEV(buffer[hpass]), SLIMG_DEV(vsum),
+                                   SLARG(width), SLARG(height), SLARG(vscale))
+       || dt_slang_gpu_run_2d_args("dwt", "dwt_decompose_horiz", width, height,
+                                   SLIMG_DEV(vsum), SLIMG_DEV(buffer[hpass]),
+                                   SLIMG_DEV(buffer[lpass]), SLIMG_DEV(detail),
+                                   SLARG(width), SLARG(height), SLARG(hscale));
+    if(err) break;
+    dt_slang_gpu_image_t *t = buffer[hpass];
+    buffer[hpass] = detail;
+    detail = t;
+
+    // no merge scales or we didn't reach the merge scale from yet
+    if(p->merge_from_scale == 0 || p->merge_from_scale > lev + 1)
+    {
+      // allow to process this detail scale
+      if(layer_func) err = layer_func(buffer[hpass], p, lev + 1);
+      if(err) break;
+
+      // user wants to preview this detail scale
+      if(p->return_layer == lev + 1)
+      {
+        err = _dwt_copy_slang(buffer[hpass], p->image, p);
+        bcontinue = FALSE;
+      }
+      // user wants the entire reconstructed image
+      else if(p->return_layer == 0)
+        err = _dwt_accumulate_slang(&layers, &layers_empty, buffer[hpass], &spare, p);
+    }
+    // we are on the merge scales range
+    else
+    {
+      err = _dwt_accumulate_slang(&merged_layers, &merged_empty, buffer[hpass], &spare, p);
+      // allow to process this merged scale
+      if(!err && layer_func) err = layer_func(merged_layers, p, lev + 1);
+      if(err) break;
+
+      // user wants to preview this merged scale
+      if(p->return_layer == lev + 1)
+      {
+        err = _dwt_copy_slang(merged_layers, p->image, p);
+        bcontinue = FALSE;
+      }
+    }
+
+    hpass = lpass;
+  }
+
+  // all scales have been processed
+  if(bcontinue && !err)
+  {
+    // allow to process residual image
+    if(layer_func) err = layer_func(buffer[hpass], p, p->scales + 1);
+
+    // user wants to preview residual image
+    if(!err && p->return_layer == p->scales + 1)
+      err = _dwt_copy_slang(buffer[hpass], p->image, p);
+    // return reconstructed image
+    else if(!err && p->return_layer == 0)
+    {
+      // some of the detail scales are on the merged layers
+      if(p->merge_from_scale > 0 && !merged_empty)
+        err = _dwt_accumulate_slang(&layers, &layers_empty, merged_layers, &spare, p);
+      // add residual image to final image
+      if(!err) err = _dwt_accumulate_slang(&layers, &layers_empty, buffer[hpass], &spare, p);
+      // allow to process reconstructed image
+      if(!err && layer_func) err = layer_func(layers, p, p->scales + 2);
+      if(!err) err = _dwt_copy_slang(layers, p->image, p);
+    }
+  }
+
+  // p->image went around the slots, so free whichever images are not it
+  dt_slang_gpu_image_t *slots[7] = { buffer[0], buffer[1], vsum, detail, layers, spare, merged_layers };
+  for(int k = 0; k < 7; k++)
+    if(slots[k] != p->image) dt_slang_gpu_image_free(slots[k]);
+
+  return err;
+}
+
+int dwt_decompose_slang(dwt_params_slang_t *p, _dwt_layer_func_slang layer_func)
+{
+  // this is a zoom scale, not a wavelet scale
+  if(p->preview_scale <= 0.f) p->preview_scale = 1.f;
+
+  // if a single scale is requested it cannot be grather than the residual
+  if(p->return_layer > p->scales + 1)
+  {
+    p->return_layer = p->scales + 1;
+  }
+
+  const int max_scale = dwt_get_max_scale_slang(p);
+
+  // if requested scales is grather than max scales adjust it
+  if(p->scales > max_scale)
+  {
+    // residual should be returned
+    if(p->return_layer > p->scales) p->return_layer = max_scale + 1;
+    // a scale should be returned, it cannot be grather than max scales
+    else if(p->return_layer > max_scale)
+      p->return_layer = max_scale;
+
+    p->scales = max_scale;
+  }
+
+  return _dwt_wavelet_decompose_slang(p, layer_func);
+}
+#endif
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

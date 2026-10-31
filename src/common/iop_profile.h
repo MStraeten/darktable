@@ -269,6 +269,57 @@ gboolean dt_ioppr_transform_image_colorspace_rgb_cl
    const char *message);
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// must be in sync with dt_colorspaces_iccprofile_info_cl_t in
+// data/kernels/slang/color_conversion.slang, which is laid out with std430
+typedef struct dt_colorspaces_iccprofile_info_slang_t
+{
+  float matrix_in[9];
+  float matrix_out[9];
+  int lutsize;
+  float unbounded_coeffs_in[3][3];
+  float unbounded_coeffs_out[3][3];
+  int nonlinearlut;
+  float grey;
+  int hdr_transfer;
+} dt_colorspaces_iccprofile_info_slang_t;
+
+/** the Slang equivalent of dt_ioppr_build_iccprofile_params_cl(): fills info
+ *  and returns the curves as a lut_width x lut_height single channel image,
+ *  to be freed with free(). profile_info may be NULL. */
+float *dt_ioppr_build_iccprofile_params_slang
+  (const dt_iop_order_iccprofile_info_t *const profile_info,
+   dt_colorspaces_iccprofile_info_slang_t *info,
+   int *lut_width,
+   int *lut_height);
+
+struct dt_slang_gpu_image_t;
+/** converts between RGB and Lab on the device, like
+ *  dt_ioppr_transform_image_colorspace_cl() does with a matrix profile.
+ *  Returns FALSE, having done nothing, for any other conversion. */
+gboolean dt_ioppr_transform_image_colorspace_slang
+  (struct dt_iop_module_t *self,
+   struct dt_slang_gpu_image_t *dev_img_in,
+   struct dt_slang_gpu_image_t *dev_img_out,
+   const int width,
+   const int height,
+   const dt_iop_colorspace_type_t cst_from,
+   const dt_iop_colorspace_type_t cst_to,
+   const dt_iop_order_iccprofile_info_t *const profile_info);
+
+/** converts between two RGB matrix profiles on the device, like
+ *  dt_ioppr_transform_image_colorspace_rgb_cl() does. Returns FALSE, having
+ *  done nothing, when either profile has no matrix. */
+gboolean dt_ioppr_transform_image_colorspace_rgb_slang
+  (struct dt_slang_gpu_image_t *dev_img_in,
+   struct dt_slang_gpu_image_t *dev_img_out,
+   const int width,
+   const int height,
+   const dt_iop_order_iccprofile_info_t *const profile_info_from,
+   const dt_iop_order_iccprofile_info_t *const profile_info_to,
+   const char *message);
+#endif
+
 /** the following must have the matrix_in and matrix_out generated */
 
 DT_OMP_DECLARE_SIMD(aligned(lut:64))

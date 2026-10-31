@@ -242,6 +242,10 @@ changes (where available).
   faster processing times in comparison to CPU code path, depending on
   CPU & GPU.
 
+- Prefer Slang GPU processing over OpenCL for modules that support both
+  backends, while keeping image data synchronized when the pipeline switches
+  between them.
+
 - Hovering over and dragging nodes of long drawn brush strokes and
   paths is much faster, as the mask overlay is no longer redrawn on
   every mouse move and long outlines are drawn with far fewer points.

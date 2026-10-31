@@ -2060,6 +2060,195 @@ error:
 
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// Markesteijn as in process_markesteijn_cl(), on full X-Trans data. Returns
+// TRUE on success
+static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
+                                          dt_slang_gpu_image_t *dev_in,
+                                          dt_slang_gpu_image_t *dev_out,
+                                          const uint8_t (*const xtrans)[6],
+                                          const int width,
+                                          const int height)
+{
+  const dt_iop_demosaic_data_t *data = piece->data;
+  const char *prg = "demosaic_markesteijn";
+
+  const int passes = ((data->demosaicing_method & ~DT_DEMOSAIC_DUAL) == DT_IOP_DEMOSAIC_MARKESTEIJN_3) ? 3 : 1;
+  const int ndir = passes > 1 ? 8 : 4;
+  const int pad_tile = (passes == 1) ? 12 : 17;
+  if(!process_vng_slang(dev_in, dev_out, xtrans, width, height, 9u, pad_tile + 2, TRUE))
+    return FALSE;
+
+  static const short orth[12] = { 1, 0, 0, 1, -1, 0, 0, -1, 1, 0, 0, 1 },
+                     patt[2][16] = { { 0, 1, 0, -1, 2, 0, -1, 0, 1, 1, 1, -1, 0, 0, 0, 0 },
+                                     { 0, 1, 0, -2, 1, 0, -2, 0, 1, 1, -2, -2, 1, -1, -1, 1 } };
+
+  // allhex and sgreen as in process_markesteijn_cl()
+  char allhex[3][3][8][2] = { { { { 0 } } } };
+  int sgreen[2] = { 0 };
+
+  for(int row = 0; row < 3; row++)
+    for(int col = 0; col < 3; col++)
+      for(int ng = 0, d = 0; d < 10; d += 2)
+      {
+        const int g = FCNxtrans(row, col, xtrans) == 1;
+        if(FCNxtrans(row + orth[d] + 6, col + orth[d + 2] + 6, xtrans) == 1)
+          ng = 0;
+        else
+          ng++;
+        if(ng == 4)
+        {
+          sgreen[0] = col;
+          sgreen[1] = row;
+        }
+        if(ng == g + 1)
+          for(int c = 0; c < 8; c++)
+          {
+            const int v = orth[d] * patt[g][c * 2] + orth[d + 1] * patt[g][c * 2 + 1];
+            const int h = orth[d + 2] * patt[g][c * 2] + orth[d + 3] * patt[g][c * 2 + 1];
+
+            allhex[row][col][c ^ (g * 2 & d)][0] = h;
+            allhex[row][col][c ^ (g * 2 & d)][1] = v;
+          }
+      }
+
+  const size_t npix = (size_t)width * height;
+
+  // the homogeneity maps hold four directions per word. No buffer needs
+  // clearing: each kernel reads only what an earlier one wrote, within the
+  // borders that grow from one step to the next
+  dt_slang_gpu_buffer_t *rgbv[8] = { NULL };
+  dt_slang_gpu_buffer_t *drv[8] = { NULL };
+  dt_slang_gpu_buffer_t *homo[2] = { NULL };
+  dt_slang_gpu_buffer_t *homosum[2] = { NULL };
+  dt_slang_gpu_buffer_t *gminmax = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 2 * npix);
+  dt_slang_gpu_buffer_t *aux = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * npix);
+
+  gboolean ok = gminmax && aux;
+  for(int n = 0; n < ndir && ok; n++)
+  {
+    rgbv[n] = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * npix);
+    drv[n] = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npix);
+    ok = rgbv[n] && drv[n];
+  }
+  for(int n = 0; n < ndir / 4 && ok; n++)
+  {
+    homo[n] = dt_slang_gpu_buffer_new_uninit(sizeof(uint32_t) * npix);
+    homosum[n] = dt_slang_gpu_buffer_new_uninit(sizeof(uint32_t) * npix);
+    ok = homo[n] && homosum[n];
+  }
+
+  // the kernels taking all eight directions get the first four twice with
+  // one pass, and read only the first ndir of them
+  dt_slang_gpu_buffer_t *rgb8[8], *drv8[8], *homo2[2], *homosum2[2];
+  for(int n = 0; n < 8; n++)
+  {
+    rgb8[n] = rgbv[n % ndir];
+    drv8[n] = drv[n % ndir];
+  }
+  for(int n = 0; n < 2; n++)
+  {
+    homo2[n] = homo[n % (ndir / 4)];
+    homosum2[n] = homosum[n % (ndir / 4)];
+  }
+
+#define MRUN(kernel, ...) \
+  if(ok) ok = !dt_slang_gpu_run_2d_args(prg, kernel, width, height, __VA_ARGS__)
+
+  dt_slang_gpu_buffer_t **rgb = rgbv;
+
+  const int pad_g1_g3 = PAD_G1_G3;
+  MRUN("markesteijn_green_minmax", SLIMG_DEV(dev_in), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
+       SLARG(pad_g1_g3), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+
+  const int pad_g_interp = PAD_G_INTERP;
+  MRUN("markesteijn_initial_green", SLIMG_DEV(dev_in), SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[1]),
+       SLBUF_DEV(rgb[2]), SLBUF_DEV(rgb[3]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
+       SLARG(pad_g_interp), SLARG(sgreen), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+
+  // the solitary green pixels are every third one from sgreen on
+  const int sg_width = (width - sgreen[0] + 2) / 3;
+  const int sg_height = (height - sgreen[1] + 2) / 3;
+
+  for(int pass = 0; pass < passes && ok; pass++)
+  {
+    if(pass == 1)
+    {
+      for(int c = 0; c < 4; c++)
+        MRUN("markesteijn_copy", SLBUF_DEV(rgb[c]), SLBUF_DEV(rgb[c + 4]), SLARG(width), SLARG(height));
+      rgb += 4;
+    }
+
+    if(pass)
+    {
+      const int pad_g_recalc = PAD_G_RECALC;
+      MRUN("markesteijn_recalculate_green", SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[1]), SLBUF_DEV(rgb[2]),
+           SLBUF_DEV(rgb[3]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height), SLARG(pad_g_recalc),
+           SLARG(sgreen), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+    }
+
+    const int pad_rb_g = (passes == 1) ? 6 : 5;
+    dt_slang_gpu_buffer_t **trgb = rgb;
+    for(int d = 0, i = 1, h = 0; d < 6; d++, i ^= 1, h ^= 2)
+    {
+      const int dir[2] = { i, i ^ 1 };
+      if(ok)
+        ok = !dt_slang_gpu_run_2d_args(prg, "markesteijn_solitary_green", sg_width, sg_height,
+                                       SLBUF_DEV(trgb[0]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
+                                       SLARG(pad_rb_g), SLARG(d), SLARG(dir), SLARG(h), SLARG(sgreen),
+                                       SLBUF(xtrans, 36));
+      if((d < 2) || (d & 1)) trgb++;
+    }
+
+    const int pad_rb_br = (passes == 1) ? 6 : 5;
+    for(int d = 0; d < 4; d++)
+      MRUN("markesteijn_red_and_blue", SLBUF_DEV(rgb[d]), SLARG(width), SLARG(height), SLARG(pad_rb_br),
+           SLARG(d), SLARG(sgreen), SLBUF(xtrans, 36));
+
+    const int pad_g22 = (passes == 1) ? 8 : 4;
+    for(int d = 0, n = 0; d < ndir; d += 2, n++)
+      MRUN("markesteijn_interpolate_twoxtwo", SLBUF_DEV(rgb[n]), SLARG(width), SLARG(height), SLARG(pad_g22),
+           SLARG(d), SLARG(sgreen), SLBUF(allhex, sizeof(allhex)));
+  }
+
+  // convert to perceptual colorspace and differentiate in all directions
+  const int pad_yuv = (passes == 1) ? 8 : 13;
+  for(int d = 0; d < ndir; d++)
+    MRUN("markesteijn_differentiate", SLBUF_DEV(rgbv[d]), SLBUF_DEV(drv[d]), SLARG(width), SLARG(height),
+         SLARG(pad_yuv), SLARG(d));
+
+  // the homogeneity maps and their 5x5 sums
+  const int pad_homo = (passes == 1) ? 10 : 15;
+  MRUN("markesteijn_homo_set", SLBUF_DEV(drv8[0]), SLBUF_DEV(drv8[1]), SLBUF_DEV(drv8[2]), SLBUF_DEV(drv8[3]),
+       SLBUF_DEV(drv8[4]), SLBUF_DEV(drv8[5]), SLBUF_DEV(drv8[6]), SLBUF_DEV(drv8[7]), SLBUF_DEV(homo2[0]),
+       SLBUF_DEV(homo2[1]), SLARG(width), SLARG(height), SLARG(pad_homo), SLARG(ndir));
+  MRUN("markesteijn_homo_sum", SLBUF_DEV(homo2[0]), SLBUF_DEV(homo2[1]), SLBUF_DEV(homosum2[0]),
+       SLBUF_DEV(homosum2[1]), SLARG(width), SLARG(height), SLARG(pad_tile), SLARG(ndir));
+
+  // average the most homogeneous directions into the inner part of dev_out,
+  // which leaves the border from VNG alone
+  MRUN("markesteijn_accu_final", SLBUF_DEV(rgb8[0]), SLBUF_DEV(rgb8[1]), SLBUF_DEV(rgb8[2]),
+       SLBUF_DEV(rgb8[3]), SLBUF_DEV(rgb8[4]), SLBUF_DEV(rgb8[5]), SLBUF_DEV(rgb8[6]), SLBUF_DEV(rgb8[7]),
+       SLBUF_DEV(homosum2[0]), SLBUF_DEV(homosum2[1]), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+       SLARG(pad_tile), SLARG(ndir));
+#undef MRUN
+
+  for(int n = 0; n < 8; n++)
+  {
+    dt_slang_gpu_buffer_free(rgbv[n]);
+    dt_slang_gpu_buffer_free(drv[n]);
+  }
+  for(int n = 0; n < 2; n++)
+  {
+    dt_slang_gpu_buffer_free(homo[n]);
+    dt_slang_gpu_buffer_free(homosum[n]);
+  }
+  dt_slang_gpu_buffer_free(gminmax);
+  dt_slang_gpu_buffer_free(aux);
+  return ok;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

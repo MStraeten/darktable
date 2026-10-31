@@ -2537,6 +2537,11 @@ void dt_iop_commit_params(dt_iop_module_t *module,
   if(module->process_cl)
     piece->process_cl_ready = TRUE;
 #endif
+#ifdef HAVE_SLANG_GPU
+  // process_slang() runs the same kernels, so it follows the same flag
+  if(module->process_slang)
+    piece->process_cl_ready = TRUE;
+#endif
 
   // register if module allows tiling, commit_params can overwrite this.
   if(module->flags() & IOP_FLAGS_ALLOW_TILING)

@@ -46,6 +46,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/colorchecker.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/illuminants.h"
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
@@ -2277,23 +2278,9 @@ void process(dt_iop_module_t *self,
     }
 }
 
-#if HAVE_OPENCL
-int process_cl(dt_iop_module_t *self,
-               dt_dev_pixelpipe_iop_t *piece,
-               const cl_mem dev_in,
-               cl_mem dev_out,
-               const dt_iop_roi_t *const roi_in,
-               const dt_iop_roi_t *const roi_out)
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
+static void _update_camera_illuminant(dt_iop_module_t *self, dt_iop_channelmixer_rbg_data_t *d)
 {
-  dt_iop_channelmixer_rbg_data_t *const d = piece->data;
-  const dt_iop_channelmixer_rgb_global_data_t *const gd = self->global_data;
-
-  const dt_iop_order_iccprofile_info_t *const work_profile =
-    dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
-
-  if(dt_pipe_is_preview(piece->pipe))
-    _declare_cat_on_pipe(self, FALSE);
-
   if(d->illuminant_type == DT_ILLUMINANT_CAMERA)
   {
     // The camera illuminant is a behaviour rather than a preset of
@@ -2319,6 +2306,27 @@ int process_cl(dt_iop_module_t *self,
       d->illuminant[3] = 0.f;
     }
   }
+}
+#endif
+
+#if HAVE_OPENCL
+int process_cl(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               const cl_mem dev_in,
+               cl_mem dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_channelmixer_rbg_data_t *const d = piece->data;
+  const dt_iop_channelmixer_rgb_global_data_t *const gd = self->global_data;
+
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+
+  if(dt_pipe_is_preview(piece->pipe))
+    _declare_cat_on_pipe(self, FALSE);
+
+  _update_camera_illuminant(self, d);
 
   cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
 
@@ -2420,6 +2428,58 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_channelmixer_rgb_rgb);
   free(self->data);
   self->data = NULL;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_channelmixer_rbg_data_t *const d = piece->data;
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  if(piece->colors != 4 || !work_profile) return FALSE;
+
+  if(dt_pipe_is_preview(piece->pipe))
+    _declare_cat_on_pipe(self, FALSE);
+
+  _update_camera_illuminant(self, d);
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const char *kernel;
+  switch(d->adaptation)
+  {
+    case DT_ADAPTATION_FULL_BRADFORD:
+      kernel = "channelmixerrgb_bradford_full";
+      break;
+    case DT_ADAPTATION_LINEAR_BRADFORD:
+      kernel = "channelmixerrgb_bradford_linear";
+      break;
+    case DT_ADAPTATION_CAT16:
+      kernel = "channelmixerrgb_CAT16";
+      break;
+    case DT_ADAPTATION_XYZ:
+      kernel = "channelmixerrgb_XYZ";
+      break;
+    case DT_ADAPTATION_RGB:
+    case DT_ADAPTATION_LAST:
+    default:
+      kernel = "channelmixerrgb_RGB";
+      break;
+  }
+
+  return !dt_slang_gpu_run_2d_args("channelmixer", kernel, width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLBUF(work_profile->matrix_in, 12 * sizeof(float)), SLBUF(work_profile->matrix_out, 12 * sizeof(float)),
+    SLBUF(d->MIX, 12 * sizeof(float)), SLARG(d->illuminant), SLARG(d->saturation),
+    SLARG(d->lightness), SLARG(d->grey), SLARG(d->p), SLARG(d->gamut), SLARG(d->clip),
+    SLARG(d->apply_grey), SLARG(d->version));
 }
 #endif
 

@@ -357,6 +357,76 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   }
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_hotpixels_gui_data_t *g = self->gui_data;
+  const dt_iop_hotpixels_data_t *data = piece->data;
+
+  // marking the fixed pixels writes the neighbors of each hot pixel, and a
+  // monochrome raw comes as 4 channels: both stay on the CPU
+  if(data->markfixed || data->pure_monochrome) return FALSE;
+
+  const gboolean xtrans = !data->monochrome && piece->pipe->dsc.filters == 9u;
+  const int mode = data->monochrome ? 1 : xtrans ? 2 : 0;
+
+  // the four nearest like-colored sensels for each cell of the X-Trans
+  // pattern, found as _process_xtrans() does
+  int offsets[6][6][4][2] = { { { { 0 } } } };
+  if(xtrans)
+  {
+    const int search[20][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 }, { -1, -1 },
+                                { -1, 1 }, { 1, -1 }, { 1, 1 }, { -2, 0 }, { 2, 0 },
+                                { 0, -2 }, { 0, 2 }, { -2, -1 }, { -2, 1 }, { 2, -1 },
+                                { 2, 1 }, { -1, -2 }, { 1, -2 }, { -1, 2 }, { 1, 2 } };
+    for(int j = 0; j < 6; ++j)
+      for(int i = 0; i < 6; ++i)
+      {
+        const uint8_t c = FCNxtrans(j, i, piece->xtrans);
+        for(int s = 0, found = 0; s < 20 && found < 4; ++s)
+        {
+          if(c == FCNxtrans(j + search[s][1], i + search[s][0], piece->xtrans))
+          {
+            offsets[j][i][found][0] = search[s][0];
+            offsets[j][i][found][1] = search[s][1];
+            ++found;
+          }
+        }
+      }
+  }
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const int min_neighbours = data->permissive ? 3 : 4;
+  dt_slang_gpu_buffer_t *fixed = dt_slang_gpu_buffer_new(sizeof(uint32_t), NULL);
+  gboolean ok = fixed
+    && !dt_slang_gpu_run_2d_args("hotpixels", "hotpixels", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLARG(data->threshold), SLARG(data->multiplier), SLARG(min_neighbours),
+                                 SLARG(mode), SLBUF(offsets, sizeof(offsets)), SLBUF_DEV(fixed));
+
+  // reading the count waits for the kernel, so only the darkroom does it
+  if(ok && g && self->dev->gui_attached && dt_pipe_is_full(piece->pipe))
+  {
+    uint32_t count = 0;
+    ok = !dt_slang_gpu_buffer_read(fixed, &count, sizeof(count));
+    if(ok)
+    {
+      dt_iop_gui_enter_critical_section(self);
+      g->pixels_fixed = count;
+      dt_iop_gui_leave_critical_section(self);
+    }
+  }
+  dt_slang_gpu_buffer_free(fixed);
+  return ok;
+}
+#endif
+
 void reload_defaults(dt_iop_module_t *self)
 {
   const dt_image_t *img = &self->dev->image_storage;

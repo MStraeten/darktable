@@ -119,6 +119,8 @@ typedef struct dt_dev_pixelpipe_iop_t
   // the same images on the device while dt_develop_blend_process_cl runs,
   // where the guides above are not read back; NULL otherwise
   struct dt_develop_blend_cl_context_t *blend_refine_cl;
+  // and on the Slang device while dt_develop_blend_process_slang runs
+  struct dt_develop_blend_slang_context_t *blend_refine_slang;
 
   // the refinements previewed as off, copied at commit time so that the
   // renderer never reads the GUI's set from a worker thread
@@ -281,6 +283,19 @@ typedef struct dt_dev_pixelpipe_t
   gboolean opencl_enabled;
   // opencl error detected?
   gboolean opencl_error;
+#ifdef HAVE_SLANG_GPU
+  // output of the last module run by process_slang(), still on the device.
+  // slang_host is its cacheline, which holds the same data only once
+  // slang_host_valid is set
+  struct dt_slang_gpu_image_t *slang_image;
+  void *slang_host;
+  gboolean slang_host_valid;
+  // the CPU path runs the module tiled on the Slang kernels, as its
+  // full-size images don't fit the device
+  gboolean slang_tiling;
+  // Slang kernels allowed for this run? Off after a device error
+  gboolean slang_enabled;
+#endif
   // running in a tiling context?
   gboolean tiling;
   // should this pixelpipe display a mask in the end?
@@ -507,6 +522,14 @@ gboolean dt_dev_write_scharr_mask(dt_dev_pixelpipe_iop_t *piece,
                                   float *const rgb,
                                   const dt_iop_roi_t *const roi_in,
                                   const gboolean mode);
+#ifdef HAVE_SLANG_GPU
+// as dt_dev_write_scharr_mask(), from an RGB image on the Slang device.
+// TRUE on failure.
+gboolean dt_dev_write_scharr_mask_slang(dt_dev_pixelpipe_iop_t *piece,
+                                        struct dt_slang_gpu_image_t *in,
+                                        const dt_iop_roi_t *const roi_in,
+                                        const gboolean mode);
+#endif
 #ifdef HAVE_OPENCL
 int dt_dev_write_scharr_mask_cl(dt_dev_pixelpipe_iop_t *piece,
                                 const cl_mem in,

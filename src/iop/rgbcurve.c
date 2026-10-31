@@ -21,6 +21,7 @@
 #include "common/iop_profile.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/rgb_norms.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 #include "develop/imageop_gui.h"
@@ -1863,6 +1864,50 @@ cleanup:
   dt_ioppr_free_iccprofile_params_cl(&profile_info_cl, &profile_lut_cl,
                                      &dev_profile_info, &dev_profile_lut);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+
+  dt_iop_rgbcurve_data_t *d = piece->data;
+  _generate_curve_lut(piece->pipe, d);
+
+  dt_colorspaces_iccprofile_info_slang_t profile_info;
+  int lut_width, lut_height;
+  float *profile_lut = dt_ioppr_build_iccprofile_params_slang(work_profile, &profile_info,
+                                                              &lut_width, &lut_height);
+  if(!profile_lut) return FALSE;
+
+  const int use_work_profile = (work_profile == NULL) ? 0 : 1;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int autoscale = d->params.curve_autoscale;
+  const int preserve_colors = d->params.preserve_colors;
+
+  const int err = dt_slang_gpu_run_2d_args("rgbcurve", "rgbcurve", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLIMG_IN(d->table[DT_IOP_RGBCURVE_R], 256, 256, 1),
+    SLIMG_IN(d->table[DT_IOP_RGBCURVE_G], 256, 256, 1),
+    SLIMG_IN(d->table[DT_IOP_RGBCURVE_B], 256, 256, 1),
+    SLBUF(d->unbounded_coeffs[0], sizeof(d->unbounded_coeffs[0])),
+    SLBUF(d->unbounded_coeffs[1], sizeof(d->unbounded_coeffs[1])),
+    SLBUF(d->unbounded_coeffs[2], sizeof(d->unbounded_coeffs[2])),
+    SLARG(autoscale), SLARG(preserve_colors),
+    SLBUF(&profile_info, sizeof(profile_info)),
+    SLIMG_IN(profile_lut, lut_width, lut_height, 1),
+    SLARG(use_work_profile));
+
+  free(profile_lut);
+  return !err;
 }
 #endif
 

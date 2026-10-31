@@ -25,6 +25,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/image_cache.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/utility.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -907,6 +908,63 @@ error:
   dt_opencl_release_mem_object(dev_corr);
   dt_opencl_release_mem_object(dev_hsm);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorin_data_t *d = piece->data;
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  // a Lab input profile is a plain copy, left to the CPU
+  if(d->type == DT_COLORSPACE_LAB) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const dt_dev_chroma_t *chr = &self->dev->chroma;
+  const gboolean corrected = chr->late_correction;
+  dt_aligned_pixel_t coeffs = { corrected ? chr->D65coeffs[0] / chr->as_shot[0] : 1.0f,
+                                corrected ? chr->D65coeffs[1] / chr->as_shot[1] : 1.0f,
+                                corrected ? chr->D65coeffs[2] / chr->as_shot[2] : 1.0f,
+                                corrected ? chr->D65coeffs[3] / chr->as_shot[3] : 1.0f };
+
+  float cmat[9], lmat[9];
+  pack_3xSSE_to_3x3(d->nrgb ? d->nmatrix : d->cmatrix, cmat);
+  pack_3xSSE_to_3x3(d->lmatrix, lmat);
+
+  const gboolean blue_mapping = d->blue_mapping
+                           && dt_image_is_matrix_correction_supported(&pipe->image);
+  const float scale = dt_iop_get_processed_maximum(piece);
+  const int use_hsm = d->hsm != NULL;
+  float dummy_hsm = 0.0f;
+  const size_t len = use_hsm ? (size_t)d->hue_div * d->sat_div * d->val_div * 3 : 1;
+
+  const int err = dt_slang_gpu_run_2d_args("basic", d->nrgb ? "colorin_clipping" : "colorin_unbound",
+    width, height, SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLBUF(cmat, sizeof(cmat)), SLBUF(lmat, sizeof(lmat)),
+    SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1), SLIMG_IN(d->lut[2], 256, 256, 1),
+    SLARG(blue_mapping), SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)),
+    SLBUF(coeffs, sizeof(float) * 4), SLARG(scale), SLARG(d->hue_div), SLARG(d->sat_div),
+    SLARG(d->val_div), SLBUF(use_hsm ? d->hsm : &dummy_hsm, sizeof(float) * len),
+    SLARG(d->hsm_encode), SLARG(use_hsm), SLARG(d->hdr_transfer));
+  if(err) return FALSE;
+
+  // only once the kernel ran: on failure the CPU path does this again
+  if(corrected)
+  {
+    for_four_channels(k)
+    {
+      pipe->dsc.temperature.coeffs[k] = chr->D65coeffs[k];
+      pipe->dsc.processed_maximum[k] *= coeffs[k];
+    }
+  }
+  return TRUE;
 }
 #endif
 

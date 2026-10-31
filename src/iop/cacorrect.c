@@ -1212,6 +1212,390 @@ DT_OMP_PRAGMA(barrier)
   dt_free_align(oldraw);
 }
 
+#ifdef HAVE_SLANG_GPU
+// the state that process() keeps across iterations, for the host part of
+// process_slang()
+typedef struct _cacorrect_fit_t
+{
+  int vert_tiles, horiz_tiles;
+  float *blockwt;
+  float (*blockshifts)[2][2];
+  float blockave[2][2], blocksqave[2][2], blockdenom[2][2];
+  int polyord, numpar;
+  double fitparams[2][2][16];
+} _cacorrect_fit_t;
+
+// the part of process() between its two tile loops, from the per-tile sums
+// that cacorrect_tile_sums() leaves in sums. Returns FALSE where process()
+// clears processpasstwo.
+static gboolean _cacorrect_fit(_cacorrect_fit_t *f,
+                               const float *const sums,
+                               const int vtiles,
+                               const int htiles)
+{
+  const float eps = 1e-5f;
+  const float eps2 = 1e-10f;
+  const int horiz_tiles = f->horiz_tiles;
+  const int vert_tiles = f->vert_tiles;
+  float *blockwt = f->blockwt;
+  float (*blockshifts)[2][2] = f->blockshifts;
+
+  for(int kv = 0; kv < vtiles; kv++)
+    for(int kh = 0; kh < htiles; kh++)
+    {
+      const int vblock = kv + 1;
+      const int hblock = kh + 1;
+      const float(*coeff)[3][2] = (const float(*)[3][2])(sums + (kv * htiles + kh) * 12);
+      float CAshift[2][2];
+      for(int c = 0; c < 2; c++)
+        for(int dir = 0; dir < 2; dir++)
+        {
+          if(coeff[dir][2][c] > eps2)
+          {
+            CAshift[dir][c] = coeff[dir][1][c] / coeff[dir][2][c];
+            blockwt[vblock * horiz_tiles + hblock] = coeff[dir][2][c] / (eps + coeff[dir][0][c]);
+          }
+          else
+          {
+            CAshift[dir][c] = 17.0f;
+            blockwt[vblock * horiz_tiles + hblock] = 0;
+          }
+          if(fabsf(CAshift[dir][c]) < 2.0f)
+          {
+            f->blockave[dir][c] += CAshift[dir][c];
+            f->blocksqave[dir][c] += sqrf(CAshift[dir][c]);
+            f->blockdenom[dir][c] += 1;
+          }
+          blockshifts[vblock * horiz_tiles + hblock][c][dir] = CAshift[dir][c];
+        }
+    }
+
+  float blockvar[2][2];
+  for(int dir = 0; dir < 2; dir++)
+    for(int c = 0; c < 2; c++)
+    {
+      if(!f->blockdenom[dir][c])
+      {
+        dt_print(DT_DEBUG_PIPE, "[cacorrect] blockdenom vanishes");
+        return FALSE;
+      }
+      blockvar[dir][c] = f->blocksqave[dir][c] / f->blockdenom[dir][c]
+                         - sqrf(f->blockave[dir][c] / f->blockdenom[dir][c]);
+    }
+
+  for(int vblock = 1; vblock < vert_tiles - 1; vblock++)
+    for(int c = 0; c < 2; c++)
+      for(int i = 0; i < 2; i++)
+      {
+        blockshifts[vblock * horiz_tiles][c][i] = blockshifts[(vblock)*horiz_tiles + 2][c][i];
+        blockshifts[vblock * horiz_tiles + horiz_tiles - 1][c][i] = blockshifts[(vblock)*horiz_tiles + horiz_tiles - 3][c][i];
+      }
+  for(int hblock = 0; hblock < horiz_tiles; hblock++)
+    for(int c = 0; c < 2; c++)
+      for(int i = 0; i < 2; i++)
+      {
+        blockshifts[hblock][c][i] = blockshifts[2 * horiz_tiles + hblock][c][i];
+        blockshifts[(vert_tiles - 1) * horiz_tiles + hblock][c][i] = blockshifts[(vert_tiles - 3) * horiz_tiles + hblock][c][i];
+      }
+
+  double polymat[2][2][256] = { { { 0 } } };
+  double shiftmat[2][2][16] = { { { 0 } } };
+  int numblox[2] = { 0, 0 };
+  const int polyord = f->polyord;
+  const int numpar = f->numpar;
+
+  for(int vblock = 1; vblock < vert_tiles - 1; vblock++)
+    for(int hblock = 1; hblock < horiz_tiles - 1; hblock++)
+      for(int c = 0; c < 2; c++)
+      {
+        float bstemp[2];
+        for(int dir = 0; dir < 2; dir++)
+        {
+          const float p[9] __attribute__((aligned(16))) =
+                { blockshifts[(vblock - 1) * horiz_tiles + hblock - 1][c][dir],
+                  blockshifts[(vblock - 1) * horiz_tiles + hblock    ][c][dir],
+                  blockshifts[(vblock - 1) * horiz_tiles + hblock + 1][c][dir],
+                  blockshifts[(vblock)     * horiz_tiles + hblock - 1][c][dir],
+                  blockshifts[(vblock)     * horiz_tiles + hblock    ][c][dir],
+                  blockshifts[(vblock)     * horiz_tiles + hblock + 1][c][dir],
+                  blockshifts[(vblock + 1) * horiz_tiles + hblock - 1][c][dir],
+                  blockshifts[(vblock + 1) * horiz_tiles + hblock    ][c][dir],
+                  blockshifts[(vblock + 1) * horiz_tiles + hblock + 1][c][dir] };
+          bstemp[dir] = median9f(p);
+        }
+        if(sqrf(bstemp[0]) > caautostrength * blockvar[0][c] || sqrf(bstemp[1]) > caautostrength * blockvar[1][c])
+          continue;
+
+        numblox[c]++;
+        double powVblockInit = 1.0;
+        for(int i = 0; i < polyord; i++)
+        {
+          double powHblockInit = 1.0;
+          for(int j = 0; j < polyord; j++)
+          {
+            double powVblock = powVblockInit;
+            for(int m = 0; m < polyord; m++)
+            {
+              double powHblock = powHblockInit;
+              for(int n = 0; n < polyord; n++)
+              {
+                double inc = powVblock * powHblock * blockwt[vblock * horiz_tiles + hblock];
+                size_t idx = numpar * (polyord * i + j) + (polyord * m + n);
+                polymat[c][0][idx] += inc;
+                polymat[c][1][idx] += inc;
+                powHblock *= hblock;
+              }
+              powVblock *= vblock;
+            }
+            double blkinc = powVblockInit * powHblockInit * blockwt[vblock * horiz_tiles + hblock];
+            shiftmat[c][0][(polyord * i + j)] += blkinc * bstemp[0];
+            shiftmat[c][1][(polyord * i + j)] += blkinc * bstemp[1];
+            powHblockInit *= hblock;
+          }
+          powVblockInit *= vblock;
+        }
+      }
+
+  numblox[1] = MIN(numblox[0], numblox[1]);
+  // process() lowers the order for the later iterations too
+  if(numblox[1] < 32)
+  {
+    f->polyord = 2;
+    f->numpar = 4;
+    if(numblox[1] < 10)
+    {
+      dt_print(DT_DEBUG_PIPE, "[cacorrect] restrict fit to linear, numblox = %d ", numblox[1]);
+      return FALSE;
+    }
+  }
+
+  gboolean ok = TRUE;
+  for(int c = 0; c < 2; c++)
+    for(int dir = 0; dir < 2; dir++)
+      if(!_LinEqSolve(f->numpar, polymat[c][dir], shiftmat[c][dir], f->fitparams[c][dir]))
+      {
+        dt_print(DT_DEBUG_PIPE, "[cacorrect] can't solve linear equations for colour %d direction %d", c, dir);
+        ok = FALSE;
+      }
+  return ok;
+}
+
+// the clamped CA shift of each tile, as the second tile loop of process()
+// computes it: shifts[tile * 4 + color * 2 + dir]
+static void _cacorrect_tile_shifts(const _cacorrect_fit_t *f,
+                                   float *const shifts,
+                                   const int vtiles,
+                                   const int htiles)
+{
+  const int polyord = f->polyord;
+  for(int kv = 0; kv < vtiles; kv++)
+    for(int kh = 0; kh < htiles; kh++)
+    {
+      const int vblock = kv + 1;
+      const int hblock = kh + 1;
+      float lblockshifts[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+      float powVblock = 1.0f;
+      for(int i = 0; i < polyord; i++)
+      {
+        float powHblock = powVblock;
+        for(int j = 0; j < polyord; j++)
+        {
+          lblockshifts[0][0] += powHblock * f->fitparams[0][0][polyord * i + j];
+          lblockshifts[0][1] += powHblock * f->fitparams[0][1][polyord * i + j];
+          lblockshifts[1][0] += powHblock * f->fitparams[1][0][polyord * i + j];
+          lblockshifts[1][1] += powHblock * f->fitparams[1][1][polyord * i + j];
+          powHblock *= hblock;
+        }
+        powVblock *= vblock;
+      }
+      const float bslim = 3.99f;
+      float *s = shifts + (kv * htiles + kh) * 4;
+      s[0] = CLAMPF(lblockshifts[0][0], -bslim, bslim);
+      s[1] = CLAMPF(lblockshifts[0][1], -bslim, bslim);
+      s[2] = CLAMPF(lblockshifts[1][0], -bslim, bslim);
+      s[3] = CLAMPF(lblockshifts[1][1], -bslim, bslim);
+    }
+}
+
+// the colorshift avoidance of process(): the blurred ratios of the red and
+// blue values before and after the correction scale the corrected ones
+static gboolean _cacorrect_avoid_shift(dt_slang_gpu_buffer_t *before,
+                                       dt_slang_gpu_buffer_t *buf,
+                                       const int width,
+                                       const int height,
+                                       const uint32_t filters)
+{
+  const int h_width = (width + 1) / 2;
+  const int h_height = (height + 1) / 2;
+
+  // the row and column parity of the red and the blue sensels, and the plane
+  // that process() completes with the column before its last
+  int prow[3] = { 0 }, pcol[3] = { 0 };
+  for(int row = 0; row < 2; row++)
+  {
+    const int firstCol = FC(row, 0, filters) & 1;
+    const int color = FC(row, firstCol, filters);
+    prow[color] = row;
+    pcol[color] = firstCol;
+  }
+  const int ngRow = 1 - (FC(0, 0, filters) & 1);
+  const int ngCol = FC(ngRow, 0, filters) & 1;
+  const int wcolor = FC(ngRow, ngCol, filters);
+  const int fixrow = height % 2;
+
+  dt_slang_gpu_image_t *red = dt_slang_gpu_image_new(h_width, h_height, 1, NULL);
+  dt_slang_gpu_image_t *blue = dt_slang_gpu_image_new(h_width, h_height, 1, NULL);
+  gboolean ok = red && blue;
+  for(int color = 0; color < 3 && ok; color += 2)
+  {
+    dt_slang_gpu_image_t *factors = color == 0 ? red : blue;
+    const int fixcol = width % 2 && color == wcolor;
+    ok = !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_factors", h_width, h_height,
+                                   SLBUF_DEV(before), SLBUF_DEV(buf), SLIMG_DEV(factors),
+                                   SLARG(width), SLARG(height), SLARG(h_width), SLARG(h_height),
+                                   SLARG(prow[color]), SLARG(pcol[color]), SLARG(fixrow), SLARG(fixcol))
+      && !dt_gaussian_blur_slang(factors, factors, h_width, h_height, 30.0f, 10.0f, 0.1f);
+  }
+  ok = ok && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_apply_factors", width, height,
+                                       SLBUF_DEV(buf), SLIMG_DEV(red), SLIMG_DEV(blue),
+                                       SLARG(width), SLARG(height), SLARG(filters));
+  dt_slang_gpu_image_free(red);
+  dt_slang_gpu_image_free(blue);
+  return ok;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_cacorrect_data_t *d = piece->data;
+  const gboolean run_fast = dt_pipe_is_fast(piece->pipe);
+  const gboolean avoidshift = d->avoidshift && !dt_pipe_is_preview(piece->pipe);
+
+  const uint32_t filters = piece->filters;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const float scaler = dt_iop_get_processed_maximum(piece);
+  const float inv_scaler = 1.0f / scaler;
+  const int dx = roi_out->x;
+  const int dy = roi_out->y;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+
+  const int ewidth = width + 2 * border;
+  const int eheight = height + 2 * border;
+  const int hwidth = (ewidth + 1) / 2;
+  const int step = ts - border2;
+  const int vtiles = (height + border - 1) / step + 1;
+  const int htiles = (width + border - 1) / step + 1;
+
+  const size_t isize = sizeof(float) * width * height;
+  const size_t esize = sizeof(float) * ewidth * eheight;
+  const size_t fsize = sizeof(float) * 6 * eheight * hwidth;
+  size_t available = 0;
+  int max_dim = 0;
+  dt_slang_gpu_memory_info(&available, &max_dim);
+  if(!run_fast && (avoidshift ? 3 : 2) * isize + 3 * esize + fsize > available) return FALSE;
+
+  dt_slang_gpu_buffer_t *cur = dt_slang_gpu_buffer_new_uninit(isize);
+  gboolean ok = cur
+    && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_load", width, height,
+                                 SLIMG_DEV(dev_in), SLBUF_DEV(cur),
+                                 SLARG(width), SLARG(height), SLARG(inv_scaler));
+
+  const int iterations = d->iterations;
+  if(ok && !run_fast && iterations > 0)
+  {
+    dt_slang_gpu_buffer_t *next = dt_slang_gpu_buffer_new_uninit(isize);
+    dt_slang_gpu_buffer_t *raw = dt_slang_gpu_buffer_new_uninit(esize);
+    dt_slang_gpu_buffer_t *green = dt_slang_gpu_buffer_new_uninit(esize);
+    dt_slang_gpu_buffer_t *green2 = dt_slang_gpu_buffer_new_uninit(esize);
+    dt_slang_gpu_buffer_t *filt = dt_slang_gpu_buffer_new_uninit(fsize);
+    dt_slang_gpu_buffer_t *tsums = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 12 * vtiles * htiles);
+
+    _cacorrect_fit_t fit = { 0 };
+    const int vz1 = (height + border2) % (ts - border2) == 0 ? 1 : 0;
+    const int hz1 = (width + border2) % (ts - border2) == 0 ? 1 : 0;
+    fit.vert_tiles = ceilf((float)(height + border2) / (ts - border2) + 2 + vz1);
+    fit.horiz_tiles = ceilf((float)(width + border2) / (ts - border2) + 2 + hz1);
+    fit.blockwt = dt_calloc_align_float(5 * fit.vert_tiles * fit.horiz_tiles);
+    fit.blockshifts = fit.blockwt ? (float(*)[2][2])(fit.blockwt + fit.vert_tiles * fit.horiz_tiles) : NULL;
+    fit.polyord = 4;
+    fit.numpar = 16;
+    float *sums = dt_alloc_align_float(12 * vtiles * htiles);
+    float *shifts = dt_alloc_align_float(4 * vtiles * htiles);
+
+    // the values before the correction, for the colorshift avoidance
+    dt_slang_gpu_buffer_t *before = avoidshift ? dt_slang_gpu_buffer_new_uninit(isize) : NULL;
+    ok = next && raw && green && green2 && filt && tsums && fit.blockwt && sums && shifts
+      && (!avoidshift
+          || (before
+              && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_copy", width, height,
+                                           SLBUF_DEV(cur), SLBUF_DEV(before), SLARG(width), SLARG(height))));
+
+    const int origin = border * ewidth + border;
+    const int zero = 0;
+    gboolean processpasstwo = TRUE;
+    for(int it = 0; it < iterations && ok && processpasstwo; it++)
+    {
+      ok = !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_extend", ewidth, eheight,
+                                     SLBUF_DEV(cur), SLBUF_DEV(raw),
+                                     SLARG(width), SLARG(height), SLARG(zero), SLARG(width))
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_green", ewidth, eheight,
+                                     SLBUF_DEV(raw), SLBUF_DEV(green),
+                                     SLARG(ewidth), SLARG(eheight), SLARG(filters))
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_filters", hwidth, eheight,
+                                     SLBUF_DEV(raw), SLBUF_DEV(green), SLBUF_DEV(filt),
+                                     SLARG(ewidth), SLARG(eheight), SLARG(hwidth), SLARG(filters))
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_tile_sums", 16 * htiles, 16 * vtiles,
+                                     SLBUF_DEV(raw), SLBUF_DEV(green), SLBUF_DEV(filt), SLBUF_DEV(tsums),
+                                     SLARG(width), SLARG(height), SLARG(hwidth), SLARG(htiles),
+                                     SLARG(filters))
+        && !dt_slang_gpu_buffer_read(tsums, sums, sizeof(float) * 12 * vtiles * htiles);
+      if(!ok) break;
+
+      processpasstwo = _cacorrect_fit(&fit, sums, vtiles, htiles);
+      if(!processpasstwo) break;
+
+      _cacorrect_tile_shifts(&fit, shifts, vtiles, htiles);
+      ok = !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_extend", ewidth, eheight,
+                                     SLBUF_DEV(green), SLBUF_DEV(green2),
+                                     SLARG(width), SLARG(height), SLARG(origin), SLARG(ewidth))
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_correct", width, height,
+                                     SLBUF_DEV(raw), SLBUF_DEV(green2),
+                                     SLBUF(shifts, sizeof(float) * 4 * vtiles * htiles), SLBUF_DEV(next),
+                                     SLARG(width), SLARG(height), SLARG(htiles), SLARG(filters));
+      dt_slang_gpu_buffer_t *t = cur;
+      cur = next;
+      next = t;
+    }
+
+    if(ok && avoidshift && processpasstwo) ok = _cacorrect_avoid_shift(before, cur, width, height, filters);
+
+    dt_slang_gpu_buffer_free(before);
+    dt_slang_gpu_buffer_free(next);
+    dt_slang_gpu_buffer_free(raw);
+    dt_slang_gpu_buffer_free(green);
+    dt_slang_gpu_buffer_free(green2);
+    dt_slang_gpu_buffer_free(filt);
+    dt_slang_gpu_buffer_free(tsums);
+    dt_free_align(fit.blockwt);
+    dt_free_align(sums);
+    dt_free_align(shifts);
+  }
+
+  ok = ok && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_store", owidth, oheight,
+                                       SLBUF_DEV(cur), SLIMG_DEV(dev_out),
+                                       SLARG(width), SLARG(owidth), SLARG(oheight),
+                                       SLARG(dx), SLARG(dy), SLARG(scaler));
+  dt_slang_gpu_buffer_free(cur);
+  return ok;
+}
+#endif
+
 /*==================================================================================
  * end raw therapee code
  *==================================================================================*/

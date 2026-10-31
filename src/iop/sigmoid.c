@@ -20,6 +20,7 @@
 #include "common/custom_primaries.h"
 #include "common/math.h"
 #include "common/matrices.h"
+#include "common/slang_gpu.h"
 #include "common/dttypes.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
@@ -884,6 +885,49 @@ cleanup:
   return err;
 }
 #endif // HAVE_OPENCL
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_sigmoid_data_t pipe_d;
+  const dt_iop_sigmoid_data_t *const d = _pipe_data(piece, &pipe_d);
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  int err;
+  if(d->color_processing == DT_SIGMOID_METHOD_PER_CHANNEL)
+  {
+    const dt_iop_order_iccprofile_info_t *pipe_work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+    const dt_iop_order_iccprofile_info_t *base_profile = _get_base_profile(self->dev, pipe_work_profile, d->base_primaries);
+    dt_colormatrix_t pipe_to_base_transposed, base_to_rendering_transposed,
+        rendering_to_pipe_transposed, pipe_to_base, base_to_rendering, rendering_to_pipe;
+    _calculate_adjusted_primaries(d, pipe_work_profile, base_profile, pipe_to_base_transposed, base_to_rendering_transposed, rendering_to_pipe_transposed);
+    transpose_3xSSE(pipe_to_base_transposed, pipe_to_base);
+    transpose_3xSSE(base_to_rendering_transposed, base_to_rendering);
+    transpose_3xSSE(rendering_to_pipe_transposed, rendering_to_pipe);
+
+    err = dt_slang_gpu_run_2d_args("sigmoid", "sigmoid_loglogistic_per_channel", width, height,
+        SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(d->white_target),
+        SLARG(d->paper_exposure), SLARG(d->film_fog), SLARG(d->film_power), SLARG(d->paper_power),
+        SLARG(d->hue_preservation), SLBUF(pipe_to_base, sizeof(pipe_to_base)),
+        SLBUF(base_to_rendering, sizeof(base_to_rendering)), SLBUF(rendering_to_pipe, sizeof(rendering_to_pipe)));
+  }
+  else
+  {
+    err = dt_slang_gpu_run_2d_args("sigmoid", "sigmoid_loglogistic_rgb_ratio", width, height,
+        SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+        SLARG(d->white_target), SLARG(d->black_target), SLARG(d->paper_exposure),
+        SLARG(d->film_fog), SLARG(d->film_power), SLARG(d->paper_power));
+  }
+  return !err;
+}
+#endif
 
 void init_global(dt_iop_module_so_t *self)
 {

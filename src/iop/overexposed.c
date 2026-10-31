@@ -20,6 +20,7 @@
 #include <cairo.h>
 
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
 #include "control/control.h"
@@ -362,6 +363,53 @@ error:
   dt_ioppr_free_iccprofile_params_cl(&profile_info_cl, &profile_lut_cl, &dev_profile_info, &dev_profile_lut);
   dt_opencl_release_mem_object(dev_tmp);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_develop_t *dev = self->dev;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  const dt_iop_order_iccprofile_info_t *const current_profile = dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_histogram_profile_info(dev);
+
+  // display mask using histogram profile as output
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  gboolean ok = dev_tmp
+    && dt_ioppr_transform_image_colorspace_rgb_slang(dev_in, dev_tmp, width, height,
+                                                     current_profile, work_profile, self->op);
+
+  dt_colorspaces_iccprofile_info_slang_t info;
+  int lut_w = 0, lut_h = 0;
+  float *lut = ok ? dt_ioppr_build_iccprofile_params_slang(work_profile, &info, &lut_w, &lut_h) : NULL;
+
+  const float lower = exp2f(fminf(dev->overexposed.lower, -4.f));   // in EV
+  const float upper = dev->overexposed.upper / 100.0f;              // in %
+  const int colorscheme = dev->overexposed.colorscheme;
+  const int use_work_profile = work_profile == NULL ? 0 : 1;
+  const int mode = dev->overexposed.mode;
+
+  ok = lut
+    && !dt_slang_gpu_run_2d_args("basic", "overexposed", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLIMG_DEV(dev_tmp),
+                                 SLARG(width), SLARG(height), SLARG(lower), SLARG(upper),
+                                 SLARG(dt_iop_overexposed_colors[colorscheme][1]),
+                                 SLARG(dt_iop_overexposed_colors[colorscheme][0]),
+                                 SLBUF(&info, sizeof(info)), SLIMG_IN(lut, lut_w, lut_h, 1),
+                                 SLARG(use_work_profile), SLARG(mode));
+  free(lut);
+  dt_slang_gpu_image_free(dev_tmp);
+  return ok;
 }
 #endif
 

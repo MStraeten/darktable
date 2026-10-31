@@ -26,6 +26,7 @@
 #include "common/image_cache.h"
 #include "common/mipmap_cache.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -538,6 +539,30 @@ int process_cl(dt_iop_module_t *self,
 
 error:
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_exposure_data_t *d = piece->data;
+
+  _process_common_setup(self, piece);
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  if(dt_slang_gpu_run_2d_args("basic", "exposure", width, height,
+                              SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                              SLARG(d->black), SLARG(d->scale)))
+    return FALSE;
+  for(int k = 0; k < 3; k++) piece->pipe->dsc.processed_maximum[k] *= d->scale;
+  return TRUE;
 }
 #endif
 

@@ -21,6 +21,7 @@
 #include "common/debug.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -1068,6 +1069,207 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 error:
   dt_iop_colorreconstruct_bilateral_free_cl(b);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// the grid of dt_iop_colorreconstruct_bilateral_t on the device of the Slang
+// kernels, in grid; grid_tmp holds the splat and the blur passes
+typedef struct dt_iop_colorreconstruct_bilateral_slang_t
+{
+  int size_x, size_y, size_z;
+  int width, height, x, y;
+  float scale;
+  float sigma_s, sigma_r;
+  dt_slang_gpu_buffer_t *grid, *grid_tmp;
+} dt_iop_colorreconstruct_bilateral_slang_t;
+
+static void _bilateral_free_slang(dt_iop_colorreconstruct_bilateral_slang_t *b)
+{
+  if(!b) return;
+  dt_slang_gpu_buffer_free(b->grid);
+  dt_slang_gpu_buffer_free(b->grid_tmp);
+  free(b);
+}
+
+static size_t _bilateral_size_slang(const dt_iop_colorreconstruct_bilateral_slang_t *b)
+{
+  return sizeof(dt_iop_colorreconstruct_Lab_t) * b->size_x * b->size_y * b->size_z;
+}
+
+// the grid of dt_iop_colorreconstruct_bilateral_init(), or of the frozen one
+// when bf is not NULL
+static dt_iop_colorreconstruct_bilateral_slang_t *_bilateral_init_slang(const dt_iop_roi_t *roi,
+                                                                        const float iscale,
+                                                                        const float sigma_s,
+                                                                        const float sigma_r,
+                                                                        const dt_iop_colorreconstruct_bilateral_frozen_t *bf)
+{
+  dt_iop_colorreconstruct_bilateral_slang_t *b = calloc(1, sizeof(dt_iop_colorreconstruct_bilateral_slang_t));
+  if(!b) return NULL;
+
+  if(bf)
+  {
+    b->size_x = bf->size_x;
+    b->size_y = bf->size_y;
+    b->size_z = bf->size_z;
+    b->width = bf->width;
+    b->height = bf->height;
+    b->x = bf->x;
+    b->y = bf->y;
+    b->scale = bf->scale;
+    b->sigma_s = bf->sigma_s;
+    b->sigma_r = bf->sigma_r;
+  }
+  else
+  {
+    const float _x = roundf(roi->width / sigma_s);
+    const float _y = roundf(roi->height / sigma_s);
+    const float _z = roundf(100.0f / sigma_r);
+    b->size_x = CLAMPS((int)_x, 4, DT_COLORRECONSTRUCT_BILATERAL_MAX_RES_S) + 1;
+    b->size_y = CLAMPS((int)_y, 4, DT_COLORRECONSTRUCT_BILATERAL_MAX_RES_S) + 1;
+    b->size_z = CLAMPS((int)_z, 4, DT_COLORRECONSTRUCT_BILATERAL_MAX_RES_R) + 1;
+    b->width = roi->width;
+    b->height = roi->height;
+    b->x = roi->x;
+    b->y = roi->y;
+    b->scale = iscale / roi->scale;
+    b->sigma_s = MAX(roi->height / (b->size_y - 1.0f), roi->width / (b->size_x - 1.0f));
+    b->sigma_r = 100.0f / (b->size_z - 1.0f);
+  }
+
+  // the splat writes every grid point, and the slice reads a thawed grid as
+  // it is
+  const size_t size = _bilateral_size_slang(b);
+  b->grid = bf ? dt_slang_gpu_buffer_new(size, bf->buf) : dt_slang_gpu_buffer_new_uninit(size);
+  b->grid_tmp = bf ? NULL : dt_slang_gpu_buffer_new_uninit(size);
+  if(!b->grid || (!bf && !b->grid_tmp))
+  {
+    _bilateral_free_slang(b);
+    return NULL;
+  }
+  return b;
+}
+
+static dt_iop_colorreconstruct_bilateral_frozen_t *_bilateral_freeze_slang(dt_iop_colorreconstruct_bilateral_slang_t *b)
+{
+  dt_iop_colorreconstruct_bilateral_frozen_t *bf = malloc(sizeof(dt_iop_colorreconstruct_bilateral_frozen_t));
+  if(!bf) return NULL;
+
+  bf->size_x = b->size_x;
+  bf->size_y = b->size_y;
+  bf->size_z = b->size_z;
+  bf->width = b->width;
+  bf->height = b->height;
+  bf->x = b->x;
+  bf->y = b->y;
+  bf->scale = b->scale;
+  bf->sigma_s = b->sigma_s;
+  bf->sigma_r = b->sigma_r;
+  bf->buf = dt_alloc_align_type(dt_iop_colorreconstruct_Lab_t, b->size_x * b->size_y * b->size_z);
+  if(!bf->buf || dt_slang_gpu_buffer_read(b->grid, bf->buf, _bilateral_size_slang(b)))
+  {
+    dt_iop_colorreconstruct_bilateral_dump(bf);
+    return NULL;
+  }
+  return bf;
+}
+
+// the splat goes to grid_tmp, and the passes of
+// dt_iop_colorreconstruct_bilateral_blur_cl() end in grid
+static int _bilateral_splat_blur_slang(dt_iop_colorreconstruct_bilateral_slang_t *b,
+                                       dt_slang_gpu_image_t *in,
+                                       const float threshold,
+                                       const int precedence,
+                                       const float *params)
+{
+  const dt_slang_arg_t arg_params = { DT_SLANG_ARG_VALUE, params, 4 * sizeof(float), 0, 0, 0 };
+  const int sx = b->size_x, sy = b->size_y, sz = b->size_z;
+  const int sxy = sx * sy, one = 1;
+  return dt_slang_gpu_run_2d_args("colorreconstruction", "colorreconstruction_splat", sx, sy,
+           SLIMG_DEV(in), SLBUF_DEV(b->grid_tmp), SLARG(b->width), SLARG(b->height),
+           SLARG(sx), SLARG(sy), SLARG(sz), SLARG(b->sigma_s), SLARG(b->sigma_r), SLARG(threshold),
+           SLARG(precedence), arg_params)
+    || dt_slang_gpu_run_2d_args("colorreconstruction", "colorreconstruction_blur_line", sz, sy,
+           SLBUF_DEV(b->grid_tmp), SLBUF_DEV(b->grid),
+           SLARG(sxy), SLARG(sx), SLARG(one), SLARG(sz), SLARG(sy), SLARG(sx))
+    || dt_slang_gpu_run_2d_args("colorreconstruction", "colorreconstruction_blur_line", sz, sx,
+           SLBUF_DEV(b->grid), SLBUF_DEV(b->grid_tmp),
+           SLARG(sxy), SLARG(one), SLARG(sx), SLARG(sz), SLARG(sx), SLARG(sy))
+    || dt_slang_gpu_run_2d_args("colorreconstruction", "colorreconstruction_blur_line", sx, sy,
+           SLBUF_DEV(b->grid_tmp), SLBUF_DEV(b->grid),
+           SLARG(one), SLARG(sx), SLARG(sxy), SLARG(sx), SLARG(sy), SLARG(sz));
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorreconstruct_data_t *d = piece->data;
+  dt_iop_colorreconstruct_gui_data_t *g = self->gui_data;
+  if(piece->colors != 4) return FALSE;
+
+  // the parameters of process(), which differ from those of process_cl()
+  // when zoomed in past 100%
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float sigma_r = fmax(d->range, 0.1f);
+  const float sigma_s = fmax(d->spatial, 1.0f) / scale;
+  const float hue = hue_conversion(d->hue); // convert to LCH hue which better fits to Lab colorspace
+  const float params[4] = { hue, M_PI_F * M_PI_F / 8.0f, 0.0f, 0.0f };
+  const int precedence = d->precedence;
+
+  // see process() for more details on how we transfer a bilateral grid from the preview to the full pipeline
+  dt_iop_colorreconstruct_bilateral_slang_t *b = NULL;
+  int err = 0;
+  if(sigma_s > DT_COLORRECONSTRUCT_SPATIAL_APPROX
+     && self->dev->gui_attached
+     && g
+     && dt_pipe_is_full(piece->pipe)
+     && dt_dev_get_zoomed_in() > 1.05f)
+  {
+    if(!dt_dev_sync_pixelpipe_hash(self->dev, piece->pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL, &self->gui_lock, &g->hash))
+      dt_control_log(_("inconsistent output"));
+
+    dt_iop_gui_enter_critical_section(self);
+    if(g->can) b = _bilateral_init_slang(roi_in, piece->iscale, sigma_s, sigma_r, g->can);
+    err = g->can && !b;
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  if(!b && !err)
+  {
+    b = _bilateral_init_slang(roi_in, piece->iscale, sigma_s, sigma_r, NULL);
+    err = !b || _bilateral_splat_blur_slang(b, dev_in, d->threshold, precedence, params);
+  }
+
+  if(!err)
+  {
+    const int bxy[2] = { b->x, b->y };
+    const int roixy[2] = { roi_in->x, roi_in->y };
+    const float rescale = piece->iscale / (roi_in->scale * b->scale);
+    err = dt_slang_gpu_run_2d_args("colorreconstruction", "colorreconstruction_slice", roi_in->width, roi_in->height,
+            SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLBUF_DEV(b->grid), SLARG(roi_in->width), SLARG(roi_in->height),
+            SLARG(b->size_x), SLARG(b->size_y), SLARG(b->size_z), SLARG(b->sigma_s), SLARG(b->sigma_r),
+            SLARG(d->threshold), SLARG(bxy), SLARG(roixy), SLARG(rescale));
+  }
+
+  // here is where we generate the canned bilateral grid of the preview pipe for later use
+  if(!err && self->dev->gui_attached && g && dt_pipe_is_preview(piece->pipe))
+  {
+    dt_hash_t hash = dt_dev_hash_plus(self->dev, piece->pipe, self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL);
+    dt_iop_colorreconstruct_bilateral_frozen_t *can = _bilateral_freeze_slang(b);
+    dt_iop_gui_enter_critical_section(self);
+    dt_iop_colorreconstruct_bilateral_dump(g->can);
+    g->can = can;
+    g->hash = hash;
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  _bilateral_free_slang(b);
+  return !err;
 }
 #endif
 

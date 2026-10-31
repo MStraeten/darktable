@@ -25,6 +25,7 @@
 #include "common/debug.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -934,6 +935,49 @@ int process_cl(dt_iop_module_t *self,
   return dt_opencl_enqueue_kernel_2d_args(devid, kernel, width, height,
     CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(data->color), CLARG(density),
     CLARG(length_base), CLARG(length_inc_x), CLARG(length_inc_y));
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_graduatednd_data_t *data = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const int ix = (roi_in->x);
+  const int iy = (roi_in->y);
+  const float iw = piece->buf_in.width * roi_out->scale;
+  const float ih = piece->buf_in.height * roi_out->scale;
+  const float hw = iw / 2.0f;
+  const float hh = ih / 2.0f;
+  const float hw_inv = 1.0f / hw;
+  const float hh_inv = 1.0f / hh;
+  const float v = deg2radf(-data->rotation);
+  const float sinv = sinf(v);
+  const float cosv = cosf(v);
+  const float filter_radie = hypotf(hh, hw) / hh;
+  const float offset = data->offset / 100.0f * 2.0f;
+  const float density = data->density;
+
+  const float filter_hardness = (1.0f / filter_radie)
+                                / (1.0f - (0.5f + (data->hardness / 100.0f) * 0.9f / 2.0f)) * 0.5f;
+
+  const float length_base = (sinv * (-1.0 + ix * hw_inv) - cosv * (-1.0f + iy * hh_inv) - 1.0f + offset)
+                            * filter_hardness;
+  const float length_inc_y = -cosv * hh_inv * filter_hardness;
+  const float length_inc_x = sinv * hw_inv * filter_hardness;
+
+  return !dt_slang_gpu_run_2d_args("extended", "graduatednd", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(data->color), SLARG(density), SLARG(length_base),
+                                   SLARG(length_inc_x), SLARG(length_inc_y));
 }
 #endif
 
