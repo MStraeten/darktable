@@ -2108,6 +2108,76 @@ static void _slang_release(dt_dev_pixelpipe_t *pipe)
   pipe->slang_host_valid = FALSE;
 }
 
+// the color picker for an image on the device. Where the device can't reduce
+// it, the picker runs on the host: on host if that holds the image, else on
+// a copy read back from the device
+static void _pixelpipe_picker_slang(dt_iop_module_t *module,
+                                    dt_dev_pixelpipe_iop_t *piece,
+                                    dt_iop_buffer_dsc_t *dsc,
+                                    dt_slang_gpu_image_t *img,
+                                    const float *host,
+                                    const dt_iop_roi_t *roi,
+                                    float *picked_color,
+                                    float *picked_color_min,
+                                    float *picked_color_max,
+                                    const dt_iop_colorspace_type_t image_cst,
+                                    const dt_pixelpipe_picker_source_t picker_source)
+{
+  int box[4] = { 0 };
+  lib_colorpicker_stats pick;
+  const gboolean denoise = darktable.lib->proxy.colorpicker.primary_sample->denoise;
+  if(dt_color_picker_box(module, roi, darktable.lib->proxy.colorpicker.primary_sample, picker_source, box))
+  {
+    for_four_channels(k)
+    {
+      picked_color_min[k] = FLT_MAX;
+      picked_color_max[k] = -FLT_MAX;
+      picked_color[k] = 0.0f;
+    }
+    return;
+  }
+
+  if(!dt_color_picker_helper_slang(dsc, img, roi, box, denoise, pick, image_cst,
+                                   dt_iop_color_picker_get_active_cst(module),
+                                   dt_ioppr_get_pipe_current_profile_info(module, piece->pipe)))
+  {
+    float *copy = NULL;
+    if(!host)
+    {
+      copy = dt_iop_image_alloc(roi->width, roi->height, dsc->channels);
+      if(copy && dt_slang_gpu_image_read(img, copy))
+      {
+        dt_free_align(copy);
+        copy = NULL;
+      }
+    }
+    if(host || copy)
+      _pixelpipe_picker(module, piece, dsc, host ? host : copy, roi,
+                        picked_color, picked_color_min, picked_color_max, image_cst, picker_source);
+    dt_free_align(copy);
+    return;
+  }
+
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_PICKER,
+                picker_source == PIXELPIPE_PICKER_INPUT
+                  ? "pixelpipe IN picker slang"
+                  : "pixelpipe OUT picker slang",
+                piece->pipe, module, DT_DEVICE_NONE, roi, NULL,
+                "%s -> %s (%s), %sbox %i/%i -- %i/%i",
+                dt_iop_colorspace_to_name(dsc->cst),
+                dt_iop_colorspace_to_name(image_cst),
+                dt_iop_colorspace_to_name(dt_iop_color_picker_get_active_cst(module)),
+                denoise ? "denoised " : "",
+                box[0], box[1], box[2], box[3]);
+
+  for_four_channels(k)
+  {
+    picked_color_min[k] = pick[DT_PICK_MIN][k];
+    picked_color_max[k] = pick[DT_PICK_MAX][k];
+    picked_color[k] = pick[DT_PICK_MEAN][k];
+  }
+}
+
 // the downscale of a non-raw input in the pipe's first step, as the OpenCL
 // path of dt_dev_pixelpipe_process_rec() does it. The result stays on the
 // device as the first module's input, like the output of process_slang(), and
@@ -2332,8 +2402,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   // on the host
   const gboolean histogram = (dev->gui_attached || !(piece->request_histogram & DT_REQUEST_ONLY_IN_GUI))
                              && (piece->request_histogram & DT_REQUEST_ON);
-  // the color picker reads the input and output on the host, as the
-  // OpenCL path does after reading them back
+  // the color picker reduces the input and output on the device
   const gboolean picking = _request_color_pick(pipe, dev, module);
   const dt_iop_order_iccprofile_info_t *const work_profile =
     input_format->cst != IOP_CS_RAW ? dt_ioppr_get_pipe_work_profile_info(pipe) : NULL;
@@ -2343,12 +2412,12 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     _slang_release(pipe);
     return 0;
   }
-  if(resident && (important_input || histogram || picking) && !_slang_sync_host(pipe)) return -1;
+  if(resident && (important_input || histogram) && !_slang_sync_host(pipe)) return -1;
 
   // a colorspace conversion of the input runs on the device if it can, and
   // the histogram is taken from the converted input
   dt_slang_gpu_image_t *dev_in = NULL;
-  if(convert && !histogram && !picking)
+  if(convert && !histogram)
   {
     dt_slang_gpu_image_t *src = resident
       ? pipe->slang_image
@@ -2438,6 +2507,13 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     return 0;
   }
 
+  if(picking)
+    _pixelpipe_picker_slang(module, piece, &piece->dsc_in, dev_in,
+                            converted || (!converted_on_device && !raw_u16 && (!on_device || pipe->slang_host_valid))
+                              ? host_in : NULL,
+                            roi_in, module->picked_color, module->picked_color_min,
+                            module->picked_color_max, cst_to, PIXELPIPE_PICKER_INPUT);
+
   // a resident input converted on the device is released only now, as the
   // CPU fallback above needs it on the host
   if(!on_device) dt_slang_gpu_image_free(dev_in);
@@ -2447,7 +2523,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   pipe->slang_host = *output;
   pipe->slang_host_valid = FALSE;
   // important cachelines are kept for the GUI, and the NaN check reads the output
-  if((important_out || picking || (darktable.unmuted & DT_DEBUG_NAN)) && !_slang_sync_host(pipe))
+  if((important_out || (darktable.unmuted & DT_DEBUG_NAN)) && !_slang_sync_host(pipe))
   {
     dt_free_align(converted);
     return -1;
@@ -2457,17 +2533,12 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   {
     dt_iop_buffer_dsc_t dsc_out = pipe->dsc;
     dsc_out.cst = cst_out;
-    _pixelpipe_picker(module, piece, &piece->dsc_in, host_in, roi_in,
-                      module->picked_color,
-                      module->picked_color_min,
-                      module->picked_color_max,
-                      cst_to, PIXELPIPE_PICKER_INPUT);
-
-    _pixelpipe_picker(module, piece, &dsc_out, (float *)(*output), roi_out,
-                      module->picked_output_color,
-                      module->picked_output_color_min,
-                      module->picked_output_color_max,
-                      cst_out, PIXELPIPE_PICKER_OUTPUT);
+    _pixelpipe_picker_slang(module, piece, &dsc_out, dev_out,
+                            pipe->slang_host_valid ? (float *)(*output) : NULL, roi_out,
+                            module->picked_output_color,
+                            module->picked_output_color_min,
+                            module->picked_output_color_max,
+                            cst_out, PIXELPIPE_PICKER_OUTPUT);
 
     DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_CONTROL_PICKERDATA_READY, module, pipe);
   }
