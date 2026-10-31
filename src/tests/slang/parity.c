@@ -318,6 +318,7 @@ static void markesteijn_hex(const uint8_t (*const xtrans)[6], signed char allhex
 #define FLOAT4_BUF(n, a, b, c, d) { .kind = ARG_FLOAT4_BUF, .name = n, .v = { a, b, c, d } }
 #define SLANG_INT(n, val) { .kind = ARG_INT, .name = n, .i = val, .slang_only = 1 }
 #define SLANG_BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz, .slang_only = 1 }
+#define CL_BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz, .cl_only = 1 }
 #define SLANG_RAW_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = 1, .pixels = px, \
                               .slang_only = 1 }
 #define CHAR2(n, a, b) { .kind = ARG_CHAR2, .name = n, .iv = { a, b } }
@@ -2040,9 +2041,12 @@ static int make_tests(test_t *t)
   // lens correction. The lensfun kernels sample at coordinates that lensfun
   // computes on the host, one pair per color: a mild barrel distortion with
   // some lateral chromatic aberration, which runs off the image at the edges,
-  // and with the nan checks a few invalid coordinates
+  // and with the nan checks a few invalid coordinates. OpenCL reads them from
+  // a grid, given here with a step of 1 and a row of W points, which is the
+  // per-pixel layout of the Slang kernels; the extra row and point are only
+  // read by OpenCL, with a weight of zero
   {
-    static float ln_pi[2][2 * 3 * W * H];
+    static float ln_pi[2][2 * 3 * (W * (H + 1) + 1)];
     for(int v = 0; v < 2; v++)
       for(int y = 0; y < H; y++)
         for(int x = 0; x < W; x++)
@@ -2070,14 +2074,21 @@ static int make_tests(test_t *t)
         TEST_TOL(ln_labels[v][d], "basic", ln_kernels[d], 1e-4,
                  IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
                  INT("iwidth", W), INT("iheight", H), INT("roi_in_x", 7), INT("roi_in_y", -3),
-                 BUFFER("pi", ln_pi[v], sizeof(ln_pi[v])), INT("do_nan_checks", v));
+                 BUFFER("pi", ln_pi[v], sizeof(ln_pi[v])), INT("do_nan_checks", v),
+                 INT("step", 1), INT("gwidth", W));
 
-    // lensfun's vignetting correction factors, halved, four to a pixel
-    static float ln_vig[4 * W * H];
-    for(int k = 0; k < 4 * W * H; k++) ln_vig[k] = 0.5f + 0.3f * image_in[(k + 4 * 11) % (4 * W * H)];
+    // lensfun's vignetting correction factors, four to a pixel: whole on the
+    // OpenCL grid, halved for the Slang kernel, which doubles them
+    static float ln_vig[4 * (W * (H + 1) + 1)], ln_vig_half[4 * W * H];
+    for(int k = 0; k < 4 * W * H; k++)
+    {
+      ln_vig_half[k] = 0.5f + 0.3f * image_in[(k + 4 * 11) % (4 * W * H)];
+      ln_vig[k] = 2.0f * ln_vig_half[k];
+    }
     TEST("lens_vignette", "basic", "lens_vignette",
          IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
-         BUFFER("pi", ln_vig, sizeof(ln_vig)));
+         CL_BUFFER("pi", ln_vig, sizeof(ln_vig)), SLANG_BUFFER("pi", ln_vig_half, sizeof(ln_vig_half)),
+         INT("step", 1), INT("gwidth", W));
 
     // the manual vignette spline, as _init_vignette_spline() makes it
     static float ln_spline[512];
@@ -2888,6 +2899,7 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
   for(int a = 0; a < t->nargs; a++)
   {
     const arg_t *arg = &t->args[a];
+    if(arg->cl_only) continue;
     const spv_param_t *p = spv_find(&info, arg->name);
     if(!p)
     {
