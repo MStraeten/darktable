@@ -496,7 +496,13 @@ jobs:
           # where it is, so the release would keep pointing at the first push
           git push origin --delete nightly_${{ github.ref_name }} || true
           git tag nightly_${{ github.ref_name }}
-          git push origin nightly_${{ github.ref_name }}
+          # once the tag is gone GitHub turns the release into a hidden draft,
+          # so a transient server error here must not leave it deleted
+          for delay in 2 4 8 16 0; do
+            git push origin nightly_${{ github.ref_name }} && break
+            [ "$delay" = 0 ] && exit 1
+            sleep "$delay"
+          done
           popd
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
