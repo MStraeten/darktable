@@ -749,7 +749,6 @@ void filmic_mask_clipped_pixels(uint3 gid : SV_DispatchThreadID,
   const float argument = -pix_max * normalize + feathering;
   const float weight = clipf(1.0f / (1.0f + dtcl_exp2(argument)));
 
-  // the OpenCL kernel increments without an atomic and may undercount
   if(4.f > argument) InterlockedAdd(clipped[0], 1);
   out.write(int2(x, y), float4(weight));
 }
