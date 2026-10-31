@@ -318,7 +318,6 @@ static void markesteijn_hex(const uint8_t (*const xtrans)[6], signed char allhex
 #define FLOAT4_BUF(n, a, b, c, d) { .kind = ARG_FLOAT4_BUF, .name = n, .v = { a, b, c, d } }
 #define SLANG_INT(n, val) { .kind = ARG_INT, .name = n, .i = val, .slang_only = 1 }
 #define SLANG_BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz, .slang_only = 1 }
-#define CL_BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz, .cl_only = 1 }
 #define SLANG_RAW_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = 1, .pixels = px, \
                               .slang_only = 1 }
 #define CHAR2(n, a, b) { .kind = ARG_CHAR2, .name = n, .iv = { a, b } }
@@ -2041,54 +2040,58 @@ static int make_tests(test_t *t)
   // lens correction. The lensfun kernels sample at coordinates that lensfun
   // computes on the host, one pair per color: a mild barrel distortion with
   // some lateral chromatic aberration, which runs off the image at the edges,
-  // and with the nan checks a few invalid coordinates. OpenCL reads them from
-  // a grid, given here with a step of 1 and a row of W points, which is the
-  // per-pixel layout of the Slang kernels; the extra row and point are only
-  // read by OpenCL, with a weight of zero
+  // and with the nan checks a few invalid coordinates. They read them from a
+  // grid of every step-th pixel, as _lens_grid_build() makes it: a step of 1
+  // with a row of W points, padded by the row and point read with a weight of
+  // zero, and a step of 4 that the kernels interpolate
   {
-    static float ln_pi[2][2 * 3 * (W * (H + 1) + 1)];
-    for(int v = 0; v < 2; v++)
-      for(int y = 0; y < H; y++)
-        for(int x = 0; x < W; x++)
+    enum { LS = 4, LGW = (W - 1) / LS + 2, LGH = (H - 1) / LS + 2 };
+    static float ln_pi[2][2 * 3 * (W * (H + 1) + 1)], ln_grid[2 * 3 * LGW * LGH];
+    for(int v = 0; v < 3; v++)
+    {
+      const int step = v == 2 ? LS : 1, gw = v == 2 ? LGW : W, gh = v == 2 ? LGH : H;
+      for(int j = 0; j < gh; j++)
+        for(int i = 0; i < gw; i++)
         {
-          const float cx = x - 0.5f * W, cy = y - 0.5f * H;
+          const float cx = i * step - 0.5f * W, cy = j * step - 0.5f * H;
           const float r2 = (cx * cx + cy * cy) / (0.25f * W * W);
           for(int c = 0; c < 3; c++)
           {
             const float k = 0.97f + 0.04f * r2 + 0.003f * (c - 1);
-            float *p = ln_pi[v] + 6 * (y * W + x) + 2 * c;
+            float *p = (v == 2 ? ln_grid : ln_pi[v]) + 6 * (j * gw + i) + 2 * c;
             p[0] = 0.5f * W + k * cx + 7.0f;
             p[1] = 0.5f * H + k * cy - 3.0f;
-            if(v == 1 && (x * 7 + y * 13) % 101 == 0) p[c & 1] = NAN;
+            if(v == 1 && (i * 7 + j * 13) % 101 == 0) p[c & 1] = NAN;
           }
         }
+    }
     static const char *ln_kernels[4] = { "lens_distort_bilinear", "lens_distort_bicubic",
                                          "lens_distort_lanczos2", "lens_distort_lanczos3" };
-    static const char *ln_labels[2][4] = {
+    static const char *ln_labels[3][4] = {
       { "lens_distort_bilinear", "lens_distort_bicubic", "lens_distort_lanczos2", "lens_distort_lanczos3" },
-      { "lens_distort_bilinear nan", "lens_distort_bicubic nan", "lens_distort_lanczos2 nan", "lens_distort_lanczos3 nan" } };
+      { "lens_distort_bilinear nan", "lens_distort_bicubic nan", "lens_distort_lanczos2 nan", "lens_distort_lanczos3 nan" },
+      { "lens_distort_bilinear grid", "lens_distort_bicubic grid", "lens_distort_lanczos2 grid", "lens_distort_lanczos3 grid" } };
     // for blue the bicubic kernel weighs clamped taps, whose weights can
     // nearly cancel: one pixel here lands 2.4e-5 away on lavapipe
-    for(int v = 0; v < 2; v++)
+    for(int v = 0; v < 3; v++)
       for(int d = 0; d < 4; d++)
         TEST_TOL(ln_labels[v][d], "basic", ln_kernels[d], 1e-4,
                  IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
                  INT("iwidth", W), INT("iheight", H), INT("roi_in_x", 7), INT("roi_in_y", -3),
-                 BUFFER("pi", ln_pi[v], sizeof(ln_pi[v])), INT("do_nan_checks", v),
-                 INT("step", 1), INT("gwidth", W));
+                 BUFFER("pi", v == 2 ? ln_grid : ln_pi[v], v == 2 ? sizeof(ln_grid) : sizeof(ln_pi[v])),
+                 INT("do_nan_checks", v == 1), INT("step", v == 2 ? LS : 1), INT("gwidth", v == 2 ? LGW : W));
 
-    // lensfun's vignetting correction factors, four to a pixel: whole on the
-    // OpenCL grid, halved for the Slang kernel, which doubles them
-    static float ln_vig[4 * (W * (H + 1) + 1)], ln_vig_half[4 * W * H];
-    for(int k = 0; k < 4 * W * H; k++)
-    {
-      ln_vig_half[k] = 0.5f + 0.3f * image_in[(k + 4 * 11) % (4 * W * H)];
-      ln_vig[k] = 2.0f * ln_vig_half[k];
-    }
+    // lensfun's vignetting correction factors, four to a pixel, per pixel and
+    // on a grid of step 4
+    static float ln_vig[4 * (W * (H + 1) + 1)], ln_vig_grid[4 * LGW * LGH];
+    for(int k = 0; k < 4 * W * H; k++) ln_vig[k] = 1.0f + 0.6f * image_in[(k + 4 * 11) % (4 * W * H)];
+    for(int k = 0; k < 4 * LGW * LGH; k++) ln_vig_grid[k] = 1.0f + 0.6f * image_in[(k * 5 + 4 * 11) % (4 * W * H)];
     TEST("lens_vignette", "basic", "lens_vignette",
          IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
-         CL_BUFFER("pi", ln_vig, sizeof(ln_vig)), SLANG_BUFFER("pi", ln_vig_half, sizeof(ln_vig_half)),
-         INT("step", 1), INT("gwidth", W));
+         BUFFER("pi", ln_vig, sizeof(ln_vig)), INT("step", 1), INT("gwidth", W));
+    TEST("lens_vignette grid", "basic", "lens_vignette",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         BUFFER("pi", ln_vig_grid, sizeof(ln_vig_grid)), INT("step", LS), INT("gwidth", LGW));
 
     // the manual vignette spline, as _init_vignette_spline() makes it
     static float ln_spline[512];
@@ -2899,7 +2902,6 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
   for(int a = 0; a < t->nargs; a++)
   {
     const arg_t *arg = &t->args[a];
-    if(arg->cl_only) continue;
     const spv_param_t *p = spv_find(&info, arg->name);
     if(!p)
     {

@@ -59,7 +59,6 @@ typedef struct arg_t
   int bytes;        // ARG_BUFFER_OUT holds bytes, compared exactly
   int ints;         // ARG_BUFFER_OUT holds int counts, compared as numbers
   int slang_only;   // a Slang parameter the OpenCL kernel does not have
-  int cl_only;      // an OpenCL parameter, where Slang takes another of the same name
 } arg_t;
 
 typedef struct test_t

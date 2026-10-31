@@ -166,7 +166,7 @@ void mtl_run(const char *dir, const test_t *t, void **outs)
     {
       const arg_t *arg = &t->args[a];
       NSString *an = @(arg->name);
-      if(arg->kind == ARG_LOCAL || arg->cl_only) continue;
+      if(arg->kind == ARG_LOCAL) continue;
       id<MTLBinding> b = bindings[an];
       NSArray<NSNumber *> *member = members[an];
       if(!b && !member)

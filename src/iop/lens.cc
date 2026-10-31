@@ -3541,15 +3541,6 @@ static int _process_slang_lf(dt_iop_module_t *self,
   const int roi_in_y = roi_in->y;
   const int width = MAX(iwidth, owidth);
   const int height = MAX(iheight, oheight);
-  // lens_vignette reads four factors per pixel
-  const int ch = 4;
-  const int tmpbufwidth = owidth * 2 * 3;
-  const size_t tmpbufsize = (size_t)tmpbufwidth * oheight * sizeof(float);
-  const size_t tmpbuflen = d->inverse
-    ? (size_t)oheight * owidth * 2 * 3 * sizeof(float)
-    : MAX((size_t)oheight * owidth * 2 * 3,
-          (size_t)iheight * iwidth * ch) * sizeof(float);
-  const unsigned int pixelformat = LF_CR_4(RED, GREEN, BLUE, UNKNOWN);
   const int do_nan_checks = d->do_nan_checks;
 
   const float orig_w = roi_in->scale * piece->buf_in.width;
@@ -3560,7 +3551,7 @@ static int _process_slang_lf(dt_iop_module_t *self,
     dt_print_pipe(DT_DEBUG_PIPE, "lensfun bypass", piece->pipe, self, DT_DEVICE_NONE, roi_in, roi_out);
     return _slang_copy(dev_in, dev_out, owidth, oheight);
   }
-  if(piece->colors != ch) return 1;
+  if(piece->colors != 4) return 1;
 
   const char *ldkernel = NULL;
   switch(dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP)->id)
@@ -3583,99 +3574,71 @@ static int _process_slang_lf(dt_iop_module_t *self,
 
   int err = 1;
   int modflags;
-  float *tmpbuf = (float *)dt_alloc_aligned(tmpbuflen);
+  const dt_iop_lens_grid_cache_t *grids = NULL;
+  int coord_step = 0, coord_gwidth = 0, vig_step = 0, vig_gwidth = 0;
+  size_t coords_size = 0, vig_size = 0;
   dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
   lfModifier *modifier = NULL;
-  if(!tmpbuf || !dev_tmp) goto error;
+  if(!dev_tmp) goto error;
 
   dt_pthread_mutex_lock(&darktable.plugin_threadsafe);
   modifier = _get_modifier(&modflags, orig_w, orig_h, d, used_lf_mask, FALSE);
   dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
 
+  grids = _lens_grids(d, modifier, modflags, roi_in, roi_out,
+                      orig_w, orig_h, used_lf_mask, pass_mode, TRUE);
+  if(!grids) goto error;
+  coord_step = grids->coords.step;
+  coord_gwidth = grids->coords.gwidth;
+  vig_step = grids->vig.step;
+  vig_gwidth = grids->vig.gwidth;
+  coords_size = sizeof(float) * 6 * grids->coords.gwidth * grids->coords.gheight;
+  vig_size = sizeof(float) * 4 * grids->vig.gwidth * grids->vig.gheight;
+
   if(d->inverse)
   {
     // reverse direction (useful for renderings)
-    if(modflags & (LF_MODIFY_TCA | LF_MODIFY_DISTORTION | LF_MODIFY_GEOMETRY | LF_MODIFY_SCALE))
-    {
-      DT_OMP_FOR(shared(tmpbuf, d, modifier))
-      for(int y = 0; y < roi_out->height; y++)
-      {
-        float *pi = tmpbuf + (size_t)y * tmpbufwidth;
-        modifier->ApplySubpixelGeometryDistortion(roi_out->x, roi_out->y + y, roi_out->width, 1, pi);
-      }
-
+    if(grids->coords.data)
       err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
                                      SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(owidth), SLARG(oheight),
                                      SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
-                                     SLBUF(tmpbuf, tmpbufsize), SLARG(do_nan_checks));
-    }
+                                     SLBUF(grids->coords.data, coords_size), SLARG(do_nan_checks),
+                                     SLARG(coord_step), SLARG(coord_gwidth));
     else
       err = _slang_copy(dev_in, dev_tmp, owidth, oheight);
     if(err) goto error;
 
-    if(!pass_mode && (modflags & LF_MODIFY_VIGNETTING))
-    {
-      DT_OMP_FOR(shared(tmpbuf, modifier, d))
-      for(int y = 0; y < roi_out->height; y++)
-      {
-        float *buf = tmpbuf + (size_t)y * ch * roi_out->width;
-        for(int k = 0; k < ch * roi_out->width; k++) buf[k] = 0.5f;
-        modifier->ApplyColorModification(buf, roi_out->x, roi_out->y + y, roi_out->width, 1,
-                                         pixelformat, ch * roi_out->width);
-      }
-
-      const size_t bsize = (size_t)ch * roi_out->width * roi_out->height * sizeof(float);
+    if(grids->vig.data)
       err = dt_slang_gpu_run_2d_args("basic", "lens_vignette", owidth, oheight,
                                      SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
-                                     SLBUF(tmpbuf, bsize));
-    }
+                                     SLBUF(grids->vig.data, vig_size), SLARG(vig_step), SLARG(vig_gwidth));
     else
       err = _slang_copy(dev_tmp, dev_out, owidth, oheight);
   }
   else // correct distortions:
   {
-    if(!pass_mode && (modflags & LF_MODIFY_VIGNETTING))
-    {
-      DT_OMP_FOR(shared(tmpbuf, modifier, d))
-      for(int y = 0; y < roi_in->height; y++)
-      {
-        float *buf = tmpbuf + (size_t)y * ch * roi_in->width;
-        for(int k = 0; k < ch * roi_in->width; k++) buf[k] = 0.5f;
-        modifier->ApplyColorModification(buf, roi_in->x, roi_in->y + y, roi_in->width, 1,
-                                         pixelformat, ch * roi_in->width);
-      }
-
-      const size_t bsize = (size_t)ch * roi_in->width * roi_in->height * sizeof(float);
+    if(grids->vig.data)
       err = dt_slang_gpu_run_2d_args("basic", "lens_vignette", iwidth, iheight,
                                      SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(iwidth), SLARG(iheight),
-                                     SLBUF(tmpbuf, bsize));
-    }
+                                     SLBUF(grids->vig.data, vig_size), SLARG(vig_step), SLARG(vig_gwidth));
     else
       err = _slang_copy(dev_in, dev_tmp, iwidth, iheight);
     if(err) goto error;
 
-    if(modflags & (LF_MODIFY_TCA | LF_MODIFY_DISTORTION | LF_MODIFY_GEOMETRY | LF_MODIFY_SCALE))
-    {
-      DT_OMP_FOR(shared(tmpbuf, d, modifier))
-      for(int y = 0; y < roi_out->height; y++)
-      {
-        float *pi = tmpbuf + (size_t)y * tmpbufwidth;
-        modifier->ApplySubpixelGeometryDistortion(roi_out->x, roi_out->y + y, roi_out->width, 1, pi);
-      }
-
+    if(grids->coords.data)
       err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
                                      SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
                                      SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
-                                     SLBUF(tmpbuf, tmpbufsize), SLARG(do_nan_checks));
-    }
+                                     SLBUF(grids->coords.data, coords_size), SLARG(do_nan_checks),
+                                     SLARG(coord_step), SLARG(coord_gwidth));
     else
       err = _slang_copy(dev_tmp, dev_out, owidth, oheight);
   }
 
 error:
-  // SLBUF copies tmpbuf to the device when the kernel is started
+  // SLBUF copies the grids to the device when the kernel is started
   dt_slang_gpu_image_free(dev_tmp);
-  dt_free_align(tmpbuf);
+  _lens_grid_cache_release(d);
   if(modifier != NULL) delete modifier;
   return err;
 }
