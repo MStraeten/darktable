@@ -71,6 +71,7 @@ typedef struct test_t
   int gw, gh;       // work items, W x H if 0
   int clgw, clgh, cllx, clly; // OpenCL global and local sizes, if they differ from the above
   int outliers;     // values allowed past the tolerance, where the math is ill-conditioned
+  int hue_wrap;     // a hue display, where a hue within rounding of 0 shows as 0 or as 1
   int nargs;
   arg_t args[MAX_ARGS];
 } test_t;

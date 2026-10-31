@@ -1291,9 +1291,7 @@ static int make_tests(test_t *t)
                     LUT("profile_lut", lut_profile, 256, 256 * 6), INT("use_profile", prof),
                     BUFFER("work_profile_info", &profile_nonlinear, sizeof(profile_info_t)),
                     LUT("work_profile_lut", lut_profile, 256, 256 * 6), INT("use_work_profile", prof));
-          // a hue of exactly 0 can round to either side of the wrap, 0 or 1,
-          // which is the same hue: Metal and OpenCL differ on a few pixels
-          if(chn == 15) t[n - 1].outliers = 8;
+          if(chn == 15) t[n - 1].hue_wrap = 1;
         }
 #undef BL_IMG
 #undef BL_OUT
@@ -3208,7 +3206,11 @@ int main(int argc, char **argv)
           if(isnan(fc[i]) != isnan(fv[i])) nan_mismatch++;
           continue;
         }
-        const double d = fabs((double)fc[i] - (double)fv[i]);
+        double d = fabs((double)fc[i] - (double)fv[i]);
+        // b_z of a hue near 0 is a difference of near-equal terms, so float
+        // rounding picks its sign: the backends may show the same hue as 0
+        // and as 1, the two ends of the display's ramp
+        if(t->hue_wrap && fmin(fc[i], fv[i]) <= 1e-6f && fmax(fc[i], fv[i]) >= 1.0f - 1e-6f) d = 0.0;
         const double err = d / fmax(1.0, fabs((double)fc[i]));
         if(err > max_err || worst_arg < 0)
         {
