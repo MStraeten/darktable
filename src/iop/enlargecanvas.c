@@ -19,6 +19,7 @@
 // our includes go first:
 #include "bauhaus/bauhaus.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop.h"
 #include "develop/borders_helper.h"
 #include "develop/imageop_gui.h"
@@ -456,6 +457,49 @@ int process_cl(dt_iop_module_t *self,
   }
 
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_enlargecanvas_data_t *const d = piece->data;
+
+  float pos_v = .5f;
+  float pos_h = .5f;
+
+  _compute_pos(d, &pos_v, &pos_h);
+
+  dt_aligned_pixel_t fcolor = { 1.0f, 1.0f, 1.0f, 1.0f };
+  dt_aligned_pixel_t bcolor;
+  _border_color(d, bcolor);
+
+  dt_iop_border_positions_t binfo;
+
+  dt_iop_setup_binfo(piece, roi_in, roi_out, pos_v, pos_h,
+                     bcolor, fcolor, 0.f, 0.f, &binfo);
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  // borders' kernel without a frame, on the image area of process_cl()
+  const int frame = 0;
+  const int no_frame[4] = { 0, 0, 0, 0 };
+  const int in_x = binfo.image_left;
+  const int in_y = binfo.image_top;
+  const int in_width = binfo.image_right - binfo.image_left;
+  const int in_height = binfo.image_bot - binfo.image_top;
+
+  return !dt_slang_gpu_run_2d_args("basic", "borders", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(in_x), SLARG(in_y), SLARG(in_width), SLARG(in_height),
+                                   SLARG(frame), SLARG(no_frame), SLARG(no_frame),
+                                   SLARG(bcolor), SLARG(bcolor));
 }
 #endif
 
