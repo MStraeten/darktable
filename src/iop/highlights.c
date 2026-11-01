@@ -782,7 +782,7 @@ gboolean process_slang(dt_iop_module_t *self,
 
   if((filters && dmode != DT_IOP_HIGHLIGHTS_OPPOSED && dmode != DT_IOP_HIGHLIGHTS_CLIP
       && dmode != DT_IOP_HIGHLIGHTS_LCH && dmode != DT_IOP_HIGHLIGHTS_LAPLACIAN)
-     || (!filters && dmode != DT_IOP_HIGHLIGHTS_CLIP)
+     || (!filters && dmode != DT_IOP_HIGHLIGHTS_CLIP && dmode != DT_IOP_HIGHLIGHTS_OPPOSED)
      || (dmode == DT_IOP_HIGHLIGHTS_LAPLACIAN && filters == 9u)
      // process_lch_bayer() reads its input with the output's size
      || (dmode == DT_IOP_HIGHLIGHTS_LCH
@@ -829,7 +829,19 @@ gboolean process_slang(dt_iop_module_t *self,
   }
 
   gboolean ok;
-  if(!filters)
+  if(!filters && dmode == DT_IOP_HIGHLIGHTS_OPPOSED)
+  {
+    // linear raws, as process(): opposed on roi_in, then scaled to roi_out
+    dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, NULL);
+    dt_iop_roi_t iroi = *roi_in, oroi = *roi_out;
+    iroi.x = iroi.y = oroi.x = oroi.y = 0;
+    const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+    ok = tmp
+      && _process_linear_opposed_slang(self, piece, dev_in, tmp, roi_in)
+      && !dt_interpolation_resample_slang(itor, dev_out, &oroi, tmp, &iroi);
+    dt_slang_gpu_image_free(tmp);
+  }
+  else if(!filters)
   {
     const int width = roi_out->width;
     const int height = roi_out->height;

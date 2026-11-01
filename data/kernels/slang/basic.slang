@@ -725,6 +725,72 @@ void highlights_opposed(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), float4(val));
 }
 
+// linear raws, as in ../basic.cl
+float _calc_linear_refavg(float4 pixel, int color)
+{
+  const float ins[3] = { dt_cbrt(max(0.0f, pixel.x)), dt_cbrt(max(0.0f, pixel.y)), dt_cbrt(max(0.0f, pixel.z)) };
+  const float opp[3] = { 0.5f*(ins[1]+ins[2]), 0.5f*(ins[0]+ins[2]), 0.5f*(ins[0]+ins[1]) };
+  return fcube(opp[color]);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_initmask_linear(uint3 gid : SV_DispatchThreadID,
+                                uniform ImageIn in, uniform RWStructuredBuffer<uint> inmask,
+                                uniform int msize, uniform int mwidth, uniform int mheight,
+                                uniform int iwidth, uniform int iheight, uniform float4 clips)
+{
+  const int mcol = gid.x;
+  const int mrow = gid.y;
+
+  if(mcol >= mwidth || mrow >= mheight)
+    return;
+
+  const int irow = 3*mrow;
+  const int icol = 3*mcol;
+  const int rowend = mrow == mheight - 1 ? iheight : irow + 3;
+  const int colend = mcol == mwidth - 1 ? iwidth : icol + 3;
+  int mbuff[3] = { 0, 0, 0 };
+
+  for(int y = irow; y < rowend; y++)
+  {
+    for(int x = icol; x < colend; x++)
+    {
+      // the CPU code tests the red channel against all three clip values
+      const float val = in.Areadpixel(x, y).x;
+      if(val >= clips.x) mbuff[0] = 1;
+      if(val >= clips.y) mbuff[1] = 1;
+      if(val >= clips.z) mbuff[2] = 1;
+    }
+  }
+
+  const int mdx = mrow * mwidth + mcol;
+  for(int c = 0; c < 3; c++)
+    _mask_set(inmask, c*msize + mdx, mbuff[c]);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_opposed_linear(uint3 gid : SV_DispatchThreadID,
+                               uniform ImageIn in, uniform ImageOut out,
+                               uniform int width, uniform int height,
+                               uniform float4 clips, uniform float4 chroma)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float4 pixel = in.Areadpixel(x, y);
+  const float clip[3] = { clips.x, clips.y, clips.z };
+  const float chr[3] = { chroma.x, chroma.y, chroma.z };
+  const float inval[3] = { max(0.0f, pixel.x), max(0.0f, pixel.y), max(0.0f, pixel.z) };
+  float oval[3];
+  for(int c = 0; c < 3; c++)
+    oval[c] = inval[c] >= clip[c] ? max(inval[c], _calc_linear_refavg(pixel, c) + chr[c]) : inval[c];
+
+  out.write(int2(x, y), float4(oval[0], oval[1], oval[2], pixel.w));
+}
+
 // interpolation_resample in ../basic.cl splits each output pixel's vertical
 // taps across a work group and sums them in local memory. Here one work item
 // does all taps of its pixel, so the sums differ in the last bits.
