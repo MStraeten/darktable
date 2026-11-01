@@ -150,7 +150,13 @@ void modify_roi_in(dt_iop_module_t *self,
   }
 
 #ifdef HAVE_OPENCL
-  if(roi_out->scale > 1.0f && !piece->pipe->tiling
+  // process_cl_ready also gates process_slang(), which has its own tiler and
+  // keeps the image on the device
+  gboolean on_slang = FALSE;
+#ifdef HAVE_SLANG_GPU
+  on_slang = piece->pipe->slang_enabled && dt_slang_gpu_enabled();
+#endif
+  if(roi_out->scale > 1.0f && !piece->pipe->tiling && !on_slang
      && !_upscale_fits_device(piece, roi_in, roi_out))
     piece->process_cl_ready = FALSE;
 #endif
