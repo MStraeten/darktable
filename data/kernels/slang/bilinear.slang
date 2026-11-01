@@ -139,3 +139,36 @@ void bilinear4(uint3 gid : SV_DispatchThreadID,
   out[y * width_out + x] = Dy_prev * (Q_SW * Dx_next + Q_SE * Dx_prev)
                          + Dy_next * (Q_NW * Dx_next + Q_NE * Dx_prev);
 }
+
+// bilinear_image in ../bilinear.cl
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void bilinear_image(uint3 gid : SV_DispatchThreadID,
+                    uniform ImageIn in, uniform int width_in, uniform int height_in,
+                    uniform ImageOut out, uniform int width_out, uniform int height_out)
+{
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  if(x >= width_out || y >= height_out) return;
+
+  const float x_in = (float(x) / float(width_out)) * float(width_in);
+  const float y_in = (float(y) / float(height_out)) * float(height_in);
+
+  const int x_prev = clamp(int(floor(x_in)), 0, width_in - 1);
+  const int x_next = clamp(x_prev + 1, 0, width_in - 1);
+  const int y_prev = clamp(int(floor(y_in)), 0, height_in - 1);
+  const int y_next = clamp(y_prev + 1, 0, height_in - 1);
+
+  const float4 Q_NW = in.Areadpixel(x_prev, y_prev);
+  const float4 Q_NE = in.Areadpixel(x_next, y_prev);
+  const float4 Q_SE = in.Areadpixel(x_next, y_next);
+  const float4 Q_SW = in.Areadpixel(x_prev, y_next);
+
+  const float Dy_next = float(y_next) - y_in;
+  const float Dy_prev = 1.0f - Dy_next;
+  const float Dx_next = float(x_next) - x_in;
+  const float Dx_prev = 1.0f - Dx_next;
+
+  out.write(int2(x, y), Dy_prev * (Q_SW * Dx_next + Q_SE * Dx_prev)
+                      + Dy_next * (Q_NW * Dx_next + Q_NE * Dx_prev));
+}

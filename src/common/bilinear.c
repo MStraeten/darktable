@@ -115,6 +115,18 @@ int dt_interpolate_bilinear_slang(dt_slang_gpu_buffer_t *in,
                                   SLBUF_DEV(in), SLARG(width_in), SLARG(height_in),
                                   SLBUF_DEV(out), SLARG(width_out), SLARG(height_out));
 }
+
+int dt_interpolate_bilinear_image_slang(dt_slang_gpu_image_t *in,
+                                        const int width_in,
+                                        const int height_in,
+                                        dt_slang_gpu_image_t *out,
+                                        const int width_out,
+                                        const int height_out)
+{
+  return dt_slang_gpu_run_2d_args("bilinear", "bilinear_image", width_out, height_out,
+                                  SLIMG_DEV(in), SLARG(width_in), SLARG(height_in),
+                                  SLIMG_DEV(out), SLARG(width_out), SLARG(height_out));
+}
 #endif
 
 // clang-format off

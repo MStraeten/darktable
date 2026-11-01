@@ -79,6 +79,16 @@ int dt_interpolate_bilinear_slang(dt_slang_gpu_buffer_t *in,
                                   const int width_out,
                                   const int height_out,
                                   const int ch);
+
+/** Like dt_interpolate_bilinear_image_cl(), for device images of the Slang
+ *  kernels. Returns 0 on success.
+ */
+int dt_interpolate_bilinear_image_slang(dt_slang_gpu_image_t *in,
+                                        const int width_in,
+                                        const int height_in,
+                                        dt_slang_gpu_image_t *out,
+                                        const int width_out,
+                                        const int height_out);
 #endif
 
 // clang-format off

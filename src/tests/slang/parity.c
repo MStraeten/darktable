@@ -1819,6 +1819,54 @@ static int make_tests(test_t *t)
     }
   }
 
+  // chromatic aberrations (RGB): each kernel with the green guide, and the
+  // correction with the red and blue ones and each mode. The manifolds take
+  // positive data, as the module's do
+  {
+    static float ca_a[4 * W * H], ca_b[4 * W * H], ca_c[4 * W * H];
+    for(size_t k = 0; k < (size_t)4 * W * H; k++)
+    {
+      ca_a[k] = 0.02f + fabsf(image_in[k]);
+      ca_b[k] = 0.02f + fabsf(image_in[(k * 7 + 5) % ((size_t)4 * W * H)]);
+      ca_c[k] = 0.02f + fabsf(image_in[(k * 13 + 3) % ((size_t)4 * W * H)]);
+    }
+    TEST_TOL("cacorrectrgb_manifolds", "cacorrectrgb", "cacorrectrgb_manifolds", 1e-5,
+         IMG_IN("in", image_in), IMG_IN("blurred_in", ca_a), IMG_OUT("manifold_higher"),
+         IMG_OUT("manifold_lower"), INT("width", W), INT("height", H), INT("guide", 1));
+    TEST_TOL("cacorrectrgb_normalize", "cacorrectrgb", "cacorrectrgb_normalize", 1e-5,
+         IMG_IN("blurred_in", ca_a), IMG_IN("blurred_higher", image_in), IMG_IN("blurred_lower", ca_b),
+         IMG_OUT("manifold_higher"), IMG_OUT("manifold_lower"), INT("width", W), INT("height", H),
+         INT("guide", 1));
+    // the weight is a product of 1 / distance terms between log2 values, so
+    // the few ulp of difference in log2 grow to a few 1e-5
+    TEST_TOL("cacorrectrgb_refine", "cacorrectrgb", "cacorrectrgb_refine", 1e-4,
+         IMG_IN("in", image_in), IMG_IN("higher", ca_a), IMG_IN("lower", ca_b), IMG_IN("blurred_in", ca_c),
+         IMG_OUT("manifold_higher"), IMG_OUT("manifold_lower"), INT("width", W), INT("height", H),
+         INT("guide", 1));
+    static const char *ca_labels[3] = { "cacorrectrgb_apply red standard", "cacorrectrgb_apply green darken",
+                                        "cacorrectrgb_apply blue brighten" };
+    for(int k = 0; k < 3; k++)
+      TEST_TOL(ca_labels[k], "cacorrectrgb", "cacorrectrgb_apply", 1e-5,
+           IMG_IN("in", image_in), IMG_IN("higher", ca_a), IMG_IN("lower", ca_b), IMG_OUT("out"),
+           INT("width", W), INT("height", H), INT("guide", k), INT("mode", k));
+    TEST("cacorrectrgb_artifacts_prepare", "cacorrectrgb", "cacorrectrgb_artifacts_prepare",
+         IMG_IN("in", image_in), IMG_IN("corrected", ca_a), IMG_OUT("in_out"), INT("width", W),
+         INT("height", H), INT("guide", 1));
+    TEST_TOL("cacorrectrgb_artifacts", "cacorrectrgb", "cacorrectrgb_artifacts", 1e-5,
+         IMG_IN("in", image_in), IMG_IN("corrected", ca_a), IMG_IN("blurred_in_out", ca_b), IMG_OUT("out"),
+         INT("width", W), INT("height", H), INT("guide", 1), FLOAT("safety", 4.47f));
+
+    enum { CW = W / 2, CH = H / 2 };
+    TEST_GRID("bilinear_image down", "bilinear", "bilinear_image", 1e-6, CW, CH,
+              IMG_IN("in", image_in), INT("width_in", W), INT("height_in", H),
+              { .kind = ARG_IMAGE_OUT, .name = "out", .w = CW, .h = CH, .channels = 4 },
+              INT("width_out", CW), INT("height_out", CH));
+    TEST_GRID("bilinear_image up", "bilinear", "bilinear_image", 1e-6, W, H,
+              { .kind = ARG_IMAGE_IN, .name = "in", .w = CW, .h = CH, .channels = 4, .pixels = image_in },
+              INT("width_in", CW), INT("height_in", CH), IMG_OUT("out"), INT("width_out", W),
+              INT("height_out", H));
+  }
+
   // color equalizer, on plausible working data: chromaticities, saturations,
   // positive definite covariances with a few singular ones, smooth LUTs over
   // hue, and the HSB pixels write_output() maps back to RGB
