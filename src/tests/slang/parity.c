@@ -667,6 +667,13 @@ static int make_tests(test_t *t)
          INT("filters", hl_fc_filters[f]), BUFFER("xtrans", xtrans, sizeof(xtrans)));
   TEST("highlights_4f_clip", "basic", "highlights_4f_clip",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), FLOAT("clip", 0.6f));
+  // the opposed method on linear raws, with the clip values of highlights_4f_clip
+  TEST_GRID("highlights_initmask_linear", "basic", "highlights_initmask_linear", 0.0, mwidth, mheight,
+       IMG_IN("in", image_in), BYTES_OUT("inmask", 3 * msize), INT("msize", msize), INT("mwidth", mwidth),
+       INT("mheight", mheight), INT("iwidth", W), INT("iheight", H), FLOAT4("clips", 0.6f, 0.65f, 0.55f, 1.0f));
+  TEST("highlights_opposed_linear", "basic", "highlights_opposed_linear",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+       FLOAT4("clips", 0.6f, 0.65f, 0.55f, 1.0f), FLOAT4("chroma", 0.05f, -0.02f, 0.03f, 0.0f));
   TEST("whitebalance_1f_xtrans", "basic", "whitebalance_1f_xtrans",
        RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H),
        BUFFER("coeffs", wb_coeffs, sizeof(wb_coeffs)), INT("filters", 9),
