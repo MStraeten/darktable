@@ -215,10 +215,14 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_in,
                        const dt_iop_roi_t *const roi_out)
 {
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  // as process_cl(): a tile of an export is placed by its roi offsets
+  if(dt_pipe_is_export(piece->pipe) && piece->pipe->tiling)
+    return !dt_interpolation_resample_tile_slang(itor, dev_out, roi_out, dev_in, roi_in);
+
   // the export pipe's buffers hold exactly the rois, as in dt_iop_clip_and_zoom_roi()
   dt_iop_roi_t iroi = *roi_in, oroi = *roi_out;
   if(dt_pipe_is_export(piece->pipe)) iroi.x = iroi.y = oroi.x = oroi.y = 0;
-  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
   return !dt_interpolation_resample_slang(itor, dev_out, &oroi, dev_in, &iroi);
 }
 #endif

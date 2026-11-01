@@ -1457,11 +1457,14 @@ int dt_interpolation_resample_tile_cl(const dt_interpolation_t *itor,
 #endif
 
 #ifdef HAVE_SLANG_GPU
-int dt_interpolation_resample_slang(const dt_interpolation_t *itor,
-                                    dt_slang_gpu_image_t *dev_out,
-                                    const dt_iop_roi_t *const roi_out,
-                                    dt_slang_gpu_image_t *dev_in,
-                                    const dt_iop_roi_t *const roi_in)
+// as _resample()
+static int _resample_slang(const dt_interpolation_t *itor,
+                           dt_slang_gpu_image_t *dev_out,
+                           const dt_iop_roi_t *const roi_out,
+                           dt_slang_gpu_image_t *dev_in,
+                           const dt_iop_roi_t *const roi_in,
+                           const float xshift,
+                           const float yshift)
 {
   const int dx = MAX(0, roi_out->x);
   const int dy = MAX(0, roi_out->y);
@@ -1477,9 +1480,9 @@ int dt_interpolation_resample_slang(const dt_interpolation_t *itor,
   int *vindex = NULL, *vlength = NULL, *vmeta = NULL;
   float *hkernel = NULL, *vkernel = NULL;
   int err = 1;
-  if(_prepare_resampling_plan(itor, roi_in->width, width, dx, roi_out->scale,
+  if(_prepare_resampling_plan(itor, roi_in->width, width, xshift, roi_out->scale,
                               &hlength, &hkernel, &hindex, &hmeta)
-     || _prepare_resampling_plan(itor, roi_in->height, height, dy, roi_out->scale,
+     || _prepare_resampling_plan(itor, roi_in->height, height, yshift, roi_out->scale,
                                  &vlength, &vkernel, &vindex, &vmeta))
     goto error;
 
@@ -1502,6 +1505,33 @@ error:
   dt_free_align(hlength);
   dt_free_align(vlength);
   return err;
+}
+
+int dt_interpolation_resample_slang(const dt_interpolation_t *itor,
+                                    dt_slang_gpu_image_t *dev_out,
+                                    const dt_iop_roi_t *const roi_out,
+                                    dt_slang_gpu_image_t *dev_in,
+                                    const dt_iop_roi_t *const roi_in)
+{
+  return _resample_slang(itor, dev_out, roi_out, dev_in, roi_in,
+                         MAX(0, roi_out->x), MAX(0, roi_out->y));
+}
+
+int dt_interpolation_resample_tile_slang(const dt_interpolation_t *itor,
+                                         dt_slang_gpu_image_t *dev_out,
+                                         const dt_iop_roi_t *const roi_out,
+                                         dt_slang_gpu_image_t *dev_in,
+                                         const dt_iop_roi_t *const roi_in)
+{
+  dt_iop_roi_t oroi = *roi_out;
+  oroi.x = oroi.y = 0;
+
+  dt_iop_roi_t iroi = *roi_in;
+  iroi.x = iroi.y = 0;
+
+  return _resample_slang(itor, dev_out, &oroi, dev_in, &iroi,
+                         roi_out->x - roi_in->x * roi_out->scale,
+                         roi_out->y - roi_in->y * roi_out->scale);
 }
 
 int dt_interpolation_resample_roi_mask_slang(const dt_interpolation_t *itor,
