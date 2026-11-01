@@ -32,6 +32,7 @@
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 
 #define GRAIN_LIGHTNESS_STRENGTH_SCALE 0.15f
 
@@ -525,7 +526,7 @@ void process(dt_iop_module_t *self,
   }
 }
 
-#ifdef HAVE_OPENCL
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
 // v mod 768 as (integer part, fraction): the simplex noise repeats every
 // 768 units along x and along y, so this is all a GPU kernel needs of v
 static void _reduce_coord(const double v, float c[2])
@@ -591,7 +592,9 @@ static int _noise_coords(const dt_dev_pixelpipe_iop_t *piece,
   }
   return samples;
 }
+#endif
 
+#ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
                cl_mem dev_in,
@@ -660,6 +663,42 @@ void tiling_callback(dt_iop_module_t *self,
   tiling->overlap = 0;
   tiling->align = 1;
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_grain_data_t *data = piece->data;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  const float strength = (data->strength / 100.0f);
+
+  // as process_cl()
+  gboolean ok = FALSE;
+  float *cols = NULL, *rows = NULL, *xoffs = NULL, *yoffs = NULL;
+  const int samples = _noise_coords(piece, roi_out, &cols, &rows, &xoffs, &yoffs);
+  if(samples)
+    ok = !dt_slang_gpu_run_2d_args("grain", "grain", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                   SLARG(width), SLARG(height),
+                                   SLBUF(cols, sizeof(float) * 6 * width),
+                                   SLBUF(rows, sizeof(float) * 6 * height),
+                                   SLBUF(xoffs, sizeof(float) * 6 * samples),
+                                   SLBUF(yoffs, sizeof(float) * 6 * samples),
+                                   SLARG(samples), SLARG(strength),
+                                   SLBUF(data->grain_lut, sizeof(data->grain_lut)));
+  dt_free_align(cols);
+  dt_free_align(rows);
+  dt_free_align(xoffs);
+  dt_free_align(yoffs);
+  return ok;
+}
+#endif
 
 void commit_params(dt_iop_module_t *self,
                    dt_iop_params_t *p1,

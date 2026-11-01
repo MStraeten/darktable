@@ -688,6 +688,37 @@ static int make_tests(test_t *t)
          INT("in_width", W), INT("in_height", H), INT2("roi_out", 0, 0), INT2("roi_in", 0, 0),
          FLOAT4("m", 0.6875f, 0.71875f, -0.71875f, 0.6875f), FLOAT2("center", 0.0f, H * 0.5f),
          INT("itype", k), INT("iwidth", rp_widths[k]));
+  // grain on Lab input, without and with the 21-sample filter. The reduced
+  // coordinates are (integer part, fraction) pairs as _noise_coords() in
+  // grain.c makes them; the integer parts span the whole 768 period
+  static float gr_cols[6 * W], gr_rows[6 * H], gr_xoffs[6 * 21], gr_yoffs[6 * 21];
+  static float gr_lut[128 * 128];
+  uint32_t gr_seed = 12345;
+#define GR_NEXT() (gr_seed = gr_seed * 1664525u + 1013904223u)
+#define GR_COORD(arr, n)                                                                  \
+  for(int k = 0; k < 3 * (n); k++)                                                        \
+  {                                                                                       \
+    arr[2 * k] = (float)(GR_NEXT() % 768u);                                               \
+    arr[2 * k + 1] = (float)(GR_NEXT() >> 8) / 16777216.0f;                               \
+  }
+  GR_COORD(gr_cols, W);
+  GR_COORD(gr_rows, H);
+  GR_COORD(gr_xoffs, 21);
+  GR_COORD(gr_yoffs, 21);
+#undef GR_COORD
+#undef GR_NEXT
+  for(int j = 0; j < 128; j++)
+    for(int i = 0; i < 128; i++)
+      gr_lut[j * 128 + i] = 20.0f * sinf(i * 0.05f) * (1.0f - fabsf(j / 63.5f - 1.0f));
+  static const char *gr_labels[2] = { "grain", "grain filtered" };
+  static const int gr_samples[2] = { 1, 21 };
+  for(int k = 0; k < 2; k++)
+    TEST_TOL(gr_labels[k], "grain", "grain", 1e-4,
+         IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+         BUFFER("cols", gr_cols, sizeof(gr_cols)), BUFFER("rows", gr_rows, sizeof(gr_rows)),
+         BUFFER("xoffs", gr_xoffs, sizeof(gr_xoffs)), BUFFER("yoffs", gr_yoffs, sizeof(gr_yoffs)),
+         INT("samples", gr_samples[k]), FLOAT("strength", 0.8f),
+         BUFFER("grain_lut", gr_lut, sizeof(gr_lut)));
   TEST("whitebalance_1f_xtrans", "basic", "whitebalance_1f_xtrans",
        RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H),
        BUFFER("coeffs", wb_coeffs, sizeof(wb_coeffs)), INT("filters", 9),
