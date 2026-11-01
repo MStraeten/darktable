@@ -1917,6 +1917,7 @@ static gboolean _slang_tile(dt_iop_module_t *self,
 {
   const size_t irow = (size_t)iroi->width * in_bpp;
   const size_t orow = (size_t)oroi->width * out_bpp;
+  DT_OMP_FOR()
   for(size_t y = 0; y < iroi->height; y++)
     memcpy(tile_in + y * irow, in + y * ipitch, irow);
 
@@ -1935,10 +1936,14 @@ static gboolean _slang_tile(dt_iop_module_t *self,
   dt_slang_gpu_image_free(dev_out);
   if(!ok) return FALSE;
 
+  DT_OMP_FOR()
   for(size_t y = 0; y < oh; y++)
     memcpy(out + y * opitch, tile_out + (oy + y) * orow + ox * out_bpp, ow * out_bpp);
   return TRUE;
 }
+
+// upper bound for one tile buffer, host or device
+#define SLANG_TILE_MAX_BYTES (512.0f * DT_MEGA)
 
 // the tile size that fits the device, as in the OpenCL variants above
 static void _slang_tile_size(dt_iop_module_t *self,
@@ -1960,7 +1965,11 @@ static void _slang_tile_size(dt_iop_module_t *self,
   int max_dim = 0;
   dt_slang_gpu_memory_info(&available, &max_dim);
   const float factor = fmaxf(tiling->factor_cl - 1.0f, 1.0f);
-  const float singlebuffer = fmaxf(((float)available - tiling->overhead) / factor, 0.0f);
+  // a unified memory device reports most of the host's RAM as available,
+  // and each tile is held on the host and on the device next to the pipe's
+  // full-size buffers: tiles that large pushed a 24 GB Mac into swap
+  const float singlebuffer = fminf(fmaxf(((float)available - tiling->overhead) / factor, 0.0f),
+                                   SLANG_TILE_MAX_BYTES);
   const float maxbuf = fmaxf(tiling->maxbuf_cl, 1.0f);
 
   int w = MIN(MAX(roi_in->width, roi_out->width), max_dim);
@@ -2010,10 +2019,23 @@ static int _default_process_tiling_slang_ptp(dt_iop_module_t *self,
 
   const int overlap = tiling.overlap % align != 0 ? (tiling.overlap / align + 1) * align
                                                   : tiling.overlap;
-  const int tile_wd = width - 2 * overlap > 0 ? width - 2 * overlap : 1;
-  const int tile_ht = height - 2 * overlap > 0 ? height - 2 * overlap : 1;
+  int tile_wd = width - 2 * overlap > 0 ? width - 2 * overlap : 1;
+  int tile_ht = height - 2 * overlap > 0 ? height - 2 * overlap : 1;
   const int tiles_x = width < roi_in->width ? ceilf(roi_in->width / (float)tile_wd) : 1;
   const int tiles_y = height < roi_in->height ? ceilf(roi_in->height / (float)tile_ht) : 1;
+
+  // spread the image evenly over the tiles: a full tile plus a narrow strip
+  // costs the strip's per-tile overhead for little work
+  if(tiles_x > 1)
+  {
+    tile_wd = _align_up((roi_in->width + tiles_x - 1) / tiles_x, align);
+    width = MIN(tile_wd + 2 * overlap, width);
+  }
+  if(tiles_y > 1)
+  {
+    tile_ht = _align_up((roi_in->height + tiles_y - 1) / tiles_y, align);
+    height = MIN(tile_ht + 2 * overlap, height);
+  }
 
   if(tiles_x * tiles_y > _maximum_number_tiles())
   {
