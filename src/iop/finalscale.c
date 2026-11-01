@@ -215,9 +215,6 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_in,
                        const dt_iop_roi_t *const roi_out)
 {
-  // like process_cl(), which leaves upscaling to the CPU
-  if(roi_out->scale > 1.0f) return FALSE;
-
   // the export pipe's buffers hold exactly the rois, as in dt_iop_clip_and_zoom_roi()
   dt_iop_roi_t iroi = *roi_in, oroi = *roi_out;
   if(dt_pipe_is_export(piece->pipe)) iroi.x = iroi.y = oroi.x = oroi.y = 0;
