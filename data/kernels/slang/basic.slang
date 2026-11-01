@@ -756,11 +756,10 @@ void highlights_initmask_linear(uint3 gid : SV_DispatchThreadID,
   {
     for(int x = icol; x < colend; x++)
     {
-      // the CPU code tests the red channel against all three clip values
-      const float val = in.Areadpixel(x, y).x;
-      if(val >= clips.x) mbuff[0] = 1;
-      if(val >= clips.y) mbuff[1] = 1;
-      if(val >= clips.z) mbuff[2] = 1;
+      const float4 val = in.Areadpixel(x, y);
+      if(val.x >= clips.x) mbuff[0] = 1;
+      if(val.y >= clips.y) mbuff[1] = 1;
+      if(val.z >= clips.z) mbuff[2] = 1;
     }
   }
 
