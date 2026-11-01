@@ -674,6 +674,20 @@ static int make_tests(test_t *t)
   TEST("highlights_opposed_linear", "basic", "highlights_opposed_linear",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
        FLOAT4("clips", 0.6f, 0.65f, 0.55f, 1.0f), FLOAT4("chroma", 0.05f, -0.02f, 0.03f, 0.0f));
+  // rotate pixels by about 45 degrees around a point inside the image, with
+  // each of the four interpolators; part of the output falls outside the input.
+  // The matrix and center are dyadic so that every position is exact: with
+  // cos(45) each side rounds the sums its own way, and the noise image turns
+  // that ulp into errors of up to 1e-4
+  static const char *rp_labels[4] = { "rotatepixels bilinear", "rotatepixels bicubic",
+                                      "rotatepixels lanczos2", "rotatepixels lanczos3" };
+  static const int rp_widths[4] = { 1, 2, 2, 3 };
+  for(int k = 0; k < 4; k++)
+    TEST_TOL(rp_labels[k], "basic", "rotatepixels", 1e-5,
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         INT("in_width", W), INT("in_height", H), INT2("roi_out", 0, 0), INT2("roi_in", 0, 0),
+         FLOAT4("m", 0.6875f, 0.71875f, -0.71875f, 0.6875f), FLOAT2("center", 0.0f, H * 0.5f),
+         INT("itype", k), INT("iwidth", rp_widths[k]));
   TEST("whitebalance_1f_xtrans", "basic", "whitebalance_1f_xtrans",
        RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H),
        BUFFER("coeffs", wb_coeffs, sizeof(wb_coeffs)), INT("filters", 9),

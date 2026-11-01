@@ -1202,6 +1202,53 @@ float interpolation_compute_single(ImageIn in, const int itor_mode, const int it
   return s;
 }
 
+// rotatepixels in ../basic.cl, with the taps of compute_upsampling_taps()
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void rotatepixels(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out,
+                  uniform int width, uniform int height, uniform int in_width, uniform int in_height,
+                  uniform int2 roi_out, uniform int2 roi_in, uniform float4 m, uniform float2 center,
+                  uniform int itype, uniform int iwidth)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float pix = float(roi_out.x + x);
+  const float piy = float(roi_out.y + y);
+  const float px = pix * m.x + piy * m.y + center.x - float(roi_in.x);
+  const float py = pix * m.z + piy * m.w + center.y - float(roi_in.y);
+
+  const int ix = int(floor(px));
+  const int iy = int(floor(py));
+
+  if(ix < -1 || iy < -1 || ix >= in_width || iy >= in_height)
+  {
+    out.write(int2(x, y), float4(0.0f));
+    return;
+  }
+
+  float kh[MAX_KERNEL_REQ];
+  float kv[MAX_KERNEL_REQ];
+  const float normh = compute_upsampling_taps(itype, iwidth, kh, px);
+  const float normv = compute_upsampling_taps(itype, iwidth, kv, py);
+  const int fx = ix - iwidth + 1;
+  const int fy = iy - iwidth + 1;
+
+  float4 pixel = float4(0.0f);
+  for(int i = 0; i < 2 * iwidth; i++)
+  {
+    const int yy = clip_mirror(fy + i, in_height - 1);
+    float4 h = float4(0.0f);
+    for(int j = 0; j < 2 * iwidth; j++)
+      h += kh[j] * in.readpixel(clip_mirror(fx + j, in_width - 1), yy);
+    pixel += kv[i] * h;
+  }
+
+  out.write(int2(x, y), pixel * (1.0f / (normh * normv)));
+}
+
 // the OpenCL kernels check the coordinates of all three channels for NaN, and
 // let a pixel through only when all of its colors are finite
 // _lens_grid_sample() in ../basic.cl: the lensfun values of pixel (x, y),

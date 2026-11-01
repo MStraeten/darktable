@@ -20,6 +20,7 @@
 #include "common/interpolation.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/tiling.h"
@@ -345,6 +346,36 @@ int process_cl(dt_iop_module_t *self,
                                           CLARG(roi_in->width), CLARG(roi_in->height),
                                           CLARG(roo), CLARG(roi), CLARG(m), CLARG(center),
                                           CLARG(itype), CLARG(iwidth));
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_rotatepixels_data_t *d = piece->data;
+
+  const float scale = roi_in->scale / piece->iscale;
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+
+  // as process_cl()
+  const float m[4] = { d->m[0], -d->m[1], -d->m[2], d->m[3] };
+  const float center[2] = { d->rx * scale, d->ry * scale };
+  const int roo[2] = { roi_out->x, roi_out->y };
+  const int roi[2] = { roi_in->x, roi_in->y };
+  const int itype = interpolation->id;
+  const int iwidth = interpolation->width;
+
+  return !dt_slang_gpu_run_2d_args("basic", "rotatepixels", roi_out->width, roi_out->height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                   SLARG(roi_out->width), SLARG(roi_out->height),
+                                   SLARG(roi_in->width), SLARG(roi_in->height),
+                                   SLARG(roo), SLARG(roi), SLARG(m), SLARG(center),
+                                   SLARG(itype), SLARG(iwidth));
 }
 #endif
 
