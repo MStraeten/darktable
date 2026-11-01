@@ -780,6 +780,19 @@ void interpolation_copy(uint3 gid : SV_DispatchThreadID,
   dev_out.write(int2(ocol, orow), pix);
 }
 
+// masks never want under- or overshoots from resampling, as in
+// dt_interpolation_resample_mask()
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void mask_clip(uint3 gid : SV_DispatchThreadID,
+               uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  out.write(int2(x, y), float4(clipf(in.Areadsingle(x, y))));
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void flip(uint3 gid : SV_DispatchThreadID,

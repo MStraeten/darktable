@@ -18,6 +18,7 @@
 
 #include <stdarg.h>
 #include "common/imagebuf.h"
+#include "common/slang_gpu.h"
 
 static size_t parallel_imgop_minimum = 500000;
 static size_t parallel_imgop_maxthreads = 4;
@@ -240,6 +241,27 @@ void dt_iop_copy_image_roi(float *const __restrict__ out,
     }
   }
 }
+
+#ifdef HAVE_SLANG_GPU
+int dt_iop_copy_image_roi_slang(dt_slang_gpu_image_t *out,
+                                dt_slang_gpu_image_t *in,
+                                const dt_iop_roi_t *const roi_in,
+                                const dt_iop_roi_t *const roi_out)
+{
+  // the same offsets and zero fill as above, where rois of the same size
+  // are copied whole whatever their positions
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+  const int iwidth = roi_in->width;
+  const int iheight = roi_in->height;
+  const gboolean same = iwidth == owidth && iheight == oheight;
+  const int dx = same ? 0 : roi_out->x - roi_in->x;
+  const int dy = same ? 0 : roi_out->y - roi_in->y;
+  return dt_slang_gpu_run_2d_args("basic", "interpolation_copy", owidth, oheight,
+                                  SLIMG_DEV(in), SLIMG_DEV(out), SLARG(owidth), SLARG(oheight),
+                                  SLARG(iwidth), SLARG(iheight), SLARG(dx), SLARG(dy));
+}
+#endif
 
 void dt_iop_image_scaled_copy(float *const restrict buf,
                               const float *const restrict src,

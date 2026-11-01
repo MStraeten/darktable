@@ -328,6 +328,16 @@ OPTIONAL(void, distort_mask, struct dt_iop_module_t *self,
                              float *const out,
                              const struct dt_iop_roi_t *const roi_in,
                              const struct dt_iop_roi_t *const roi_out);
+#ifdef HAVE_SLANG_GPU
+/** distort_mask() on the Slang device, with 1-channel images. Returns TRUE
+ *  on success; on failure the whole mask is distorted on the host. */
+OPTIONAL(gboolean, distort_mask_slang, struct dt_iop_module_t *self,
+                                       struct dt_dev_pixelpipe_iop_t *piece,
+                                       struct dt_slang_gpu_image_t *dev_in,
+                                       struct dt_slang_gpu_image_t *dev_out,
+                                       const struct dt_iop_roi_t *const roi_in,
+                                       const struct dt_iop_roi_t *const roi_out);
+#endif
 
 // introspection related callbacks, will be auto-implemented if
 // DT_MODULE_INTROSPECTION() is used,

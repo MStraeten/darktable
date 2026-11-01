@@ -1332,6 +1332,32 @@ void blendop_detail_multiply(uint3 gid : SV_DispatchThreadID,
   mask_out.write(int2(x, y), float4(mask_in.Areadsingle(x, y) * clipf(detail[y * width + x])));
 }
 
+// the same, with the detail mask distorted on the device into an image
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void blendop_detail_multiply_image(uint3 gid : SV_DispatchThreadID,
+                                   uniform ImageIn mask_in, uniform ImageIn detail,
+                                   uniform ImageOut mask_out, uniform int width, uniform int height)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  mask_out.write(int2(x, y), float4(mask_in.Areadsingle(x, y) * clipf(detail.Areadsingle(x, y))));
+}
+
+// a 1-channel buffer into an image, for the modules' distort_mask_slang()
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void detail_buffer_to_image(uint3 gid : SV_DispatchThreadID,
+                            uniform StructuredBuffer<float> in, uniform ImageOut out,
+                            uniform int width, uniform int height)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  out.write(int2(x, y), float4(in[y * width + x]));
+}
+
 static const int DT_DEV_PIXELPIPE_DISPLAY_OUTPUT = 1 << 2;
 static const int DT_DEV_PIXELPIPE_DISPLAY_L = 1 << 3;
 static const int DT_DEV_PIXELPIPE_DISPLAY_a = 2 << 3;

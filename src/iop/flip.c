@@ -297,6 +297,19 @@ void distort_mask(dt_iop_module_t *self,
                           roi_in->width, roi_in->height, stride, d->orientation);
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  // the flip kernel of process_slang() reads and writes one channel as well
+  return process_slang(self, piece, dev_in, dev_out, roi_in, roi_out);
+}
+#endif
+
 void modify_roi_out(dt_iop_module_t *self,
                     dt_dev_pixelpipe_iop_t *piece,
                     dt_iop_roi_t *roi_out,

@@ -935,9 +935,9 @@ void dt_dev_pixelpipe_synch_all(dt_dev_pixelpipe_t *pipe, dt_develop_t *dev)
      nothing cached still refers to the buffer. A mere detail-threshold change
      needs no flush either, since it changes the mask hash and the masked module
      invalidates on its own */
-  if(pipe->want_detail_mask && pipe->scharr.data == NULL)
+  if(pipe->want_detail_mask && !dt_dev_scharr_mask_available(&pipe->scharr))
     dt_dev_pixelpipe_cache_invalidate_later(pipe, 0, "usedetails build ");
-  else if(!pipe->want_detail_mask && pipe->scharr.data != NULL)
+  else if(!pipe->want_detail_mask && dt_dev_scharr_mask_available(&pipe->scharr))
     dt_dev_clear_scharr_mask(pipe);
 
   dt_print_pipe(DT_DEBUG_PARAMS,
@@ -5202,6 +5202,9 @@ failure:
 void dt_dev_clear_scharr_mask(dt_dev_pixelpipe_t *pipe)
 {
   if(pipe->scharr.data) dt_free_align(pipe->scharr.data);
+#ifdef HAVE_SLANG_GPU
+  dt_slang_gpu_buffer_free(pipe->scharr.dev_data);
+#endif
   memset(&pipe->scharr, 0, sizeof(dt_dev_detail_mask_t));
 
   // invalidate all per-piece mask caches since the source data is gone
@@ -5210,6 +5213,25 @@ void dt_dev_clear_scharr_mask(dt_dev_pixelpipe_t *pipe)
     dt_dev_pixelpipe_iop_t *piece = iter->data;
     _clear_piece_mask_caches(piece);
   }
+}
+
+const float *dt_dev_scharr_mask_host(dt_dev_pixelpipe_t *pipe)
+{
+#ifdef HAVE_SLANG_GPU
+  dt_dev_detail_mask_t *m = &pipe->scharr;
+  if(!m->data && m->dev_data)
+  {
+    float *data = dt_alloc_align_float((size_t)m->roi.width * m->roi.height);
+    if(data && !dt_slang_gpu_buffer_read(m->dev_data, data, m->size))
+      m->data = data;
+    else
+      dt_free_align(data);
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
+                  m->data ? "read scharr mask to host" : "couldn't read scharr mask to host",
+                  pipe, NULL, DT_DEVICE_NONE, &m->roi, NULL);
+  }
+#endif
+  return pipe->scharr.data;
 }
 
 gboolean dt_dev_write_scharr_mask(dt_dev_pixelpipe_iop_t *piece,
@@ -5255,10 +5277,9 @@ gboolean dt_dev_write_scharr_mask_slang(dt_dev_pixelpipe_iop_t *piece,
   const int height = roi->height;
   const size_t bsize = sizeof(float) * width * height;
 
-  float *mask = dt_alloc_align_float((size_t)width * height);
   dt_slang_gpu_buffer_t *out = dt_slang_gpu_buffer_new_uninit(bsize);
   dt_slang_gpu_buffer_t *tmp = dt_slang_gpu_buffer_new_uninit(bsize);
-  int err = !mask || !out || !tmp;
+  int err = !out || !tmp;
 
   const gboolean wboff = !p->dsc.temperature.enabled || !rawmode;
   const dt_aligned_pixel_t wb =
@@ -5272,18 +5293,18 @@ gboolean dt_dev_write_scharr_mask_slang(dt_dev_pixelpipe_iop_t *piece,
   if(!err)
     err = dt_slang_gpu_run_2d_args("blendop", "calc_scharr_mask", width, height,
                                    SLBUF_DEV(tmp), SLBUF_DEV(out), SLARG(width), SLARG(height));
-  if(!err) err = dt_slang_gpu_buffer_read(out, mask, bsize);
-  dt_slang_gpu_buffer_free(out);
   dt_slang_gpu_buffer_free(tmp);
 
   if(err)
   {
     dt_print_pipe(DT_DEBUG_ALWAYS, "couldn't write scharr mask slang", p, NULL, DT_DEVICE_NONE, roi, NULL);
-    dt_free_align(mask);
+    dt_slang_gpu_buffer_free(out);
     return TRUE;
   }
 
-  p->scharr.data = mask;
+  // the Slang blend path reads it there; dt_dev_scharr_mask_host() copies it
+  // for a module blending on the CPU
+  p->scharr.dev_data = out;
   p->scharr.size = bsize;
   memcpy(&p->scharr.roi, roi, sizeof(dt_iop_roi_t));
   p->scharr.hash = dt_hash(DT_INITHASH, &p->scharr.roi, sizeof(dt_iop_roi_t));
@@ -5365,6 +5386,28 @@ int dt_dev_write_scharr_mask_cl(dt_dev_pixelpipe_iop_t *piece,
 
 // this expects a mask prepared by rawprepare or demosaic and distorts it
 // through all pipeline modules until target
+// the module whose output the details mask was computed from
+static GList *_detail_mask_source(dt_dev_pixelpipe_t *pipe)
+{
+  const gboolean raw_img = dt_image_is_raw(&pipe->image) || dt_image_is_mono_sraw(&pipe->image);
+
+  // find the source module (demosaic or rawprepare)
+  for(GList *iter = pipe->nodes; iter; iter = g_list_next(iter))
+  {
+    const dt_dev_pixelpipe_iop_t *candidate = iter->data;
+
+    if(dt_iop_module_is(candidate->module, "demosaic")
+       && candidate->enabled
+       && raw_img)
+      return iter;
+    if(dt_iop_module_is(candidate->module, "rawprepare")
+       && candidate->enabled
+       && !raw_img)
+      return iter;
+  }
+  return NULL;
+}
+
 float *dt_dev_distort_detail_mask(dt_dev_pixelpipe_iop_t *piece,
                                   const float *src,
                                   const dt_iop_module_t *target_module,
@@ -5373,29 +5416,7 @@ float *dt_dev_distort_detail_mask(dt_dev_pixelpipe_iop_t *piece,
   if(!src) return NULL;
 
   dt_dev_pixelpipe_t *pipe = piece->pipe;
-  const gboolean raw_img = dt_image_is_raw(&pipe->image) || dt_image_is_mono_sraw(&pipe->image);
-
-  // find the source module (demosaic or rawprepare)
-  GList *source_iter = NULL;
-  for(GList *iter = pipe->nodes; iter; iter = g_list_next(iter))
-  {
-    const dt_dev_pixelpipe_iop_t *candidate = iter->data;
-
-    if(dt_iop_module_is(candidate->module, "demosaic")
-       && candidate->enabled
-       && raw_img)
-    {
-      source_iter = iter;
-      break;
-    }
-    if(dt_iop_module_is(candidate->module, "rawprepare")
-       && candidate->enabled
-       && !raw_img)
-    {
-      source_iter = iter;
-      break;
-    }
-  }
+  GList *source_iter = _detail_mask_source(pipe);
   if(!source_iter)
     return NULL;
 
@@ -5526,6 +5547,106 @@ float *dt_dev_distort_detail_mask(dt_dev_pixelpipe_iop_t *piece,
 failure:
   return NULL;
 }
+
+#ifdef HAVE_SLANG_GPU
+dt_slang_gpu_image_t *dt_dev_distort_detail_mask_slang(dt_dev_pixelpipe_iop_t *piece,
+                                                       dt_slang_gpu_image_t *src,
+                                                       const dt_iop_module_t *target_module)
+{
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  GList *source_iter = _detail_mask_source(pipe);
+  if(!source_iter || !src) return NULL;
+
+  // all or nothing: a module that can only distort on the host sends the
+  // whole walk there, so check them all before running anything
+  GList *target_iter = NULL;
+  for(GList *iter = source_iter; iter; iter = g_list_next(iter))
+  {
+    const dt_dev_pixelpipe_iop_t *it_piece = iter->data;
+    if(!_skip_piece_on_tags(it_piece)
+       && it_piece->module->distort_mask && !_empty_finalscale(it_piece)
+       && !it_piece->module->distort_mask_slang)
+    {
+      dt_print_pipe(DT_DEBUG_MASKS | DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
+                    "distort detail mask slang", pipe, it_piece->module, DT_DEVICE_NONE,
+                    NULL, NULL, "no distort_mask_slang(), distorting on the host");
+      return NULL;
+    }
+    if(it_piece->module == target_module)
+    {
+      target_iter = iter;
+      break;
+    }
+  }
+  if(!target_iter) return NULL;
+
+  dt_slang_gpu_image_t *mask = src;
+  const dt_iop_roi_t *final_roi = &pipe->scharr.roi;
+  for(GList *iter = source_iter; iter; iter = g_list_next(iter))
+  {
+    dt_dev_pixelpipe_iop_t *it_piece = iter->data;
+    if(!_skip_piece_on_tags(it_piece))
+    {
+      if(it_piece->module->distort_mask && !_empty_finalscale(it_piece))
+      {
+        const dt_iop_roi_t *roi = &it_piece->processed_roi_in;
+        const dt_iop_roi_t *roo = &it_piece->processed_roi_out;
+        dt_slang_gpu_image_t *out = dt_slang_gpu_image_new(roo->width, roo->height, 1, NULL);
+
+        dt_print_pipe(DT_DEBUG_MASKS | DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
+                      "distort detail mask slang", pipe, it_piece->module, DT_DEVICE_NONE,
+                      roi, roo);
+
+        if(!out || !it_piece->module->distort_mask_slang(it_piece->module, it_piece, mask, out, roi, roo))
+        {
+          dt_slang_gpu_image_free(out);
+          goto failure;
+        }
+        if(mask != src) dt_slang_gpu_image_free(mask);
+        mask = out;
+        final_roi = roo;
+      }
+      else
+      {
+        _distort_piece_roi(it_piece);
+      }
+    }
+    if(iter == target_iter) break;
+  }
+
+  const gboolean correct = piece->processed_roi_out.width == final_roi->width
+                           && piece->processed_roi_out.height == final_roi->height;
+
+  dt_print_pipe(DT_DEBUG_MASKS | DT_DEBUG_PIPE,
+                correct ? "got detail mask slang" : "DETAIL SIZE MISMATCH",
+                pipe, target_module, DT_DEVICE_NONE, NULL, NULL,
+                "from (%ix%i) distorted to (%ix%i)",
+                pipe->scharr.roi.width, pipe->scharr.roi.height,
+                final_roi->width, final_roi->height);
+
+  // the caller owns the result and frees src itself, so an undistorted mask
+  // can't be handed back as it is
+  if(correct && mask == src)
+  {
+    const int width = final_roi->width;
+    const int height = final_roi->height;
+    const int zero = 0;
+    dt_slang_gpu_image_t *copy = dt_slang_gpu_image_new(width, height, 1, NULL);
+    if(copy
+       && !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                    SLIMG_DEV(src), SLIMG_DEV(copy), SLARG(width), SLARG(height),
+                                    SLARG(width), SLARG(height), SLARG(zero), SLARG(zero)))
+      return copy;
+    dt_slang_gpu_image_free(copy);
+    return NULL;
+  }
+  if(correct) return mask;
+
+failure:
+  if(mask != src) dt_slang_gpu_image_free(mask);
+  return NULL;
+}
+#endif
 
 dt_hash_t dt_dev_pixelpipe_piece_hash(dt_dev_pixelpipe_iop_t *piece,
                                       const dt_iop_roi_t *roi,

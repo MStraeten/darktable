@@ -216,9 +216,18 @@ typedef struct dt_dev_detail_mask_t
 {
   dt_iop_roi_t roi;
   dt_hash_t hash;
+  // the host copy. When the mask was written on the Slang device it stays
+  // there in dev_data, and data is only filled by dt_dev_scharr_mask_host()
+  // for a module that blends on the CPU
   float *data;
+  struct dt_slang_gpu_buffer_t *dev_data;
   size_t size;
 } dt_dev_detail_mask_t;
+
+static inline gboolean dt_dev_scharr_mask_available(const dt_dev_detail_mask_t *const mask)
+{
+  return mask->data != NULL || mask->dev_data != NULL;
+}
 
 /**
  * this encapsulates the pixelpipe.
@@ -559,18 +568,29 @@ float *dt_dev_get_raster_mask(dt_dev_pixelpipe_iop_t *piece,
                               gboolean *free_mask);
 // some helper functions related to the details mask interface
 void dt_dev_clear_scharr_mask(dt_dev_pixelpipe_t *pipe);
+// the host copy of the details mask, read from the device on first use.
+// NULL if there is no mask or the read failed
+const float *dt_dev_scharr_mask_host(dt_dev_pixelpipe_t *pipe);
 
 gboolean dt_dev_write_scharr_mask(dt_dev_pixelpipe_iop_t *piece,
                                   float *const rgb,
                                   const dt_iop_roi_t *const roi_in,
                                   const gboolean mode);
 #ifdef HAVE_SLANG_GPU
-// as dt_dev_write_scharr_mask(), from an RGB image on the Slang device.
-// TRUE on failure.
+// as dt_dev_write_scharr_mask(), from an RGB image on the Slang device. The
+// mask stays on the device. TRUE on failure.
 gboolean dt_dev_write_scharr_mask_slang(dt_dev_pixelpipe_iop_t *piece,
                                         struct dt_slang_gpu_image_t *in,
                                         const dt_iop_roi_t *const roi_in,
                                         const gboolean mode);
+// as dt_dev_distort_detail_mask(), on a 1-channel image on the Slang device,
+// through the modules' distort_mask_slang(). Returns a new image of the
+// target's roi_out, or NULL when a module between the mask source and the
+// target has no distort_mask_slang() or it failed: the caller then
+// distorts on the host
+struct dt_slang_gpu_image_t *dt_dev_distort_detail_mask_slang(dt_dev_pixelpipe_iop_t *piece,
+                                                              struct dt_slang_gpu_image_t *src,
+                                                              const struct dt_iop_module_t *target_module);
 #endif
 #ifdef HAVE_OPENCL
 int dt_dev_write_scharr_mask_cl(dt_dev_pixelpipe_iop_t *piece,

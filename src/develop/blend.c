@@ -270,7 +270,7 @@ static void _refine_with_detail_mask(dt_iop_module_t *self,
   const float threshold = _detail_mask_threshold(level, detail);
 
   dt_dev_pixelpipe_t *p = piece->pipe;
-  if(p->scharr.data == NULL) goto error;
+  if(!dt_dev_scharr_mask_available(&p->scharr)) goto error;
 
   float *lum = dt_masks_calc_detail_mask(piece, threshold, detail);
   if(lum == NULL) goto error;
@@ -1480,7 +1480,8 @@ static void _refine_with_detail_mask_cl(dt_iop_module_t *self,
   cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
 
   dt_dev_pixelpipe_t *p = piece->pipe;
-  if(p->scharr.data == NULL)
+  const float *scharr = dt_dev_scharr_mask_host(p);
+  if(scharr == NULL)
   {
     dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_OPENCL,
        "no detail data available", piece->pipe, self, devid, roi_in, roi_out);
@@ -1495,7 +1496,7 @@ static void _refine_with_detail_mask_cl(dt_iop_module_t *self,
   if((lum == NULL) || (out == NULL) || (blur == NULL))
     goto error;
 
-  err = dt_opencl_write_buffer_to_device(devid, p->scharr.data, out, 0, sizeof(float) * iwidth * iheight, TRUE);
+  err = dt_opencl_write_buffer_to_device(devid, (void *)scharr, out, 0, sizeof(float) * iwidth * iheight, TRUE);
   if(err != CL_SUCCESS) goto error;
 
   err = dt_opencl_enqueue_kernel_2d_args(devid, darktable.opencl->blendop->kernel_calc_blend, iwidth, iheight,
@@ -2305,13 +2306,14 @@ static int _blend_fill_mask_slang(dt_slang_gpu_image_t *mask,
                                   SLIMG_DEV(mask), SLARG(width), SLARG(height), SLARG(value));
 }
 
-// _refine_with_detail_mask() for a mask on the device. The threshold and the
-// blur of the detail mask run there, as in _refine_with_detail_mask_cl(); the
-// geometry of the modules between its source and this one is applied on the
-// host, as on the other paths, and the result goes back to the device to
-// refine the mask there. *mask is replaced by the refined mask. Returns
-// nonzero on a device error; a missing detail mask leaves the mask as it is,
-// as on the CPU.
+// _refine_with_detail_mask() for a mask on the device. The detail mask stays
+// there from dt_dev_write_scharr_mask_slang() on: the threshold and the blur
+// run on the device, as in _refine_with_detail_mask_cl(), and so does the
+// geometry of the modules between its source and this one when they all have
+// a distort_mask_slang(). Otherwise that geometry is applied on the host, as
+// on the other paths, and the result goes back to the device. *mask is
+// replaced by the refined mask. Returns nonzero on a device error; a missing
+// detail mask leaves the mask as it is, as on the CPU.
 static int _refine_with_detail_mask_slang(dt_iop_module_t *self,
                                           dt_dev_pixelpipe_iop_t *piece,
                                           dt_slang_gpu_image_t **mask,
@@ -2325,7 +2327,7 @@ static int _refine_with_detail_mask_slang(dt_iop_module_t *self,
   const float threshold = _detail_mask_threshold(level, detail);
 
   dt_dev_pixelpipe_t *p = piece->pipe;
-  if(p->scharr.data == NULL)
+  if(!dt_dev_scharr_mask_available(&p->scharr))
   {
     dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_MASKS, "refine with detail mask",
                   p, self, DT_DEVICE_NONE, roi_in, roi_out, "no mask data available");
@@ -2339,18 +2341,60 @@ static int _refine_with_detail_mask_slang(dt_iop_module_t *self,
   const int owidth = roi_out->width;
   const int oheight = roi_out->height;
 
-  dt_slang_gpu_buffer_t *dev_scharr = dt_slang_gpu_buffer_new(isize, p->scharr.data);
+  // a mask written on the CPU, by rawprepare for instance, is uploaded
+  dt_slang_gpu_buffer_t *dev_upload =
+    p->scharr.dev_data ? NULL : dt_slang_gpu_buffer_new(isize, p->scharr.data);
+  dt_slang_gpu_buffer_t *dev_scharr = p->scharr.dev_data ? p->scharr.dev_data : dev_upload;
   dt_slang_gpu_buffer_t *dev_blend = dev_scharr ? dt_slang_gpu_buffer_new_uninit(isize) : NULL;
   dt_slang_gpu_buffer_t *dev_lum = dev_blend ? dt_slang_gpu_buffer_new_uninit(isize) : NULL;
-  float *lum = dt_alloc_align_float((size_t)iwidth * iheight);
-  int err = !dev_lum || !lum
+  int err = !dev_lum
     || dt_slang_gpu_run_2d_args("blendop", "calc_detail_blend", iwidth, iheight,
                                 SLBUF_DEV(dev_scharr), SLBUF_DEV(dev_blend), SLARG(iwidth), SLARG(iheight),
                                 SLARG(threshold), SLARG(detail))
-    || dt_gaussian_fast_blur_slang_buffer(dev_blend, dev_lum, iwidth, iheight, 2.0f, 0.0f, 1.0f)
-    || dt_slang_gpu_buffer_read(dev_lum, lum, isize);
-  dt_slang_gpu_buffer_free(dev_scharr);
+    || dt_gaussian_fast_blur_slang_buffer(dev_blend, dev_lum, iwidth, iheight, 2.0f, 0.0f, 1.0f);
+  dt_slang_gpu_buffer_free(dev_upload);
   dt_slang_gpu_buffer_free(dev_blend);
+  if(err)
+  {
+    dt_slang_gpu_buffer_free(dev_lum);
+    return err;
+  }
+
+  dt_slang_gpu_image_t *lum_img = dt_slang_gpu_image_new(iwidth, iheight, 1, NULL);
+  err = !lum_img
+    || dt_slang_gpu_run_2d_args("blendop", "detail_buffer_to_image", iwidth, iheight,
+                                SLBUF_DEV(dev_lum), SLIMG_DEV(lum_img), SLARG(iwidth), SLARG(iheight));
+  dt_slang_gpu_image_t *dev_warp = err ? NULL : dt_dev_distort_detail_mask_slang(piece, lum_img, self);
+  dt_slang_gpu_image_free(lum_img);
+  if(err)
+  {
+    dt_slang_gpu_buffer_free(dev_lum);
+    return err;
+  }
+
+  if(dev_warp)
+  {
+    dt_slang_gpu_buffer_free(dev_lum);
+    dt_print_pipe(DT_DEBUG_PIPE, "refine with detail mask slang", p, self, DT_DEVICE_NONE,
+                  roi_in, roi_out, "distorted on the device");
+    dt_slang_gpu_image_t *refined = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
+    err = !refined
+      || dt_slang_gpu_run_2d_args("blendop", "blendop_detail_multiply_image", owidth, oheight,
+                                  SLIMG_DEV(*mask), SLIMG_DEV(dev_warp), SLIMG_DEV(refined),
+                                  SLARG(owidth), SLARG(oheight));
+    dt_slang_gpu_image_free(dev_warp);
+    if(err)
+    {
+      dt_slang_gpu_image_free(refined);
+      return 1;
+    }
+    dt_slang_gpu_image_free(*mask);
+    *mask = refined;
+    return 0;
+  }
+
+  float *lum = dt_alloc_align_float((size_t)iwidth * iheight);
+  err = !lum || dt_slang_gpu_buffer_read(dev_lum, lum, isize);
   dt_slang_gpu_buffer_free(dev_lum);
   if(err)
   {
@@ -2371,16 +2415,17 @@ static int _refine_with_detail_mask_slang(dt_iop_module_t *self,
     return 0;
   }
 
-  dt_print_pipe(DT_DEBUG_PIPE, "refine with detail mask slang", p, self, DT_DEVICE_NONE, roi_in, roi_out);
+  dt_print_pipe(DT_DEBUG_PIPE, "refine with detail mask slang", p, self, DT_DEVICE_NONE,
+                roi_in, roi_out, "distorted on the host");
 
-  dt_slang_gpu_buffer_t *dev_warp = dt_slang_gpu_buffer_new(sizeof(float) * owidth * oheight, warp_mask);
+  dt_slang_gpu_buffer_t *dev_host_warp = dt_slang_gpu_buffer_new(sizeof(float) * owidth * oheight, warp_mask);
   dt_free_align(warp_mask);
-  dt_slang_gpu_image_t *refined = dev_warp ? dt_slang_gpu_image_new(owidth, oheight, 1, NULL) : NULL;
+  dt_slang_gpu_image_t *refined = dev_host_warp ? dt_slang_gpu_image_new(owidth, oheight, 1, NULL) : NULL;
   err = !refined
     || dt_slang_gpu_run_2d_args("blendop", "blendop_detail_multiply", owidth, oheight,
-                                SLIMG_DEV(*mask), SLBUF_DEV(dev_warp), SLIMG_DEV(refined),
+                                SLIMG_DEV(*mask), SLBUF_DEV(dev_host_warp), SLIMG_DEV(refined),
                                 SLARG(owidth), SLARG(oheight));
-  dt_slang_gpu_buffer_free(dev_warp);
+  dt_slang_gpu_buffer_free(dev_host_warp);
   if(err)
   {
     dt_slang_gpu_image_free(refined);
@@ -2941,7 +2986,7 @@ void tiling_callback_blendop(dt_iop_module_t *self,
     // details mask requires 2 additional quarter buffers of details data size
     // so normalize to roi_size
     dt_dev_detail_mask_t *details = &piece->pipe->scharr;
-    if(details->data)
+    if(dt_dev_scharr_mask_available(details))
     {
       tiling->factor = 0.5f * (float)(details->roi.width * details->roi.height) / (roi_in->width * roi_in->height);
       tiling->factor_cl = tiling->factor;

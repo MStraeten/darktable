@@ -185,7 +185,7 @@ float *dt_masks_calc_detail_mask(dt_dev_pixelpipe_iop_t *piece,
   dt_dev_pixelpipe_t *pipe = piece->pipe;
   dt_dev_detail_mask_t *details = &pipe->scharr;
 
-  if(!details->data)
+  if(!dt_dev_scharr_mask_host(pipe))
     return NULL;
 
   const size_t msize = (size_t) details->roi.width * details->roi.height;
