@@ -78,6 +78,10 @@ if [ -d "$ORT_LIB_DIR" ]; then
   echo "Bundled ONNX Runtime from $ORT_LIB_DIR"
 fi
 
+# appimagetool creates .DirIcon only from a PNG or XPM icon at the top level
+# of the AppDir; linuxdeploy places just the scalable SVG there.
+cp ../AppDir/usr/share/icons/hicolor/256x256/apps/darktable.png ../AppDir/
+
 # Since linuxdeploy is itself an AppImage, we don't rely on it being installed
 # on the build system, but download it every time we run this script. If that
 # doesn't suit you (for example, you want to build an AppImage without an
