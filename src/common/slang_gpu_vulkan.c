@@ -1901,7 +1901,9 @@ static int _run(const char *program,
   }
   if(nres != k->nres || nvals != k->nvals) goto mismatch;
 
-  dt_slang_batch_t *b = _batch_begin(entry, width, height);
+  // the timing is printed once the batch has finished, after the caller's
+  // entry name may be gone: gaussian.c builds its names on the stack
+  dt_slang_batch_t *b = _batch_begin(g_intern_string(entry), width, height);
   if(!b) return 1;
 
   int err = 1;
