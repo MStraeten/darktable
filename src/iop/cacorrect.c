@@ -22,6 +22,7 @@
 #endif
 
 #include "bauhaus/bauhaus.h"
+#include "common/slang_gpu.h"
 #include "common/darktable.h"
 #include "common/imagebuf.h"
 #include "common/gaussian.h"
@@ -1909,6 +1910,18 @@ void distort_mask(dt_iop_module_t *self,
 {
   dt_iop_copy_image_roi(out, in, 1, roi_in, roi_out);
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  return !dt_iop_copy_image_roi_slang(dev_out, dev_in, roi_in, roi_out);
+}
+#endif
 
 void reload_defaults(dt_iop_module_t *self)
 {

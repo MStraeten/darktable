@@ -428,6 +428,25 @@ void distort_mask(dt_iop_module_t *self,
   }
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_borders_data_t *d = piece->data;
+  dt_iop_border_positions_t binfo;
+  dt_iop_setup_binfo(piece, roi_in, roi_out, d->pos_v, d->pos_h,
+                     d->color, d->frame_color, d->frame_size, d->frame_offset, &binfo);
+  // the image inside the border, zero on the border itself
+  return !dt_iop_image_blit_slang(dev_out, dev_in, roi_in->width, roi_in->height,
+                                  roi_out->width, roi_out->height,
+                                  -binfo.border_in_x, -binfo.border_in_y);
+}
+#endif
+
 void modify_roi_out(dt_iop_module_t *self,
                     dt_dev_pixelpipe_iop_t *piece,
                     dt_iop_roi_t *roi_out,

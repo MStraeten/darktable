@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/slang_gpu.h"
 #include "common/gdk_event_utils.h"
 
 #include "bauhaus/bauhaus.h"
@@ -4039,6 +4040,21 @@ void distort_mask(dt_iop_module_t *self,
 {
   rt_copy_in_to_out(in, roi_in, out, roi_out, 1, 0, 0, 0.0f, 0.0f, 0.0f);
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  // the unrotated copy of rt_copy_in_to_out(), which distort_mask() uses
+  return !dt_iop_image_blit_slang(dev_out, dev_in, roi_in->width, roi_in->height,
+                                  roi_out->width, roi_out->height,
+                                  roi_out->x - roi_in->x, roi_out->y - roi_in->y);
+}
+#endif
 
 #ifdef HAVE_OPENCL
 

@@ -243,6 +243,20 @@ void dt_iop_copy_image_roi(float *const __restrict__ out,
 }
 
 #ifdef HAVE_SLANG_GPU
+int dt_iop_image_blit_slang(dt_slang_gpu_image_t *out,
+                            dt_slang_gpu_image_t *in,
+                            const int iwidth,
+                            const int iheight,
+                            const int owidth,
+                            const int oheight,
+                            const int dx,
+                            const int dy)
+{
+  return dt_slang_gpu_run_2d_args("basic", "interpolation_copy", owidth, oheight,
+                                  SLIMG_DEV(in), SLIMG_DEV(out), SLARG(owidth), SLARG(oheight),
+                                  SLARG(iwidth), SLARG(iheight), SLARG(dx), SLARG(dy));
+}
+
 int dt_iop_copy_image_roi_slang(dt_slang_gpu_image_t *out,
                                 dt_slang_gpu_image_t *in,
                                 const dt_iop_roi_t *const roi_in,
@@ -257,9 +271,7 @@ int dt_iop_copy_image_roi_slang(dt_slang_gpu_image_t *out,
   const gboolean same = iwidth == owidth && iheight == oheight;
   const int dx = same ? 0 : roi_out->x - roi_in->x;
   const int dy = same ? 0 : roi_out->y - roi_in->y;
-  return dt_slang_gpu_run_2d_args("basic", "interpolation_copy", owidth, oheight,
-                                  SLIMG_DEV(in), SLIMG_DEV(out), SLARG(owidth), SLARG(oheight),
-                                  SLARG(iwidth), SLARG(iheight), SLARG(dx), SLARG(dy));
+  return dt_iop_image_blit_slang(out, in, iwidth, iheight, owidth, oheight, dx, dy);
 }
 #endif
 

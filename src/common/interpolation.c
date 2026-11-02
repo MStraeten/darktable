@@ -1534,6 +1534,27 @@ int dt_interpolation_resample_tile_slang(const dt_interpolation_t *itor,
                          roi_out->y - roi_in->y * roi_out->scale);
 }
 
+int dt_interpolation_resample_mask_slang(const dt_interpolation_t *itor,
+                                         dt_slang_gpu_image_t *dev_out,
+                                         const dt_iop_roi_t *const roi_out,
+                                         dt_slang_gpu_image_t *dev_in,
+                                         const dt_iop_roi_t *const roi_in)
+{
+  // the 1:1 copy of dt_interpolation_resample_mask() is not clipped
+  if(roi_out->scale == 1.0f)
+    return dt_interpolation_resample_slang(itor, dev_out, roi_out, dev_in, roi_in);
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 1, NULL);
+  const int err = !tmp
+    || dt_interpolation_resample_slang(itor, tmp, roi_out, dev_in, roi_in)
+    || dt_slang_gpu_run_2d_args("basic", "mask_clip", width, height,
+                                SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height));
+  dt_slang_gpu_image_free(tmp);
+  return err;
+}
+
 int dt_interpolation_resample_roi_mask_slang(const dt_interpolation_t *itor,
                                              dt_slang_gpu_image_t *dev_out,
                                              const dt_iop_roi_t *const roi_out,
@@ -1544,20 +1565,7 @@ int dt_interpolation_resample_roi_mask_slang(const dt_interpolation_t *itor,
   oroi.x = oroi.y = 0;
   dt_iop_roi_t iroi = *roi_in;
   iroi.x = iroi.y = 0;
-
-  // the 1:1 copy of dt_interpolation_resample_mask() is not clipped
-  if(roi_out->scale == 1.0f)
-    return dt_interpolation_resample_slang(itor, dev_out, &oroi, dev_in, &iroi);
-
-  const int width = roi_out->width;
-  const int height = roi_out->height;
-  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 1, NULL);
-  const int err = !tmp
-    || dt_interpolation_resample_slang(itor, tmp, &oroi, dev_in, &iroi)
-    || dt_slang_gpu_run_2d_args("basic", "mask_clip", width, height,
-                                SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height));
-  dt_slang_gpu_image_free(tmp);
-  return err;
+  return dt_interpolation_resample_mask_slang(itor, dev_out, &oroi, dev_in, &iroi);
 }
 #endif
 

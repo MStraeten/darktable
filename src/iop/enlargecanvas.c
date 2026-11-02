@@ -18,6 +18,7 @@
 
 // our includes go first:
 #include "bauhaus/bauhaus.h"
+#include "common/imagebuf.h"
 #include "common/opencl.h"
 #include "common/slang_gpu.h"
 #include "develop/imageop.h"
@@ -336,6 +337,32 @@ void distort_mask(dt_iop_module_t *self,
     memcpy(outb, inb, sizeof(float) * roi_in->width);
   }
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_enlargecanvas_data_t *const d = piece->data;
+  float pos_v = .5f;
+  float pos_h = .5f;
+  _compute_pos(d, &pos_v, &pos_h);
+  dt_iop_border_positions_t binfo;
+  dt_aligned_pixel_t bcolor = { 0 };
+  dt_aligned_pixel_t fcolor = { 0 };
+  dt_iop_setup_binfo(piece, roi_in, roi_out, pos_v, pos_h,
+                     bcolor, fcolor, 0.f, 0.f, &binfo);
+  const int border_in_x = CLAMP(binfo.border_in_x, 0, roi_out->width - roi_in->width);
+  const int border_in_y = CLAMP(binfo.border_in_y, 0, roi_out->height - roi_in->height);
+  // the image inside the canvas, zero on the added border
+  return !dt_iop_image_blit_slang(dev_out, dev_in, roi_in->width, roi_in->height,
+                                  roi_out->width, roi_out->height,
+                                  -border_in_x, -border_in_y);
+}
+#endif
 
 void init_pipe(dt_iop_module_t *self,
                dt_dev_pixelpipe_t *pipe,

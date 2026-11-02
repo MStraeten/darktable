@@ -108,6 +108,16 @@ void dt_iop_copy_image_roi(float *const __restrict__ out,
 
 #ifdef HAVE_SLANG_GPU
 struct dt_slang_gpu_image_t;
+// out(x, y) = in(x + dx, y + dy) for 1- or 4-channel images on the Slang
+// device, zero where that falls outside in. Returns 0 on success
+int dt_iop_image_blit_slang(struct dt_slang_gpu_image_t *out,
+                            struct dt_slang_gpu_image_t *in,
+                            const int iwidth,
+                            const int iheight,
+                            const int owidth,
+                            const int oheight,
+                            const int dx,
+                            const int dy);
 // dt_iop_copy_image_roi() for images on the Slang device. Returns 0 on success
 int dt_iop_copy_image_roi_slang(struct dt_slang_gpu_image_t *out,
                                 struct dt_slang_gpu_image_t *in,
