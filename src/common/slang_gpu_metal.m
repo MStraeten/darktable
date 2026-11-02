@@ -1022,6 +1022,44 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *image, const void *host)
   return 0;
 }
 
+// the device shares the host's memory, so these copy on the CPU as the
+// whole-image read and write do
+int dt_slang_gpu_image_write_rect(dt_slang_gpu_image_t *image, const void *host, const size_t pitch)
+{
+  DtSlangImage *img = (__bridge DtSlangImage *)image;
+  if(!img || !host) return 1;
+  const size_t row = sizeof(float) * img->channels * img->width;
+  if(pitch == row) return dt_slang_gpu_image_write(image, host);
+  void *packed = dt_alloc_aligned(row * img->height);
+  if(!packed) return 1;
+  _copy_rows(packed, row, host, pitch, row, img->height);
+  const int err = dt_slang_gpu_image_write(image, packed);
+  dt_free_align(packed);
+  return err;
+}
+
+int dt_slang_gpu_image_read_rect(dt_slang_gpu_image_t *image,
+                                 const int x,
+                                 const int y,
+                                 const int width,
+                                 const int height,
+                                 void *host,
+                                 const size_t pitch)
+{
+  DtSlangImage *img = (__bridge DtSlangImage *)image;
+  if(!img || !host || x < 0 || y < 0 || width <= 0 || height <= 0
+     || x + width > img->width || y + height > img->height)
+    return 1;
+  const size_t bpp = sizeof(float) * img->channels;
+  const size_t row = bpp * img->width;
+  char *packed = dt_alloc_aligned(row * img->height);
+  if(!packed) return 1;
+  const int err = dt_slang_gpu_image_read(image, packed);
+  if(!err) _copy_rows(host, pitch, packed + (size_t)y * row + (size_t)x * bpp, row, bpp * width, height);
+  dt_free_align(packed);
+  return err;
+}
+
 // --------------------------------------------------------------------------------------------
 // device buffers
 

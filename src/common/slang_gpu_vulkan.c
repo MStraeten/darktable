@@ -93,6 +93,9 @@ typedef struct dt_slang_vulkan_t
   VkDeviceSize pool_budget; // bytes the image and buffer pools may keep together
   gboolean memory_budget;   // VK_EXT_memory_budget reports the free device memory
   gboolean discrete;        // the device has memory of its own, which OpenCL shares
+  gboolean host_import;     // VK_EXT_external_memory_host: copies read and write host memory directly
+  VkDeviceSize import_align; // its minImportedHostPointerAlignment
+  PFN_vkGetMemoryHostPointerPropertiesEXT host_pointer_props;
 } dt_slang_vulkan_t;
 
 static dt_slang_vulkan_t _vk = { 0 };
@@ -106,6 +109,14 @@ static GThread *_prepare_thread = NULL;
 static gboolean _device_heap(const uint32_t h)
 {
   return !_vk.discrete || (_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+}
+
+// the part of heap h's budget darktable may fill. An integrated GPU shares
+// its memory with the desktop, so 2% of each heap stays free there
+static VkDeviceSize _usable_budget(const VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget, const uint32_t h)
+{
+  const VkDeviceSize reserve = _vk.discrete ? 0 : _vk.memprops.memoryHeaps[h].size / 50;
+  return budget->heapBudget[h] > reserve ? budget->heapBudget[h] - reserve : 0;
 }
 
 // --------------------------------------------------------------------------------------------
@@ -195,16 +206,30 @@ static gboolean _init_device(void)
     dt_print(DT_DEBUG_SLANG, "[slang_gpu] memory heap %u: %" PRIu64 " MB%s", h,
              (uint64_t)(_vk.memprops.memoryHeaps[h].size >> 20),
              _vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? ", device local" : "");
+  // an integrated GPU's images come from all heaps, and _make_room() evicts
+  // the pools when an allocation needs the memory. Half of it holds the
+  // nine 380 MB images of a 64 MP denoiseprofile tile: within a quarter of
+  // the largest heap they were freed after each tile, and allocating them
+  // again, which has the kernel clear the pages, cost 0.1-0.15 s per tile
+  VkDeviceSize all_heaps = 0;
   for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
     if(_device_heap(h))
+    {
       _vk.pool_budget = MAX(_vk.pool_budget, _vk.memprops.memoryHeaps[h].size / 4);
+      all_heaps += _vk.memprops.memoryHeaps[h].size;
+    }
+  if(!_vk.discrete) _vk.pool_budget = all_heaps / 2;
 
   uint32_t next = 0;
   vkEnumerateDeviceExtensionProperties(_vk.pdev, NULL, &next, NULL);
   VkExtensionProperties *ext = g_new(VkExtensionProperties, next);
   vkEnumerateDeviceExtensionProperties(_vk.pdev, NULL, &next, ext);
+  gboolean host_import = FALSE;
   for(uint32_t e = 0; e < next; e++)
+  {
     if(!strcmp(ext[e].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) _vk.memory_budget = TRUE;
+    if(!strcmp(ext[e].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) host_import = TRUE;
+  }
   g_free(ext);
 
   VkPhysicalDeviceFeatures features;
@@ -240,9 +265,12 @@ static gboolean _init_device(void)
   // 64-bit integers seed filmic's noise, as in OpenCL; nearly every device has them
   const VkPhysicalDeviceFeatures enable = { .shaderStorageImageWriteWithoutFormat = VK_TRUE,
                                             .shaderInt64 = features.shaderInt64 };
+  const char *const dev_ext[] = { VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME };
   const VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                    .queueCreateInfoCount = 1,
                                    .pQueueCreateInfos = &qci,
+                                   .enabledExtensionCount = host_import ? 1 : 0,
+                                   .ppEnabledExtensionNames = dev_ext,
                                    .pEnabledFeatures = &enable };
   if(vkCreateDevice(_vk.pdev, &dci, NULL, &_vk.dev) != VK_SUCCESS)
   {
@@ -250,6 +278,24 @@ static gboolean _init_device(void)
     return FALSE;
   }
   vkGetDeviceQueue(_vk.dev, family, 0, &_vk.queue);
+
+  // copies between host and device images then run on the GPU's copy
+  // engine straight from the pipe's buffers, instead of the CPU copying
+  // every byte through a staging buffer
+  if(host_import)
+  {
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp
+        = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
+    VkPhysicalDeviceProperties2 props2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp };
+    vkGetPhysicalDeviceProperties2(_vk.pdev, &props2);
+    _vk.import_align = hp.minImportedHostPointerAlignment;
+    _vk.host_pointer_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)
+      vkGetDeviceProcAddr(_vk.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    _vk.host_import = _vk.host_pointer_props && _vk.import_align > 0
+                      && (_vk.import_align & (_vk.import_align - 1)) == 0;
+  }
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] %s", _vk.host_import ? "copies use host memory directly"
+                                                              : "copies go through staging buffers");
 
   const VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                          .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT
@@ -622,7 +668,7 @@ static gboolean _heap_has_room(const uint32_t h, const VkDeviceSize size)
   VkPhysicalDeviceMemoryProperties2 props2
       = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
   vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
-  return budget.heapUsage[h] + size <= budget.heapBudget[h];
+  return budget.heapUsage[h] + size <= _usable_budget(&budget, h);
 }
 
 // memory for a device image or buffer, device local if possible. On an
@@ -1157,7 +1203,7 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
   VkPhysicalDeviceMemoryProperties2 props2
       = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
   vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
-  if(budget.heapUsage[heap] + size <= budget.heapBudget[heap]) return;
+  if(budget.heapUsage[heap] + size <= _usable_budget(&budget, heap)) return;
 
   // an integrated GPU's heaps share one pool of memory, and the large
   // staging buffers kept for reuse grew to more than the host heap during
@@ -1166,7 +1212,7 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
   if(!_vk.discrete && _vk.staging)
   {
     VkDeviceSize staged = 0;
-    while(_vk.staging && budget.heapUsage[heap] + size > budget.heapBudget[heap])
+    while(_vk.staging && budget.heapUsage[heap] + size > _usable_budget(&budget, heap))
     {
       GList *oldest = g_list_last(_vk.staging);
       staged += ((const dt_slang_staging_t *)oldest->data)->size;
@@ -1176,10 +1222,10 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
     }
     dt_print(DT_DEBUG_SLANG, "[slang_gpu] freeing %" PRIu64 " MB of idle staging buffers for %" PRIu64 " MB",
              (uint64_t)(staged >> 20), (uint64_t)(size >> 20));
-    if(budget.heapUsage[heap] + size <= budget.heapBudget[heap]) return;
+    if(budget.heapUsage[heap] + size <= _usable_budget(&budget, heap)) return;
   }
 
-  const VkDeviceSize need = budget.heapUsage[heap] + size - budget.heapBudget[heap];
+  const VkDeviceSize need = budget.heapUsage[heap] + size - _usable_budget(&budget, heap);
   VkDeviceSize found = 0;
   uint64_t until = 0;
   for(GList *l = _vk.doomed_images; l; l = g_list_next(l))
@@ -1365,12 +1411,142 @@ static gboolean _record_upload(dt_slang_batch_t *b, const void *host, const size
   return TRUE;
 }
 
-// copies between host memory and a device image through a staging buffer.
-// Writes don't wait; reads wait for the kernels before them.
-static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean to_device)
+// host memory the device copies from and to directly. An import lives only
+// for its one copy: with the 1 GB input and output of a tiled
+// denoiseprofile imported for the whole module, each of its hundreds of
+// submissions got slower on amdgpu, and the module took 5.4 instead of
+// 2.8 seconds
+typedef struct dt_slang_import_t
 {
-  const size_t bytes = sizeof(float) * img->channels * img->width * img->height;
-  dt_slang_staging_t *s = _staging_acquire(bytes, to_device);
+  const char *base;   // the host address rounded down to the import alignment
+  dt_slang_mem_t mem; // a transfer buffer on the imported pages
+} dt_slang_import_t;
+
+// pinning the pages costs about 0.1 ms per MB, and below this the copy
+// through a staging buffer is cheaper
+#define DT_SLANG_IMPORT_MIN (4 << 20)
+
+static void _import_free(dt_slang_import_t *imp)
+{
+  _free_mem(&imp->mem);
+  g_free(imp);
+}
+
+static dt_slang_import_t *_import_new(const void *host, const size_t bytes)
+{
+  if(!_vk.host_import || !host || bytes == 0) return NULL;
+  const uintptr_t start = (uintptr_t)host & ~(uintptr_t)(_vk.import_align - 1);
+  const uintptr_t end = ((uintptr_t)host + bytes + _vk.import_align - 1) & ~(uintptr_t)(_vk.import_align - 1);
+  const VkDeviceSize span = end - start;
+
+  VkMemoryHostPointerPropertiesEXT hpp = { .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+  if(_vk.host_pointer_props(_vk.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                            (const void *)start, &hpp) != VK_SUCCESS)
+    return NULL;
+
+  dt_slang_import_t *imp = g_new0(dt_slang_import_t, 1);
+  imp->base = (const char *)start;
+  const VkExternalMemoryBufferCreateInfo ebci
+      = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+          .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
+  const VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                   .pNext = &ebci,
+                                   .size = span,
+                                   .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+  VkMemoryRequirements req = { 0 };
+  uint32_t type = 0;
+  // host reads after a device write need no invalidation in a coherent type
+  gboolean ok = vkCreateBuffer(_vk.dev, &bci, NULL, &imp->mem.buffer) == VK_SUCCESS;
+  if(ok)
+  {
+    vkGetBufferMemoryRequirements(_vk.dev, imp->mem.buffer, &req);
+    ok = req.size <= span
+         && _memtype(req.memoryTypeBits & hpp.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &type);
+  }
+  if(ok)
+  {
+    const VkImportMemoryHostPointerInfoEXT import
+        = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+            .pHostPointer = (void *)start };
+    const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                       .pNext = &import,
+                                       .allocationSize = span,
+                                       .memoryTypeIndex = type };
+    ok = _allocate(&mai, &imp->mem.buffer_mem)
+         && vkBindBufferMemory(_vk.dev, imp->mem.buffer, imp->mem.buffer_mem, 0) == VK_SUCCESS;
+  }
+  if(!ok)
+  {
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't import %zu MB of host memory, copying it instead", bytes >> 20);
+    _import_free(imp);
+    return NULL;
+  }
+  return imp;
+}
+
+static void _copy_rows(void *dst, const size_t dst_pitch, const void *src, const size_t src_pitch,
+                       const size_t row, const int height)
+{
+  if(dst_pitch == row && src_pitch == row)
+  {
+    _copy(dst, src, row * height);
+    return;
+  }
+  DT_OMP_FOR()
+  for(int y = 0; y < height; y++)
+    memcpy((char *)dst + y * dst_pitch, (const char *)src + y * src_pitch, row);
+}
+
+// copies between the rectangle x, y, w x h of img and host, whose rows are
+// pitch bytes apart. With the host memory imported the GPU copies it
+// directly, and both directions wait for the copy, as the caller may change
+// or free host afterwards; otherwise the CPU copies it through a staging
+// buffer, and only reads wait.
+static int _image_transfer_rect(dt_slang_gpu_image_t *img,
+                                void *host,
+                                const size_t pitch,
+                                const int x,
+                                const int y,
+                                const int w,
+                                const int h,
+                                const gboolean to_device)
+{
+  const size_t bpp = sizeof(float) * img->channels;
+  const size_t row = bpp * w;
+  const size_t span = pitch * (h - 1) + row;
+  VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                             .imageOffset = { x, y, 0 },
+                             .imageExtent = { w, h, 1 } };
+
+  // the copy engine addresses the host rows in whole pixels
+  dt_slang_import_t *imp = _vk.host_import && span >= DT_SLANG_IMPORT_MIN
+                           && pitch % bpp == 0 && (uintptr_t)host % bpp == 0
+    ? _import_new(host, span)
+    : NULL;
+  if(imp)
+  {
+    dt_slang_batch_t *b = _batch_begin(NULL, 0, 0);
+    if(!b)
+    {
+      _import_free(imp);
+      return 1;
+    }
+    copy.bufferOffset = (const char *)host - imp->base;
+    copy.bufferRowLength = pitch / bpp;
+    if(to_device)
+      vkCmdCopyBufferToImage(b->cb, imp->mem.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    else
+    {
+      vkCmdCopyImageToBuffer(b->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, imp->mem.buffer, 1, &copy);
+      _host_read_barrier(b->cb);
+    }
+    const gboolean ok = _batch_submit(b, TRUE);
+    _import_free(imp);
+    return ok ? 0 : 1;
+  }
+
+  dt_slang_staging_t *s = _staging_acquire(row * h, to_device);
   if(!s) return 1;
   dt_slang_batch_t *b = _batch_begin(NULL, 0, 0);
   if(!b)
@@ -1378,11 +1554,9 @@ static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean
     _staging_release(s);
     return 1;
   }
-  const VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                                   .imageExtent = { img->width, img->height, 1 } };
   if(to_device)
   {
-    _copy(s->mem.map, host, bytes);
+    _copy_rows(s->mem.map, row, host, pitch, row, h);
     b->staging = g_list_prepend(b->staging, s);
     vkCmdCopyBufferToImage(b->cb, s->mem.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     return _batch_submit(b, FALSE) ? 0 : 1;
@@ -1394,10 +1568,17 @@ static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean
   if(ok)
   {
     _invalidate(&s->mem);
-    _copy(host, s->mem.map, bytes);
+    _copy_rows(host, pitch, s->mem.map, row, row, h);
   }
   _staging_release(s);
   return ok ? 0 : 1;
+}
+
+// copies between host memory and the whole of img
+static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean to_device)
+{
+  const size_t row = sizeof(float) * img->channels * img->width;
+  return _image_transfer_rect(img, host, row, 0, 0, img->width, img->height, to_device);
 }
 
 void dt_slang_gpu_cleanup(void)
@@ -1562,6 +1743,32 @@ int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host)
   g_mutex_unlock(&_vk_lock);
   dt_print(DT_DEBUG_PERF, "[slang_gpu] writing %dx%d to the device took %.3f secs",
            img->width, img->height, dt_get_debug_wtime() - start);
+  return err;
+}
+
+int dt_slang_gpu_image_write_rect(dt_slang_gpu_image_t *img, const void *host, const size_t pitch)
+{
+  if(!img || !host) return 1;
+  g_mutex_lock(&_vk_lock);
+  const int err = _image_transfer_rect(img, (void *)host, pitch, 0, 0, img->width, img->height, TRUE);
+  g_mutex_unlock(&_vk_lock);
+  return err;
+}
+
+int dt_slang_gpu_image_read_rect(dt_slang_gpu_image_t *img,
+                                 const int x,
+                                 const int y,
+                                 const int width,
+                                 const int height,
+                                 void *host,
+                                 const size_t pitch)
+{
+  if(!img || !host || x < 0 || y < 0 || width <= 0 || height <= 0
+     || x + width > img->width || y + height > img->height)
+    return 1;
+  g_mutex_lock(&_vk_lock);
+  const int err = _image_transfer_rect(img, host, pitch, x, y, width, height, FALSE);
+  g_mutex_unlock(&_vk_lock);
   return err;
 }
 
@@ -1881,8 +2088,9 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
       VkDeviceSize total = 0;
       for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
       {
-        total += budget.heapBudget[h];
-        if(budget.heapBudget[h] > budget.heapUsage[h]) best += budget.heapBudget[h] - budget.heapUsage[h];
+        const VkDeviceSize usable = _usable_budget(&budget, h);
+        total += usable;
+        if(usable > budget.heapUsage[h]) best += usable - budget.heapUsage[h];
       }
       for(GList *l = _vk.staging; l; l = g_list_next(l))
         pooled += ((const dt_slang_staging_t *)l->data)->size;

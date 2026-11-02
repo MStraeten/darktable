@@ -133,6 +133,17 @@ int dt_slang_gpu_image_height(const dt_slang_gpu_image_t *img);
 // a read waits for the kernels writing the image to finish.
 int dt_slang_gpu_image_read(dt_slang_gpu_image_t *img, void *host);
 int dt_slang_gpu_image_write(dt_slang_gpu_image_t *img, const void *host);
+// the same for host rows pitch bytes apart, such as a tile of a larger
+// host image: the write fills the whole image, the read copies the
+// rectangle x, y, width x height of it
+int dt_slang_gpu_image_write_rect(dt_slang_gpu_image_t *img, const void *host, const size_t pitch);
+int dt_slang_gpu_image_read_rect(dt_slang_gpu_image_t *img,
+                                 const int x,
+                                 const int y,
+                                 const int width,
+                                 const int height,
+                                 void *host,
+                                 const size_t pitch);
 // waits for every kernel that has been started
 void dt_slang_gpu_wait(void);
 // frees the images and buffers kept for reuse, on a GPU with memory of its
