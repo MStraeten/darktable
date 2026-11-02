@@ -99,6 +99,15 @@ static dt_slang_vulkan_t _vk = { 0 };
 static GMutex _vk_lock;
 static GThread *_prepare_thread = NULL;
 
+// whether device images and buffers may live in heap h. An integrated GPU,
+// such as an AMD APU, has only a BIOS carve-out of 0.5-2 GB as device local
+// memory, and reaches the rest of system memory through the host heap
+// (GTT) at the same speed
+static gboolean _device_heap(const uint32_t h)
+{
+  return !_vk.discrete || (_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
+}
+
 // --------------------------------------------------------------------------------------------
 // device
 
@@ -187,7 +196,7 @@ static gboolean _init_device(void)
              (uint64_t)(_vk.memprops.memoryHeaps[h].size >> 20),
              _vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? ", device local" : "");
   for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
-    if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+    if(_device_heap(h))
       _vk.pool_budget = MAX(_vk.pool_budget, _vk.memprops.memoryHeaps[h].size / 4);
 
   uint32_t next = 0;
@@ -601,6 +610,47 @@ static gboolean _memtype(const uint32_t bits, const VkMemoryPropertyFlags want, 
   return FALSE;
 }
 
+// whether size more bytes fit the budget of heap h; without
+// VK_EXT_memory_budget only a failed allocation tells
+static gboolean _heap_has_room(const uint32_t h, const VkDeviceSize size)
+{
+  if(!_vk.memory_budget) return TRUE;
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT budget
+      = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+  VkPhysicalDeviceMemoryProperties2 props2
+      = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
+  vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
+  return budget.heapUsage[h] + size <= budget.heapBudget[h];
+}
+
+// memory for a device image or buffer, device local if possible. On an
+// integrated GPU it goes to another heap once the carve-out is full, instead
+// of evicting the pools to squeeze into it
+static gboolean _alloc_on_device(const VkMemoryRequirements *req, VkDeviceMemory *mem)
+{
+  uint32_t local;
+  if(!_memtype(req->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &local)
+     && !_memtype(req->memoryTypeBits, 0, &local))
+    return FALSE;
+  const uint32_t local_heap = _vk.memprops.memoryTypes[local].heapIndex;
+  uint32_t other = UINT32_MAX;
+  if(!_vk.discrete)
+    for(uint32_t i = 0; i < _vk.memprops.memoryTypeCount && other == UINT32_MAX; i++)
+      if((req->memoryTypeBits & (1u << i)) && _vk.memprops.memoryTypes[i].heapIndex != local_heap)
+        other = i;
+
+  VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .allocationSize = req->size,
+                               .memoryTypeIndex = local };
+  if(other != UINT32_MAX && !_heap_has_room(local_heap, req->size)
+     && _heap_has_room(_vk.memprops.memoryTypes[other].heapIndex, req->size))
+    mai.memoryTypeIndex = other;
+  if(_allocate(&mai, mem)) return TRUE;
+  if(other == UINT32_MAX || mai.memoryTypeIndex == other) return FALSE;
+  mai.memoryTypeIndex = other;
+  return _allocate(&mai, mem);
+}
+
 // a mapped buffer in the first memory type matching one of the n wanted
 // property sets, in order
 static gboolean _alloc_mapped(dt_slang_mem_t *m,
@@ -664,14 +714,7 @@ static gboolean _alloc_device(dt_slang_mem_t *m, const VkDeviceSize size)
   if(vkCreateBuffer(_vk.dev, &bci, NULL, &m->buffer) != VK_SUCCESS) return FALSE;
   VkMemoryRequirements req;
   vkGetBufferMemoryRequirements(_vk.dev, m->buffer, &req);
-  uint32_t type;
-  if(!_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)
-     && !_memtype(req.memoryTypeBits, 0, &type))
-    return FALSE;
-  const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                     .allocationSize = req.size,
-                                     .memoryTypeIndex = type };
-  return _allocate(&mai, &m->buffer_mem)
+  return _alloc_on_device(&req, &m->buffer_mem)
          && vkBindBufferMemory(_vk.dev, m->buffer, m->buffer_mem, 0) == VK_SUCCESS;
 }
 
@@ -746,14 +789,7 @@ static gboolean _create_image(VkImage *image,
   if(vkCreateImage(_vk.dev, &ici, NULL, image) != VK_SUCCESS) return FALSE;
   VkMemoryRequirements req;
   vkGetImageMemoryRequirements(_vk.dev, *image, &req);
-  uint32_t type;
-  if(!_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)
-     && !_memtype(req.memoryTypeBits, 0, &type))
-    return FALSE;
-  const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                     .allocationSize = req.size,
-                                     .memoryTypeIndex = type };
-  if(!_allocate(&mai, mem)
+  if(!_alloc_on_device(&req, mem)
      || vkBindImageMemory(_vk.dev, *image, *mem, 0) != VK_SUCCESS)
     return FALSE;
   const VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -1807,17 +1843,34 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
     }
     for(GList *l = _vk.buffers; l; l = g_list_next(l))
       pooled += ((const dt_slang_gpu_buffer_t *)l->data)->size;
-    for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
-      if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+    if(_vk.discrete)
+    {
+      for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
+        if(_device_heap(h))
+        {
+          const VkDeviceSize used = budget.heapUsage[h] > pooled ? budget.heapUsage[h] - pooled : 0;
+          if(budget.heapBudget[h] > used) best = MAX(best, budget.heapBudget[h] - used);
+        }
+    }
+    else
+    {
+      // a module's images may be spread over all heaps, see _alloc_on_device()
+      VkDeviceSize total = 0;
+      for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
       {
-        const VkDeviceSize used = budget.heapUsage[h] > pooled ? budget.heapUsage[h] - pooled : 0;
-        if(budget.heapBudget[h] > used) best = MAX(best, budget.heapBudget[h] - used);
+        total += budget.heapBudget[h];
+        if(budget.heapBudget[h] > budget.heapUsage[h]) best += budget.heapBudget[h] - budget.heapUsage[h];
       }
+      best = MIN(total, best + pooled);
+    }
   }
   else
     for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
-      if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-        best = MAX(best, _vk.memprops.memoryHeaps[h].size / 4 * 3);
+      if(_device_heap(h))
+      {
+        const VkDeviceSize usable = _vk.memprops.memoryHeaps[h].size / 4 * 3;
+        best = _vk.discrete ? MAX(best, usable) : best + usable;
+      }
   const int cap = dt_conf_get_int("slang_gpu_memory");
   if(cap > 0) best = MIN(best, (VkDeviceSize)cap << 20);
   *available = best;
