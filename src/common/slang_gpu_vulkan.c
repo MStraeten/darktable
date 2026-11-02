@@ -587,11 +587,13 @@ static gboolean _reclaim(void);
 static void _make_room(const uint32_t heap, const VkDeviceSize size);
 
 // device memory, after freeing the pools if the device is out of it. Pooled
-// images and buffers otherwise filled a 4 GB GPU after a few exports
+// images and buffers otherwise filled a 4 GB GPU after a few exports. An
+// integrated GPU's host heap is the same memory as its device heap, so
+// staging buffers there have to fit the budget too
 static gboolean _allocate(const VkMemoryAllocateInfo *mai, VkDeviceMemory *mem)
 {
   const uint32_t heap = _vk.memprops.memoryTypes[mai->memoryTypeIndex].heapIndex;
-  if(_vk.memprops.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+  if(!_vk.discrete || (_vk.memprops.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
     _make_room(heap, mai->allocationSize);
   VkResult res = vkAllocateMemory(_vk.dev, mai, NULL, mem);
   if(res == VK_ERROR_OUT_OF_DEVICE_MEMORY && _reclaim())
@@ -675,7 +677,7 @@ static gboolean _alloc_mapped(dt_slang_mem_t *m,
                                      .memoryTypeIndex = type };
   // the whole allocation is mapped, which is what an invalidation of a
   // non-coherent type has to cover
-  return vkAllocateMemory(_vk.dev, &mai, NULL, &m->buffer_mem) == VK_SUCCESS
+  return _allocate(&mai, &m->buffer_mem)
          && vkBindBufferMemory(_vk.dev, m->buffer, m->buffer_mem, 0) == VK_SUCCESS
          && vkMapMemory(_vk.dev, m->buffer_mem, 0, VK_WHOLE_SIZE, 0, &m->map) == VK_SUCCESS;
 }
@@ -1156,6 +1158,26 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
       = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
   vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
   if(budget.heapUsage[heap] + size <= budget.heapBudget[heap]) return;
+
+  // an integrated GPU's heaps share one pool of memory, and the large
+  // staging buffers kept for reuse grew to more than the host heap during
+  // a 64 MP export, shrinking the device heap's budget with it. No batch
+  // uses an idle one, so the oldest go first and without a wait.
+  if(!_vk.discrete && _vk.staging)
+  {
+    VkDeviceSize staged = 0;
+    while(_vk.staging && budget.heapUsage[heap] + size > budget.heapBudget[heap])
+    {
+      GList *oldest = g_list_last(_vk.staging);
+      staged += ((const dt_slang_staging_t *)oldest->data)->size;
+      _staging_destroy(oldest->data);
+      _vk.staging = g_list_delete_link(_vk.staging, oldest);
+      vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
+    }
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] freeing %" PRIu64 " MB of idle staging buffers for %" PRIu64 " MB",
+             (uint64_t)(staged >> 20), (uint64_t)(size >> 20));
+    if(budget.heapUsage[heap] + size <= budget.heapBudget[heap]) return;
+  }
 
   const VkDeviceSize need = budget.heapUsage[heap] + size - budget.heapBudget[heap];
   VkDeviceSize found = 0;
@@ -1854,13 +1876,16 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
     }
     else
     {
-      // a module's images may be spread over all heaps, see _alloc_on_device()
+      // a module's images may be spread over all heaps, see _alloc_on_device(),
+      // and _make_room() frees the idle staging buffers for them
       VkDeviceSize total = 0;
       for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
       {
         total += budget.heapBudget[h];
         if(budget.heapBudget[h] > budget.heapUsage[h]) best += budget.heapBudget[h] - budget.heapUsage[h];
       }
+      for(GList *l = _vk.staging; l; l = g_list_next(l))
+        pooled += ((const dt_slang_staging_t *)l->data)->size;
       best = MIN(total, best + pooled);
     }
   }
