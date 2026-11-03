@@ -138,7 +138,7 @@ void diffuse_pde(uint3 gid : SV_DispatchThreadID,
   const int y = gid.y;
   if(x >= width || y >= height) return;
 
-  const bool opacity = has_mask ? mask.Areadsingle(x, y) != 0.0f : true;
+  const bool opacity = has_mask != 0 ? mask.Areadsingle(x, y) != 0.0f : true;
 
   const float4 regularization_factor = float4(regularization * current_radius_square / 9.f);
 

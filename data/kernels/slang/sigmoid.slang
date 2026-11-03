@@ -103,7 +103,7 @@ float4 _generalized_loglogistic_sigmoid_vector(float4 i, float magnitude, float 
   io = magnitude * pow(io / (paper_exp + io), float4(paper_power));
 
   // Safety check for very large floats that cause numerical errors
-  return isnan(io) ? float4(magnitude) : io;
+  return select(isnan(io), float4(magnitude), io);
 }
 
 // Linear interpolation of hue that also preserve sum of channels

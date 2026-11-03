@@ -722,7 +722,7 @@ static gboolean _alloc_mapped(dt_slang_mem_t *m,
   if(vkCreateBuffer(_vk.dev, &bci, NULL, &m->buffer) != VK_SUCCESS) return FALSE;
   VkMemoryRequirements req;
   vkGetBufferMemoryRequirements(_vk.dev, m->buffer, &req);
-  uint32_t type;
+  uint32_t type = 0;
   int i = 0;
   while(i < n && !_memtype(req.memoryTypeBits, want[i], &type)) i++;
   if(i == n) return FALSE;
