@@ -382,7 +382,12 @@ static gpointer _prepare(gpointer data)
       _mtl.initialized = TRUE;
       _mtl.usable = _init_device();
     }
-    if(_mtl.usable) _preload_kernels();
+    // the driver compiles each pipeline for the GPU, about 90 ms a kernel
+    // on an AMD Radeon without a warm shader cache: building all of them
+    // held up the first export for 35 s, against 3 s for building the ones
+    // it uses. Apple GPUs build them quickly, so there the preload pays
+    // off by overlapping with loading the image
+    if(_mtl.usable && [_mtl.dev supportsFamily:MTLGPUFamilyApple1]) _preload_kernels();
   }
   g_mutex_unlock(&_mtl_lock);
   dt_print(DT_DEBUG_PERF, "[slang_gpu] preparing the Metal device and kernels took %.3f secs",
