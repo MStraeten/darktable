@@ -790,6 +790,110 @@ void highlights_opposed_linear(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), float4(oval[0], oval[1], oval[2], pixel.w));
 }
 
+// highlights_chroma_sums(_linear) in ../basic.cl: per 16x16 work group, the
+// chrominance sums and counts of the unclipped photosites next to clipped
+// ones, and in .w of the counts the number of clipped ones. The host adds up
+// the groups in double.
+groupshared float4 chroma_sums[256];
+groupshared float4 chroma_cnts[256];
+
+float4 _channel_value(int color, float val)
+{
+  return float4(color == 0 ? val : 0.0f, color == 1 ? val : 0.0f, color == 2 ? val : 0.0f, 0.0f);
+}
+
+void _chroma_sums_reduce(uint3 lid, uint3 grp, int width, float4 sum, float4 cnt,
+                         RWStructuredBuffer<float4> accu)
+{
+  const int l = lid.y * 16 + lid.x;
+  chroma_sums[l] = sum;
+  chroma_cnts[l] = cnt;
+  GroupMemoryBarrierWithGroupSync();
+  for(int offset = 128; offset > 0; offset >>= 1)
+  {
+    if(l < offset)
+    {
+      chroma_sums[l] += chroma_sums[l + offset];
+      chroma_cnts[l] += chroma_cnts[l + offset];
+    }
+    GroupMemoryBarrierWithGroupSync();
+  }
+
+  if(l == 0)
+  {
+    const int m = grp.y * ((width + 15) / 16) + grp.x;
+    accu[2*m] = chroma_sums[0];
+    accu[2*m+1] = chroma_cnts[0];
+  }
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_chroma_sums(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
+                            uint3 grp : SV_GroupID,
+                            uniform ImageIn in, uniform RWStructuredBuffer<uint> mask,
+                            uniform int msize, uniform int mwidth, uniform int mheight,
+                            uniform int iwidth, uniform int iheight,
+                            uniform uint filters, uniform StructuredBuffer<uint> xtrans,
+                            uniform StructuredBuffer<float> clips, uniform StructuredBuffer<float> correction,
+                            uniform RWStructuredBuffer<float4> accu)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  float4 sum = float4(0.0f);
+  float4 cnt = float4(0.0f);
+  if(x < iwidth && y < iheight)
+  {
+    const int color = fcol(y, x, filters, xtrans);
+    const float inval = in.Areadsingle(x, y);
+    const int mdx = clamp(y / 3, 0, mheight - 1) * mwidth + clamp(x / 3, 0, mwidth - 1);
+    if(inval < clips[color] && inval > 0.2f * clips[color] && _mask_get(mask, color * msize + mdx) != 0)
+    {
+      const float ref = _calc_refavg(in, xtrans, filters, y, x, iheight, iwidth, correction);
+      sum = _channel_value(color, inval - ref);
+      cnt = _channel_value(color, 1.0f);
+    }
+    cnt.w = inval >= clips[color] ? 1.0f : 0.0f;
+  }
+  _chroma_sums_reduce(lid, grp, iwidth, sum, cnt, accu);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_chroma_sums_linear(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
+                                   uint3 grp : SV_GroupID,
+                                   uniform ImageIn in, uniform RWStructuredBuffer<uint> mask,
+                                   uniform int msize, uniform int mwidth, uniform int mheight,
+                                   uniform int width, uniform int height, uniform float4 clips,
+                                   uniform RWStructuredBuffer<float4> accu)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  float4 sum = float4(0.0f);
+  float4 cnt = float4(0.0f);
+  if(x < width && y < height)
+  {
+    const float4 pixel = in.Areadpixel(x, y);
+    const float clip[3] = { clips.x, clips.y, clips.z };
+    const float inval[3] = { pixel.x, pixel.y, pixel.z };
+    const int mdx = clamp(y / 3, 0, mheight - 1) * mwidth + clamp(x / 3, 0, mwidth - 1);
+    // the CPU code leaves out a 3 pixel border
+    const bool inner = x >= 3 && y >= 3 && x < width - 3 && y < height - 3;
+    for(int c = 0; c < 3; c++)
+    {
+      if(inner && inval[c] > 0.2f * clip[c] && inval[c] < clip[c] && _mask_get(mask, c * msize + mdx) != 0)
+      {
+        sum += _channel_value(c, inval[c] - _calc_linear_refavg(pixel, c));
+        cnt += _channel_value(c, 1.0f);
+      }
+      cnt.w += inval[c] >= clip[c] ? 1.0f : 0.0f;
+    }
+  }
+  _chroma_sums_reduce(lid, grp, width, sum, cnt, accu);
+}
+
 // interpolation_resample in ../basic.cl splits each output pixel's vertical
 // taps across a work group and sums them in local memory. Here one work item
 // does all taps of its pixel, so the sums differ in the last bits.
