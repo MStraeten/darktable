@@ -460,13 +460,16 @@ denoiseprofile_decompose(read_only image2d_t in, write_only image2d_t coarse, wr
 kernel void
 denoiseprofile_synthesize(read_only image2d_t coarse, read_only image2d_t detail, write_only image2d_t out,
      const int width, const int height,
-     const float4 threshold, const float4 boost)
+     global const float4 *thresholds, const int band, const float4 boost)
 {
   const int x = get_global_id(0);
   const int y = get_global_id(1);
 
   if(x >= width || y >= height) return;
 
+  // the threshold comes from denoiseprofile_threshold on the device, so
+  // that the host does not wait for each scale's sums
+  const float4 threshold = thresholds[band];
   float4 c = readpixel(coarse, x, y);
   float4 d = readpixel(detail, x, y);
   float4 amount = copysign(fmax((float4)(0.0f), fabs(d) - threshold), d);
@@ -549,4 +552,25 @@ denoiseprofile_reduce_second(const global float4* input, global float4 *result, 
 
     result[gid]   = buffer[0];
   }
+}
+
+
+// adds up the partial sums of denoiseprofile_reduce_second, in the order
+// the host used to, and turns them into the BayesShrink threshold of one
+// wavelet band. Runs as a single work item.
+kernel void
+denoiseprofile_threshold(global const float4 *partial, const int length, const float npixels,
+                         const float sb2, const float4 adjt, global float4 *thresholds, const int band)
+{
+  if(get_global_id(0) != 0) return;
+
+  float4 sum_y2 = (float4)0.0f;
+  for(int k = 0; k < length; k++)
+    sum_y2 += partial[k];
+
+  const float4 var_y = sum_y2 / (npixels - 1.0f);
+  const float4 std_x = sqrt(fmax((float4)1e-6f, var_y - sb2));
+  float4 thrs = adjt * sb2 / std_x;
+  thrs.w = 0.0f;
+  thresholds[band] = thrs;
 }

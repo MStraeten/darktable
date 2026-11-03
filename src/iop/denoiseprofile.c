@@ -213,6 +213,7 @@ typedef struct dt_iop_denoiseprofile_global_data_t
   int kernel_denoiseprofile_synthesize;
   int kernel_denoiseprofile_reduce_first;
   int kernel_denoiseprofile_reduce_second;
+  int kernel_denoiseprofile_threshold;
 } dt_iop_denoiseprofile_global_data_t;
 
 static dt_noiseprofile_t dt_iop_denoiseprofile_get_auto_profile(dt_iop_module_t *self,
@@ -2237,11 +2238,11 @@ static int process_wavelets_cl(dt_iop_module_t *self,
   cl_mem dev_buf2 = NULL;
   cl_mem dev_m = NULL;
   cl_mem dev_r = NULL;
+  cl_mem dev_thrs = NULL;
   cl_mem dev_filter = NULL;
   cl_mem dev_Y0U0V0 = NULL;
   cl_mem dev_RGB = NULL;
   cl_mem *dev_detail = calloc(max_max_scale, sizeof(cl_mem));
-  float *sumsum = NULL;
 
   // corner case of extremely small image. this is not really likely
   // to happen but would cause issues later when we divide by
@@ -2291,10 +2292,10 @@ static int process_wavelets_cl(dt_iop_module_t *self,
   err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
   dev_m = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * bufsize);
   dev_r = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * reducesize);
-  sumsum = dt_alloc_align_float((size_t)4 * reducesize);
+  dev_thrs = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * max_max_scale);
   dev_tmp = dt_opencl_alloc_device(devid, width, height, sizeof(float) * 4);
 
-  if(!dev_tmp || !dev_r || !dev_m || !sumsum) goto error;
+  if(!dev_tmp || !dev_r || !dev_thrs || !dev_m) goto error;
 
   const float m[] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f }; // 1/16, 4/16, 6/16, 4/16, 1/16
   float mm[5][5];
@@ -2423,9 +2424,8 @@ static int process_wavelets_cl(dt_iop_module_t *self,
     const float varf = sqrtf(2.0f + 2.0f * 4.0f * 4.0f + 6.0f * 6.0f) / 16.0f; // about 0.5
     const float sigma_band = powf(varf, s) * sigma;
 
-    // determine thrs as bayesshrink
-    dt_aligned_pixel_t sum_y2 = { 0.0f };
-
+    // determine thrs as bayesshrink, on the device: reading the sums back
+    // would make the host wait for every scale
     size_t lsizes[2];
     size_t llocal[2];
 
@@ -2450,28 +2450,7 @@ static int process_wavelets_cl(dt_iop_module_t *self,
                               CLARG(bufsize), CLLOCAL(sizeof(float) * 4 * slocopt.sizex));
     if(err != CL_SUCCESS) goto error;
 
-    err = dt_opencl_read_buffer_from_device(devid, (void *)sumsum, dev_r, 0,
-                                            sizeof(float) * 4 * reducesize, TRUE);
-    if(err != CL_SUCCESS) goto error;
-
-    for(int k = 0; k < reducesize; k++)
-    {
-      for_each_channel(c)
-      {
-        sum_y2[c] += sumsum[4 * k + c];
-      }
-    }
-
     const float sb2 = sigma_band * sigma_band;
-    const dt_aligned_pixel_t var_y = { sum_y2[0] / (npixels - 1.0f),
-                                       sum_y2[1] / (npixels - 1.0f),
-                                       sum_y2[2] / (npixels - 1.0f),
-                                       0.0f };
-
-    const dt_aligned_pixel_t std_x = { sqrtf(MAX(1e-6f, var_y[0] - sb2)),
-                                       sqrtf(MAX(1e-6f, var_y[1] - sb2)),
-                                       sqrtf(MAX(1e-6f, var_y[2] - sb2)),
-                                       1.0f };
     // add 8.0 here because it seemed a little weak
     dt_aligned_pixel_t adjt = { 8.0f, 8.0f, 8.0f, 0.0f };
 
@@ -2519,17 +2498,17 @@ static int process_wavelets_cl(dt_iop_module_t *self,
       adjt[2] *= band_force_exp_2;
     }
 
-    const dt_aligned_pixel_t thrs = { adjt[0] * sb2 / std_x[0],
-                                      adjt[1] * sb2 / std_x[1],
-                                      adjt[2] * sb2 / std_x[2],
-                                      0.0f };
-    // dt_print(DT_DEBUG_ALWAYS, "scale %d thrs %f %f %f", s, thrs[0], thrs[1], thrs[2]);
+    const float fpixels = npixels;
+    err = dt_opencl_enqueue_kernel_1d_args(devid, gd->kernel_denoiseprofile_threshold, 1,
+                              CLARG(dev_r), CLARG(reducesize), CLARG(fpixels), CLARG(sb2),
+                              CLARG(adjt), CLARG(dev_thrs), CLARG(s));
+    if(err != CL_SUCCESS) goto error;
 
     const dt_aligned_pixel_t boost = { 1.0f, 1.0f, 1.0f, 1.0f };
     err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_denoiseprofile_synthesize, width, height,
                               CLARG(dev_buf1), CLARG(dev_detail[s]),
                               CLARG(dev_buf2), CLARG(width), CLARG(height),
-                              CLARG(thrs), CLARG(boost));
+                              CLARG(dev_thrs), CLARG(s), CLARG(boost));
     if(err != CL_SUCCESS) goto error;
 
     // swap buffers
@@ -2579,13 +2558,13 @@ static int process_wavelets_cl(dt_iop_module_t *self,
 error:
   dt_opencl_release_mem_object(dev_RGB);
   dt_opencl_release_mem_object(dev_r);
+  dt_opencl_release_mem_object(dev_thrs);
   dt_opencl_release_mem_object(dev_m);
   dt_opencl_release_mem_object(dev_tmp);
   dt_opencl_release_mem_object(dev_filter);
   for(int k = 0; k < max_scale; k++)
     dt_opencl_release_mem_object(dev_detail[k]);
   free(dev_detail);
-  dt_free_align(sumsum);
   return err;
 }
 
@@ -3226,6 +3205,8 @@ void init_global(dt_iop_module_so_t *self)
     dt_opencl_create_kernel(program, "denoiseprofile_reduce_first");
   gd->kernel_denoiseprofile_reduce_second =
     dt_opencl_create_kernel(program, "denoiseprofile_reduce_second");
+  gd->kernel_denoiseprofile_threshold =
+    dt_opencl_create_kernel(program, "denoiseprofile_threshold");
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -3245,6 +3226,7 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_opencl_free_kernel(gd->kernel_denoiseprofile_synthesize);
   dt_opencl_free_kernel(gd->kernel_denoiseprofile_reduce_first);
   dt_opencl_free_kernel(gd->kernel_denoiseprofile_reduce_second);
+  dt_opencl_free_kernel(gd->kernel_denoiseprofile_threshold);
   free(self->data);
   self->data = NULL;
 }
