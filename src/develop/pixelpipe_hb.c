@@ -2433,7 +2433,35 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   const int m_height = MAX(roi_in->height, roi_out->height);
   const float images = tiling->factor_cl + (convert ? 1.0f : 0.0f) + (_piece_wants_blending(piece) ? 1.0f : 0.0f);
   const float needed = 4.0f * sizeof(float) * m_width * m_height * images + tiling->overhead;
-  if(m_width > max_dim || m_height > max_dim || needed > (float)available)
+  const gboolean too_large = m_width > max_dim || m_height > max_dim;
+  // as OpenCL's fast tiling: a module that doesn't fit runs in strips copied
+  // on the device while its full input and output stay there, if that
+  // leaves the strips enough rows besides their overlap
+  size_t strip_avail = 0;
+  gboolean fast_tiling = FALSE;
+  if(!too_large && needed > (float)available && !raw_u16 && _piece_may_tile(piece)
+     && !memcmp(roi_in, roi_out, sizeof(dt_iop_roi_t))
+     && !(module->flags() & (IOP_FLAGS_WRITE_RASTER | IOP_FLAGS_WRITE_DETAILS)))
+  {
+    const size_t iplane = sizeof(float) * ch_in * roi_in->width * roi_in->height;
+    const size_t oplane = sizeof(float) * ch_out * roi_out->width * roi_out->height;
+    // a converted input and a blended module's own output are full images too
+    const size_t full = iplane + oplane + (convert ? iplane : 0)
+                        + (_piece_wants_blending(piece) ? oplane : 0) + tiling->overhead;
+    if(available > full + DT_MEGA)
+    {
+      strip_avail = available - full;
+      const size_t per_line = sizeof(float) * MAX(ch_in, ch_out) * roi_in->width * MAX(tiling->factor_cl, 1.0f);
+      const int64_t lines = strip_avail / per_line;
+      const int64_t valid = lines - 2 * tiling->overlap;
+      fast_tiling = valid > 0 && valid > lines / 5;
+    }
+  }
+  if(fast_tiling)
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG | DT_DEBUG_TILING, "slang fast tiling",
+                  pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "needs %zuMB of %zuMB",
+                  (size_t)needed / DT_MEGA, available / DT_MEGA);
+  else if(too_large || needed > (float)available)
   {
     if(resident && !_slang_sync_host(pipe)) return -1;
     _slang_release(pipe);
@@ -2542,7 +2570,11 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   dt_slang_gpu_image_t *dev_module = dev_out && blending
     ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL)
     : dev_out;
-  gboolean ok = dev_module && module->process_slang(module, piece, dev_in, dev_module, roi_in, roi_out);
+  gboolean ok = dev_module
+    && (fast_tiling
+        ? !process_tiling_slang_fast(piece, dev_in, dev_module, roi_in, sizeof(float) * ch_in,
+                                     sizeof(float) * ch_out, tiling, strip_avail)
+        : module->process_slang(module, piece, dev_in, dev_module, roi_in, roi_out));
   if(ok && blending)
     ok = dt_develop_blend_process_slang(module, piece, dev_in, dev_module, dev_out, roi_in, roi_out);
   if(blending) dt_slang_gpu_image_free(dev_module);
@@ -2599,6 +2631,7 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
 
   *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_ON_GPU;
   *pixelpipe_flow &= ~(PIXELPIPE_FLOW_PROCESSED_ON_CPU | PIXELPIPE_FLOW_PROCESSED_WITH_TILING);
+  if(fast_tiling) *pixelpipe_flow |= PIXELPIPE_FLOW_PROCESSED_WITH_TILING;
   if(blending)
   {
     *pixelpipe_flow |= PIXELPIPE_FLOW_BLENDED_ON_GPU;

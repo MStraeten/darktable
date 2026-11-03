@@ -1772,6 +1772,37 @@ int dt_slang_gpu_image_read_rect(dt_slang_gpu_image_t *img,
   return err;
 }
 
+int dt_slang_gpu_image_copy(dt_slang_gpu_image_t *src,
+                            const int sx,
+                            const int sy,
+                            dt_slang_gpu_image_t *dst,
+                            const int dx,
+                            const int dy,
+                            const int width,
+                            const int height)
+{
+  if(!src || !dst || src->channels != dst->channels || width <= 0 || height <= 0
+     || sx < 0 || sy < 0 || dx < 0 || dy < 0
+     || sx + width > src->width || sy + height > src->height
+     || dx + width > dst->width || dy + height > dst->height)
+    return 1;
+  g_mutex_lock(&_vk_lock);
+  dt_slang_batch_t *b = _batch_begin(NULL, 0, 0);
+  gboolean ok = b != NULL;
+  if(ok)
+  {
+    const VkImageCopy copy = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                               .srcOffset = { sx, sy, 0 },
+                               .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                               .dstOffset = { dx, dy, 0 },
+                               .extent = { width, height, 1 } };
+    vkCmdCopyImage(b->cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    ok = _batch_submit(b, FALSE);
+  }
+  g_mutex_unlock(&_vk_lock);
+  return ok ? 0 : 1;
+}
+
 // --------------------------------------------------------------------------------------------
 // buffers
 

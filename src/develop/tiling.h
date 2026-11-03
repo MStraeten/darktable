@@ -55,6 +55,9 @@ int process_tiling_cl_fast(struct dt_dev_pixelpipe_iop_t *piece, void *cl_in, vo
 int default_process_tiling_slang(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece,
                                  const void *const ivoid, void *const ovoid, const dt_iop_roi_t *const roi_in,
                                  const dt_iop_roi_t *const roi_out, const int in_bpp);
+int process_tiling_slang_fast(struct dt_dev_pixelpipe_iop_t *piece, struct dt_slang_gpu_image_t *in,
+                              struct dt_slang_gpu_image_t *out, const dt_iop_roi_t *const roi, const int ibpp,
+                              const int obpp, const dt_develop_tiling_t *tiling, const size_t avail);
 #endif
 
 void default_process_tiling(struct dt_iop_module_t *self, struct dt_dev_pixelpipe_iop_t *piece,

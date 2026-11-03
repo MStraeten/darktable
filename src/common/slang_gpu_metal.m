@@ -1060,6 +1060,48 @@ int dt_slang_gpu_image_read_rect(dt_slang_gpu_image_t *image,
   return err;
 }
 
+int dt_slang_gpu_image_copy(dt_slang_gpu_image_t *source,
+                            const int sx,
+                            const int sy,
+                            dt_slang_gpu_image_t *destination,
+                            const int dx,
+                            const int dy,
+                            const int width,
+                            const int height)
+{
+  DtSlangImage *src = (__bridge DtSlangImage *)source;
+  DtSlangImage *dst = (__bridge DtSlangImage *)destination;
+  if(!src || !dst || src->channels != dst->channels || width <= 0 || height <= 0
+     || sx < 0 || sy < 0 || dx < 0 || dy < 0
+     || sx + width > src->width || sy + height > src->height
+     || dx + width > dst->width || dy + height > dst->height)
+    return 1;
+  g_mutex_lock(&_mtl_lock);
+  gboolean ok = FALSE;
+  @autoreleasepool
+  {
+    id<MTLCommandBuffer> cb = [_mtl.queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+    if(blit)
+    {
+      [blit copyFromTexture:src->texture
+                sourceSlice:0
+                sourceLevel:0
+               sourceOrigin:MTLOriginMake(sx, sy, 0)
+                 sourceSize:MTLSizeMake(width, height, 1)
+                  toTexture:dst->texture
+           destinationSlice:0
+           destinationLevel:0
+          destinationOrigin:MTLOriginMake(dx, dy, 0)];
+      [blit endEncoding];
+      _commit(cb);
+      ok = TRUE;
+    }
+  }
+  g_mutex_unlock(&_mtl_lock);
+  return ok ? 0 : 1;
+}
+
 // --------------------------------------------------------------------------------------------
 // device buffers
 

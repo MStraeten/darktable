@@ -1931,6 +1931,76 @@ static gboolean _slang_tile(dt_iop_module_t *self,
   return ok;
 }
 
+/* runs a module whose input and output are on the device in full-width
+   strips, copying them between the full images and two strip images on the
+   device, as process_tiling_cl_fast() does. Going through the host instead
+   cost a 61 MP denoiseprofile on a Radeon 780M about a second per export in
+   copies. avail is the device memory left for the strips. Returns 0 on
+   success. */
+int process_tiling_slang_fast(dt_dev_pixelpipe_iop_t *piece,
+                              dt_slang_gpu_image_t *in,
+                              dt_slang_gpu_image_t *out,
+                              const dt_iop_roi_t *const roi,
+                              const int ibpp,
+                              const int obpp,
+                              const dt_develop_tiling_t *tiling,
+                              const size_t avail)
+{
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  dt_iop_module_t *module = piece->module;
+  const int width = roi->width;
+  const int height = roi->height;
+  const int align = MAX(tiling->align, 1);
+  const int border = tiling->overlap;
+  // factor_cl counts the module's input and output among its images
+  const size_t per_line = (size_t)MAX(ibpp, obpp) * width * MAX(tiling->factor_cl, 1.0f);
+  // every strip has the same height, so the last one starts earlier: the
+  // modules size their kernels from the roi, not from the images
+  const int strip = MIN(_align_down((int)MIN(avail / per_line, (size_t)INT_MAX), align), height);
+  const int valid = strip - 2 * border;
+  if(valid < 1) return 1;
+
+  const int strips = (height + valid - 1) / valid;
+  dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_TILING,
+                "  *fast tiled* slang", pipe, module, DT_DEVICE_NONE, roi, NULL,
+                "%d strips of %d rows, overlap=%d, avail=%zuMB",
+                strips, strip, border, avail / DT_MEGA);
+
+  dt_slang_gpu_image_t *t_in = dt_slang_gpu_image_new(width, strip, ibpp / sizeof(float), NULL);
+  dt_slang_gpu_image_t *t_out = t_in ? dt_slang_gpu_image_new(width, strip, obpp / sizeof(float), NULL) : NULL;
+  gboolean ok = t_out != NULL;
+
+  dt_aligned_pixel_t processed_maximum_saved;
+  dt_aligned_pixel_t processed_maximum_new = { 1.0f, 1.0f, 1.0f, 1.0f };
+  for_four_channels(k) processed_maximum_saved[k] = pipe->dsc.processed_maximum[k];
+
+  pipe->tiling = TRUE;
+  for(int group = 0; group < height && ok; group += valid)
+  {
+    const int first_in = MIN(MAX(group - border, 0), height - strip);
+    const int rows = MIN(valid, height - group);
+    const dt_iop_roi_t troi = { roi->x, roi->y + first_in, width, strip, roi->scale };
+    dt_print_pipe(DT_DEBUG_TILING | DT_DEBUG_VERBOSE, "    strip", pipe, module, DT_DEVICE_NONE, &troi, NULL,
+                  "rows %d-%d of the output", group, group + rows - 1);
+
+    dt_dev_prepare_piece_cfa(piece, &troi);
+    for_four_channels(k) pipe->dsc.processed_maximum[k] = processed_maximum_saved[k];
+    ok = !dt_slang_gpu_image_copy(in, 0, first_in, t_in, 0, 0, width, strip)
+         && module->process_slang(module, piece, t_in, t_out, &troi, &troi)
+         && !dt_slang_gpu_image_copy(t_out, 0, group - first_in, out, 0, group, width, rows);
+    for_four_channels(k) processed_maximum_new[k] = pipe->dsc.processed_maximum[k];
+  }
+  pipe->tiling = FALSE;
+
+  for_four_channels(k)
+    pipe->dsc.processed_maximum[k] = ok ? processed_maximum_new[k] : processed_maximum_saved[k];
+  dt_dev_prepare_piece_cfa(piece, roi);
+  // the strip images are freed once the kernels using them have finished
+  dt_slang_gpu_image_free(t_in);
+  dt_slang_gpu_image_free(t_out);
+  return ok ? 0 : 1;
+}
+
 // upper bound for one tile buffer, host or device
 #define SLANG_TILE_MAX_BYTES (512.0f * DT_MEGA)
 

@@ -144,6 +144,17 @@ int dt_slang_gpu_image_read_rect(dt_slang_gpu_image_t *img,
                                  const int height,
                                  void *host,
                                  const size_t pitch);
+// copies the width x height rectangle at sx, sy of src to dx, dy of dst on
+// the device, after the kernels before it and without waiting. Both images
+// have the same number of channels. Returns 0 on success.
+int dt_slang_gpu_image_copy(dt_slang_gpu_image_t *src,
+                            const int sx,
+                            const int sy,
+                            dt_slang_gpu_image_t *dst,
+                            const int dx,
+                            const int dy,
+                            const int width,
+                            const int height);
 // waits for every kernel that has been started
 void dt_slang_gpu_wait(void);
 // frees the images and buffers kept for reuse, on a GPU with memory of its
