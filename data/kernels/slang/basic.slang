@@ -790,7 +790,7 @@ void highlights_opposed_linear(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), float4(oval[0], oval[1], oval[2], pixel.w));
 }
 
-// highlights_chroma_sums(_linear) in ../basic.cl: per 16x16 work group, the
+// highlights_chroma_sums(_linear): per 16x16 work group, the
 // chrominance sums and counts of the unclipped photosites next to clipped
 // ones, and in .w of the counts the number of clipped ones. The host adds up
 // the groups in double.

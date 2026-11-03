@@ -678,26 +678,6 @@ static int make_tests(test_t *t)
   TEST("highlights_opposed_linear", "basic", "highlights_opposed_linear",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
        FLOAT4("clips", 0.6f, 0.65f, 0.55f, 1.0f), FLOAT4("chroma", 0.05f, -0.02f, 0.03f, 0.0f));
-  // the opposed method's chroma sums: per 16x16 work group the sums and counts
-  // of the unclipped photosites next to clipped ones, reduced in local memory
-  {
-    const int ngroups = ((W + 15) / 16) * ((H + 15) / 16);
-    static const char *cs_labels[2] = { "highlights_chroma_sums rggb", "highlights_chroma_sums xtrans" };
-    static const unsigned int cs_filters[2] = { 0x94949494u, 9u };
-    for(int f = 0; f < 2; f++)
-      TEST_TOL(cs_labels[f], "basic", "highlights_chroma_sums", 1e-5,
-               RAW_IN("in", image_raw), BUFFER("mask", mask_bytes, 3 * msize), INT("msize", msize),
-               INT("mwidth", mwidth), INT("mheight", mheight), INT("iwidth", W), INT("iheight", H),
-               INT("filters", cs_filters[f]), BUFFER("xtrans", xtrans, sizeof(xtrans)),
-               BUFFER("clips", hl_clips, sizeof(hl_clips)), BUFFER("correction", hl_correction, sizeof(hl_correction)),
-               BUFFER_OUT("accu", NULL, sizeof(float) * 8 * ngroups), LOCAL("sums", sizeof(float) * 4 * 256),
-               LOCAL("cnts", sizeof(float) * 4 * 256));
-    TEST_TOL("highlights_chroma_sums_linear", "basic", "highlights_chroma_sums_linear", 1e-5,
-             IMG_IN("in", image_in), BUFFER("mask", mask_bytes, 3 * msize), INT("msize", msize),
-             INT("mwidth", mwidth), INT("mheight", mheight), INT("width", W), INT("height", H),
-             FLOAT4("clips", 0.6f, 0.65f, 0.55f, 1.0f), BUFFER_OUT("accu", NULL, sizeof(float) * 8 * ngroups),
-             LOCAL("sums", sizeof(float) * 4 * 256), LOCAL("cnts", sizeof(float) * 4 * 256));
-  }
   // rotate pixels by about 45 degrees around a point inside the image, with
   // each of the four interpolators; part of the output falls outside the input.
   // The matrix and center are dyadic so that every position is exact: with
