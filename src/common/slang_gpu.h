@@ -157,6 +157,10 @@ int dt_slang_gpu_image_copy(dt_slang_gpu_image_t *src,
                             const int height);
 // waits for every kernel that has been started
 void dt_slang_gpu_wait(void);
+// dt_free_align() once the kernels started so far are done, for memory that
+// dt_slang_gpu_image_alias() may have wrapped: the allocator may hand it out
+// again while a queued kernel still reads or writes it through the alias
+void dt_slang_gpu_free_align(void *mem);
 // frees the images and buffers kept for reuse, on a GPU with memory of its
 // own: OpenCL's check whether a module fits doesn't see them. Images still
 // in use by kernels are freed once those finish.

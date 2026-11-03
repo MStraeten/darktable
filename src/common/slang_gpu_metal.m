@@ -75,6 +75,9 @@ typedef struct dt_slang_metal_t
   __strong NSMutableArray *staging;       // transfer buffers, see _staging_get()
   NSUInteger max_image_dim;
   gboolean private_storage; // device images and buffers in private storage
+  // host memory to free once its command buffer is done, as pairs of the
+  // last command buffer committed before the free and an NSValue pointer
+  __strong NSMutableArray<NSArray *> *deferred_free;
 } dt_slang_metal_t;
 
 static dt_slang_metal_t _mtl = { 0 };
@@ -107,6 +110,7 @@ static gboolean _init_device(void)
   _mtl.images = [NSMutableArray array];
   _mtl.buffers = [NSMutableArray array];
   _mtl.staging = [NSMutableArray array];
+  _mtl.deferred_free = [NSMutableArray array];
   // shared storage is system memory on a discrete GPU, so kernels working
   // there would read and write every pixel over PCIe
   _mtl.private_storage = !_mtl.dev.hasUnifiedMemory || dt_conf_get_bool("slang_gpu_private_memory");
@@ -141,6 +145,8 @@ void dt_slang_gpu_cleanup(void)
   g_mutex_lock(&_mtl_lock);
   for(id<MTLCommandBuffer> cb in _mtl.inflight) [cb waitUntilCompleted];
   _mtl.inflight = nil;
+  for(NSArray *entry in _mtl.deferred_free) dt_free_align([(NSValue *)entry[1] pointerValue]);
+  _mtl.deferred_free = nil;
   _mtl.images = nil;
   _mtl.buffers = nil;
   g_mutex_lock(&_staging_lock);
@@ -476,6 +482,15 @@ static gboolean _check(const gboolean wait)
       ok = FALSE;
     }
     [_mtl.inflight removeObjectAtIndex:0];
+  }
+  // the queue runs command buffers in order, so the oldest entries go first
+  while(_mtl.deferred_free.count)
+  {
+    NSArray *entry = _mtl.deferred_free.firstObject;
+    id<MTLCommandBuffer> cb = entry[0];
+    if(cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError) break;
+    dt_free_align([(NSValue *)entry[1] pointerValue]);
+    [_mtl.deferred_free removeObjectAtIndex:0];
   }
   return ok;
 }
@@ -900,6 +915,19 @@ void dt_slang_gpu_wait(void)
   g_mutex_lock(&_mtl_lock);
   _finish();
   g_mutex_unlock(&_mtl_lock);
+}
+
+void dt_slang_gpu_free_align(void *mem)
+{
+  if(!mem) return;
+  g_mutex_lock(&_mtl_lock);
+  // only shared storage aliases host memory, and only queued kernels use it
+  if(_mtl.usable && !_mtl.private_storage) _check(FALSE);
+  id<MTLCommandBuffer> last = _mtl.usable && !_mtl.private_storage ? _mtl.inflight.lastObject : nil;
+  if(last)
+    [_mtl.deferred_free addObject:@[ last, [NSValue valueWithPointer:mem] ]];
+  g_mutex_unlock(&_mtl_lock);
+  if(!last) dt_free_align(mem);
 }
 
 void dt_slang_gpu_memory_info(size_t *available, int *max_dim)

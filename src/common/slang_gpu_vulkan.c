@@ -1701,6 +1701,12 @@ void dt_slang_gpu_wait(void)
   g_mutex_unlock(&_vk_lock);
 }
 
+void dt_slang_gpu_free_align(void *mem)
+{
+  // Vulkan never aliases host memory
+  dt_free_align(mem);
+}
+
 void dt_slang_gpu_image_free(dt_slang_gpu_image_t *img)
 {
   if(!img) return;
