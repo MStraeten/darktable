@@ -2386,9 +2386,10 @@ static int make_tests(test_t *t)
                BUFFER("filter", dp_filter, sizeof(dp_filter)));
     static float dp_detail[4 * W * H];
     for(int k = 0; k < 4 * W * H; k++) dp_detail[k] = 0.6f * (image_in[(k + 4 * 29) % (4 * W * H)] - 0.5f);
+    static const float dp_thrs[4] = { 0.1f, 0.05f, 0.15f, 0.0f };
     TEST("denoiseprofile_synthesize", "denoiseprofile", "denoiseprofile_synthesize",
          IMG_IN("coarse", dp_pre), IMG_IN("detail", dp_detail), IMG_OUT("out"), INT("width", W), INT("height", H),
-         FLOAT4_BUF("threshold", 0.1f, 0.05f, 0.15f, 0.0f), SLANG_INT("band", 0),
+         BUFFER("threshold", (void *)dp_thrs, sizeof(dp_thrs)), INT("band", 0),
          FLOAT4("boost", 1.0f, 1.0f, 1.0f, 1.0f));
 
     // block sums of the squared detail. The OpenCL kernel adds up each
