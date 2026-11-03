@@ -17,8 +17,8 @@
 */
 
 // the statistics of dt_color_picker_helper() in src/common/color_picker.c,
-// reduced on the device. OpenCL has no such kernel: it reads the box back
-// and runs the CPU code on it.
+// reduced on the device, as color_picker_stats_4ch and _mosaic in basic.cl
+// do for OpenCL.
 //
 // Each work item reduces one tile of the box and writes 16 floats: the sums,
 // minima, maxima and pixel counts of the four channels. The host adds up the
