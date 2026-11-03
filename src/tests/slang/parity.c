@@ -320,6 +320,10 @@ static void markesteijn_hex(const uint8_t (*const xtrans)[6], signed char allhex
 #define SLANG_BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz, .slang_only = 1 }
 #define SLANG_RAW_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = 1, .pixels = px, \
                               .slang_only = 1 }
+// an image in Slang that the OpenCL kernel reads or writes as a float buffer
+#define BUF_IMG_IN(n, px, ch) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = ch, .pixels = px, \
+                                .cl_buffer = 1 }
+#define BUF_IMG_OUT(n) { .kind = ARG_IMAGE_OUT, .name = n, .w = W, .h = H, .channels = 4, .cl_buffer = 1 }
 #define CHAR2(n, a, b) { .kind = ARG_CHAR2, .name = n, .iv = { a, b } }
 #define RAW_U16(n, ptr, rw, rh) { .kind = ARG_RAW_U16, .name = n, .data = ptr, .w = rw, .h = rh, \
                                   .size = (size_t)(rw) * (rh) * sizeof(uint16_t) }
@@ -674,6 +678,26 @@ static int make_tests(test_t *t)
   TEST("highlights_opposed_linear", "basic", "highlights_opposed_linear",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
        FLOAT4("clips", 0.6f, 0.65f, 0.55f, 1.0f), FLOAT4("chroma", 0.05f, -0.02f, 0.03f, 0.0f));
+  // the opposed method's chroma sums: per 16x16 work group the sums and counts
+  // of the unclipped photosites next to clipped ones, reduced in local memory
+  {
+    const int ngroups = ((W + 15) / 16) * ((H + 15) / 16);
+    static const char *cs_labels[2] = { "highlights_chroma_sums rggb", "highlights_chroma_sums xtrans" };
+    static const unsigned int cs_filters[2] = { 0x94949494u, 9u };
+    for(int f = 0; f < 2; f++)
+      TEST_TOL(cs_labels[f], "basic", "highlights_chroma_sums", 1e-5,
+               RAW_IN("in", image_raw), BUFFER("mask", mask_bytes, 3 * msize), INT("msize", msize),
+               INT("mwidth", mwidth), INT("mheight", mheight), INT("iwidth", W), INT("iheight", H),
+               INT("filters", cs_filters[f]), BUFFER("xtrans", xtrans, sizeof(xtrans)),
+               BUFFER("clips", hl_clips, sizeof(hl_clips)), BUFFER("correction", hl_correction, sizeof(hl_correction)),
+               BUFFER_OUT("accu", NULL, sizeof(float) * 8 * ngroups), LOCAL("sums", sizeof(float) * 4 * 256),
+               LOCAL("cnts", sizeof(float) * 4 * 256));
+    TEST_TOL("highlights_chroma_sums_linear", "basic", "highlights_chroma_sums_linear", 1e-5,
+             IMG_IN("in", image_in), BUFFER("mask", mask_bytes, 3 * msize), INT("msize", msize),
+             INT("mwidth", mwidth), INT("mheight", mheight), INT("width", W), INT("height", H),
+             FLOAT4("clips", 0.6f, 0.65f, 0.55f, 1.0f), BUFFER_OUT("accu", NULL, sizeof(float) * 8 * ngroups),
+             LOCAL("sums", sizeof(float) * 4 * 256), LOCAL("cnts", sizeof(float) * 4 * 256));
+  }
   // rotate pixels by about 45 degrees around a point inside the image, with
   // each of the four interpolators; part of the output falls outside the input.
   // The matrix and center are dyadic so that every position is exact: with
@@ -1095,6 +1119,10 @@ static int make_tests(test_t *t)
          FLOAT("dither", 1.0f / 256), INT("unbound", k));
   }
 
+  // random dither, seeded per pixel
+  TEST("dither_random", "extended", "dither_random",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), FLOAT("dither", 1.0f / 256));
+
   // rotate and perspective: a slight rotation with a keystone, partly
   // outside the input
   {
@@ -1148,6 +1176,94 @@ static int make_tests(test_t *t)
     TEST("hazeremoval_dehaze", "hazeremoval", "hazeremoval_dehaze",
          INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_IN("trans_map", rcd_dir),
          IMG_OUT("out"), FLOAT("t_min", 0.1f), FLOAT4("A0", 0.9f, 0.95f, 1.05f, 0.0f));
+  }
+
+  // haze removal's ambient light: the dark channel, one radix pass of the
+  // quantile selection over the dark channel and over the brightness of the
+  // hazy pixels, and the per work group color sums
+  {
+    const int ngroups = ((W + 15) / 16) * ((H + 15) / 16);
+    TEST("hazeremoval_dark_channel", "hazeremoval", "hazeremoval_dark_channel",
+         INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_OUT("out"));
+    static const char *hh_labels[3] = { "hazeremoval_histogram dark", "hazeremoval_histogram dark pass 2",
+                                        "hazeremoval_histogram bright" };
+    // a dark channel key of about 0.5 is 0xbf000000, so the second pass
+    // counts the keys whose top byte is 0xbe
+    static const unsigned int hh_prefix[3] = { 0u, 0xbe000000u, 0u };
+    static const unsigned int hh_mask[3] = { 0u, 0xff000000u, 0u };
+    static const int hh_shift[3] = { 24, 16, 24 };
+    for(int k = 0; k < 3; k++)
+      TEST(hh_labels[k], "hazeremoval", "hazeremoval_histogram",
+           INT("width", W), INT("height", H), RAW_IN("dark", image_raw), IMG_IN("in", image_in),
+           INT("brightness", k == 2), FLOAT("crit", 0.4f), INT("prefix", (int)hh_prefix[k]),
+           INT("prefix_mask", (int)hh_mask[k]), INT("shift", hh_shift[k]), SLANG_INT("pass", 0),
+           INTS_OUT("hist", sizeof(int) * 256));
+    TEST_TOL("hazeremoval_ambient_sums", "hazeremoval", "hazeremoval_ambient_sums", 1e-5,
+             INT("width", W), INT("height", H), RAW_IN("dark", image_raw), IMG_IN("in", image_in),
+             FLOAT("crit_haze", 0.4f), FLOAT("crit_bright", 1.5f),
+             BUFFER_OUT("accu", NULL, sizeof(float) * 4 * ngroups), LOCAL("sums", sizeof(float) * 4 * 256));
+  }
+
+  // the retouch heal solver: the split of the difference into red and black
+  // checkerboard buffers, one over-relaxation step of each color with the
+  // per work group sums of squared changes, the convergence test, and the
+  // sum back in the image layout. OpenCL works on plain buffers where the
+  // Slang kernels take images
+  {
+    enum { SW = (W + 1) / 2 };
+    const int groups = ((SW + 15) / 16) * ((H + 15) / 16);
+    static float *heal_a = NULL, *heal_b = NULL, *heal_mask = NULL, *heal_partial = NULL;
+    if(!heal_a)
+    {
+      // a generator of its own, so the other tests keep their inputs
+      unsigned int seed = 7;
+#define HEAL_RAND() ((seed = seed * 1664525u + 1013904223u) >> 8) * (1.0f / 16777216.0f)
+      heal_a = malloc(sizeof(float) * 4 * SW * (H + 2));
+      heal_b = malloc(sizeof(float) * 4 * SW * (H + 2));
+      for(int k = 0; k < 4 * SW * (H + 2); k++)
+      {
+        heal_a[k] = HEAL_RAND() - 0.5f;
+        heal_b[k] = HEAL_RAND() - 0.5f;
+      }
+      heal_mask = malloc(sizeof(float) * W * H);
+      for(int k = 0; k < W * H; k++) heal_mask[k] = HEAL_RAND() < 0.6f ? 1.0f : 0.0f;
+      heal_partial = malloc(sizeof(float) * groups);
+      for(int k = 0; k < groups; k++) heal_partial[k] = HEAL_RAND() * 1e-6f;
+#undef HEAL_RAND
+    }
+    static const int heal_ints[2] = { 0, 0 };
+    for(int cs = 0; cs < 2; cs++)
+    {
+      static const char *sub_labels[2] = { "retouch_heal_sub black", "retouch_heal_sub red" };
+      TEST_GRID(sub_labels[cs], "retouch", "retouch_heal_sub", 0.0, SW, H + 2,
+                BUF_IMG_IN("top", image_in, 4), BUF_IMG_IN("bottom", image_lab, 4),
+                BUFFER_OUT("split", NULL, sizeof(float) * 4 * SW * (H + 2)), INT("width", W), INT("height", H),
+                INT("subwidth", SW), INT("cs", cs));
+      static const char *it_labels[2] = { "retouch_heal_iterate black", "retouch_heal_iterate red" };
+      TEST_GRID(it_labels[cs], "retouch", "retouch_heal_iterate", 1e-5, SW, H,
+                BUFFER_OUT("active", heal_a, sizeof(float) * 4 * SW * (H + 2)),
+                BUFFER("neighbor", heal_b, sizeof(float) * 4 * SW * (H + 2)), BUF_IMG_IN("mask", heal_mask, 1),
+                INT("width", W), INT("height", H), INT("subwidth", SW), INT("cs", cs), FLOAT("w", 0.45f),
+                BUFFER("converged", heal_ints, sizeof(int)), BUFFER_OUT("partial", NULL, sizeof(float) * groups),
+                LOCAL("buffer", sizeof(float) * 256));
+    }
+    // one work group of 256 in both; the OpenCL kernel is one-dimensional.
+    // The sum of the partials is about 2 * groups * 5e-7
+    for(int k = 0; k < 2; k++)
+    {
+      static const char *cv_labels[2] = { "retouch_heal_converged not yet", "retouch_heal_converged done" };
+      TEST_GRID(cv_labels[k], "retouch", "retouch_heal_converged", 0.0, 16, 16,
+                BUFFER("partial_black", heal_partial, sizeof(float) * groups),
+                BUFFER("partial_red", heal_partial, sizeof(float) * groups), INT("groups", groups),
+                FLOAT("err_exit", k ? 1.0f : 1e-9f), INTS_OUT("converged", sizeof(int)), LOCAL("buffer", sizeof(float) * 256));
+      t[n - 1].clgw = 256;
+      t[n - 1].clgh = 1;
+      t[n - 1].cllx = 256;
+      t[n - 1].clly = 1;
+    }
+    TEST("retouch_heal_add", "retouch", "retouch_heal_add",
+         BUFFER("red", heal_a, sizeof(float) * 4 * SW * (H + 2)), BUFFER("black", heal_b, sizeof(float) * 4 * SW * (H + 2)),
+         BUF_IMG_IN("bottom", image_in, 4), BUF_IMG_OUT("dest"), INT("width", W), INT("height", H), INT("subwidth", SW));
   }
 
   // resampling, with plans like _prepare_resampling_plan() makes them: per
@@ -2624,6 +2740,15 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
     const int a_cl = ca++;
     const cl_image_format fmt = { arg->channels == 1 ? CL_R : CL_RGBA, CL_FLOAT };
     const cl_image_desc desc = { .image_type = CL_MEM_OBJECT_IMAGE2D, .image_width = arg->w, .image_height = arg->h };
+    if(arg->cl_buffer)
+    {
+      const size_t sz = (size_t)arg->w * arg->h * arg->channels * sizeof(float);
+      mem[a] = clCreateBuffer(e->ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sz,
+                              (void *)(arg->kind == ARG_IMAGE_IN ? arg->pixels : initial_data(arg)), &err);
+      CK(err);
+      CK(clSetKernelArg(k, a_cl, sizeof(cl_mem), &mem[a]));
+      continue;
+    }
     switch(arg->kind)
     {
       case ARG_IMAGE_IN:
@@ -2708,7 +2833,9 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
   {
     const arg_t *arg = &t->args[a];
     const size_t origin[3] = { 0, 0, 0 }, region[3] = { arg->w, arg->h, 1 };
-    if(arg->kind == ARG_IMAGE_OUT && arg->channels == 1 && e->no_r)
+    if(arg->kind == ARG_IMAGE_OUT && arg->cl_buffer)
+      CK(clEnqueueReadBuffer(e->queue, mem[a], CL_TRUE, 0, out_size(arg), outs[a], 0, NULL, NULL));
+    else if(arg->kind == ARG_IMAGE_OUT && arg->channels == 1 && e->no_r)
     {
       const size_t npix = (size_t)arg->w * arg->h;
       float *rgba = malloc(npix * 4 * sizeof(float));
