@@ -810,6 +810,15 @@ static void _gpu_store_ambient(dt_iop_module_t *self,
       dt_control_log(_("haze removal could not calculate ambient light due to image content"));
   }
 }
+// the float of a key from _sort_key() in hazeremoval.cl
+static float _key_to_float(const uint32_t key)
+{
+  const uint32_t u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+  float v;
+  memcpy(&v, &u, sizeof(v));
+  return v;
+}
+
 #endif
 
 #ifdef HAVE_OPENCL
@@ -897,14 +906,6 @@ error:
   return err;
 }
 
-
-static float _key_to_float(const uint32_t key)
-{
-  const uint32_t u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
-  float v;
-  memcpy(&v, &u, sizeof(v));
-  return v;
-}
 
 // work groups of up to 16x16 covering the image, for the kernels that
 // reduce in local memory; the local size is a power of two
@@ -1223,6 +1224,109 @@ static int _box_slang(dt_slang_gpu_image_t *img, const int width, const int heig
   return err;
 }
 
+// the quantile of the dark channel, or with brightness set of the summed
+// colors of the pixels whose dark channel is at least crit, as
+// _quantile_cl() finds it
+static gboolean _quantile_slang(dt_slang_gpu_image_t *dark,
+                                dt_slang_gpu_image_t *img,
+                                const int width,
+                                const int height,
+                                const int brightness,
+                                const float crit,
+                                const float quantile,
+                                float *value)
+{
+  dt_slang_gpu_buffer_t *hist = dt_slang_gpu_buffer_new(sizeof(uint32_t) * 4 * 256, NULL);
+  if(!hist) return FALSE;
+
+  uint32_t counts[4 * 256];
+  uint32_t prefix = 0, prefix_mask = 0;
+  size_t k = 0;
+  gboolean ok = TRUE;
+  for(int pass = 0; pass < 4 && ok; pass++)
+  {
+    const int shift = 24 - 8 * pass;
+    ok = !dt_slang_gpu_run_2d_args("hazeremoval", "hazeremoval_histogram", width, height,
+                                   SLARG(width), SLARG(height), SLIMG_DEV(dark), SLIMG_DEV(img),
+                                   SLARG(brightness), SLARG(crit), SLARG(prefix), SLARG(prefix_mask),
+                                   SLARG(shift), SLARG(pass), SLBUF_DEV(hist))
+      && !dt_slang_gpu_buffer_read(hist, counts, sizeof(uint32_t) * 256 * (pass + 1));
+    if(!ok) break;
+
+    const uint32_t *h = counts + 256 * pass;
+    if(pass == 0)
+    {
+      size_t total = 0;
+      for(int b = 0; b < 256; b++) total += h[b];
+      k = (size_t)(total * quantile);
+      if(k >= total)
+      {
+        ok = FALSE;
+        break;
+      }
+    }
+
+    int bin = 0;
+    while(bin < 255 && k >= h[bin])
+    {
+      k -= h[bin];
+      bin++;
+    }
+    prefix |= (uint32_t)bin << shift;
+    prefix_mask |= 0xffu << shift;
+  }
+  dt_slang_gpu_buffer_free(hist);
+  if(ok) *value = _key_to_float(prefix);
+  return ok;
+}
+
+// _ambient_light_cl() on the Slang device; NAN if it fails, so that the
+// caller falls back to the host
+static float _ambient_light_slang(dt_slang_gpu_image_t *img,
+                                  const int width,
+                                  const int height,
+                                  const int w1,
+                                  rgb_pixel *pA0)
+{
+  const float dark_channel_quantil = 0.95f;
+  const float bright_quantil = 0.95f;
+  const size_t groups = (size_t)((width + 15) / 16) * ((height + 15) / 16);
+
+  dt_slang_gpu_image_t *dark = dt_slang_gpu_image_new(width, height, 1, NULL);
+  dt_slang_gpu_buffer_t *accu = dt_slang_gpu_buffer_new_uninit(4 * sizeof(float) * groups);
+  float *sums = dt_alloc_align_float(4 * groups);
+  float crit_haze_level = 0.0f, crit_brightness = 0.0f;
+  gboolean ok = dark && accu && sums
+    && !dt_slang_gpu_run_2d_args("hazeremoval", "hazeremoval_dark_channel", width, height,
+                                 SLARG(width), SLARG(height), SLIMG_DEV(img), SLIMG_DEV(dark))
+    && !_box_slang(dark, width, height, w1, FALSE)
+    && _quantile_slang(dark, img, width, height, 0, 0.0f, dark_channel_quantil, &crit_haze_level)
+    && _quantile_slang(dark, img, width, height, 1, crit_haze_level, bright_quantil, &crit_brightness)
+    && !dt_slang_gpu_run_2d_args("hazeremoval", "hazeremoval_ambient_sums", width, height,
+                                 SLARG(width), SLARG(height), SLIMG_DEV(dark), SLIMG_DEV(img),
+                                 SLARG(crit_haze_level), SLARG(crit_brightness), SLBUF_DEV(accu))
+    && !dt_slang_gpu_buffer_read(accu, sums, 4 * sizeof(float) * groups);
+
+  float distance_max = NAN;
+  if(ok)
+  {
+    double A0[4] = { 0.0, 0.0, 0.0, 0.0 };
+    for(size_t g = 0; g < groups; g++)
+      for(int c = 0; c < 4; c++) A0[c] += sums[4 * g + c];
+    if(A0[3] > 0.0)
+      for(int c = 0; c < 3; c++) A0[c] /= A0[3];
+    (*pA0)[0] = A0[0];
+    (*pA0)[1] = A0[1];
+    (*pA0)[2] = A0[2];
+    distance_max = crit_haze_level > 0 ? -1.125f * logf(crit_haze_level) : logf(FLT_MAX) / 2;
+  }
+
+  dt_free_align(sums);
+  dt_slang_gpu_buffer_free(accu);
+  dt_slang_gpu_image_free(dark);
+  return distance_max;
+}
+
 gboolean process_slang(dt_iop_module_t *self,
                        dt_dev_pixelpipe_iop_t *piece,
                        dt_slang_gpu_image_t *dev_in,
@@ -1246,8 +1350,10 @@ gboolean process_slang(dt_iop_module_t *self,
   float distance_max;
   _gpu_ambient_from_preview(self, piece, roi_in, &w1, &w2, &A0, &distance_max);
 
-  // In all other cases we calculate distance_max and A0 here, on the host
-  // as process_cl() does
+  // In all other cases we calculate distance_max and A0 here, on the device
+  // as process_cl() does, or for the compatibility mode on the host
+  if(dt_isnan(distance_max) && !compatibility_mode)
+    distance_max = _ambient_light_slang(dev_in, width, height, w1, &A0);
   if(dt_isnan(distance_max))
   {
     float *in = dt_alloc_align_float((size_t)4 * width * height);
