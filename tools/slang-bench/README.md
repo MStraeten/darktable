@@ -41,7 +41,9 @@ bash <darktable>/tools/slang-bench/bench.sh <darktable> 5
 It does 5 exports per path in one `darktable-cli` process each and writes
 `fullpipe-results/summary.md`: devices, pipe time per export, which modules
 ran on the GPU, per-module times, and the dE between the three outputs. The
-first export includes warm-up; report the later ones as steady state.
+first export includes warm-up, such as compiling GPU kernels the first time
+after an install, so the summary reports the median of the later ones as
+the steady state and the first one as its overhead over that.
 
 A third argument sets the export's longest side in pixels (`0`, the default,
 is full resolution). `RESOURCES` sets darktable's `resourcelevel`: the default,

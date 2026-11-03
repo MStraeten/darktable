@@ -67,11 +67,20 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
     echo "- tiled on $p: ${tl:-none}"
   done
   echo; echo "pipe totals in ms, one process per path, $N exports each"; echo
-  echo "| path | per export |"; echo "|---|---|"
+  # the first export pays for one-time work (kernel compilation, caches), so
+  # the steady state is the median of the others and the first is reported
+  # as its overhead over that
+  echo "| path | per export | steady state | first export overhead |"; echo "|---|---|---|---|"
   for p in cpu opencl slang; do
-    t=$(grep 'pixel pipeline processing took' "$OUT/$p.log" | sed -E 's/.*took ([0-9.]+) secs.*/\1/' | awk '{printf "%s%.0f", (NR>1?" / ":""), $1*1000}')
-    echo "| $p | $t |"
+    ms=$(grep 'pixel pipeline processing took' "$OUT/$p.log" | sed -E 's/.*took ([0-9.]+) secs.*/\1/' | awk '{printf "%.0f\n", $1*1000}')
+    t=$(echo "$ms" | paste -sd/ - | sed 's|/| / |g')
+    med=$(echo "$ms" | tail -n +2 | sort -n | awk '{v[NR]=$1} END{if(NR) print (NR%2 ? v[(NR+1)/2] : int((v[NR/2]+v[NR/2+1])/2+0.5))}')
+    first=$(echo "$ms" | head -1)
+    over=$([ -n "$med" ] && [ -n "$first" ] && echo "$((first - med))")
+    echo "| $p | $t | ${med:--} | ${over:--} |"
   done
+  echo
+  echo "- slang device and kernel preparation at startup: $(grep -m1 -oE 'preparing the (Metal|Vulkan) device and kernels took [0-9.]+ secs' "$OUT/slang.log" | sed -E 's/.*took ([0-9.]+) secs/\1 s/')"
   echo; echo "module runs over all $N exports:"; echo
   for p in opencl slang; do
     echo "- $p: $(grep -c "processed .* on GPU" "$OUT/$p.log") on GPU; on CPU: $(grep "processed .* on CPU" "$OUT/$p.log" | sed -E "s/.*processed .([a-z0-9_]+). on CPU.*/\1/" | sort | uniq -c | awk '{printf "%s(%s) ", $2, $1}')"
