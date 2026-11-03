@@ -3753,6 +3753,139 @@ gboolean process_slang(dt_iop_module_t *self,
   if(data != dev_in) dt_slang_gpu_image_free(data);
   return !err;
 }
+
+// _distort_mask_lf() on the device: the green channel's coordinates, no TCA
+// and no vignetting
+static int _distort_mask_slang_lf(dt_iop_module_t *self,
+                                  dt_dev_pixelpipe_iop_t *piece,
+                                  dt_slang_gpu_image_t *dev_in,
+                                  dt_slang_gpu_image_t *dev_out,
+                                  const dt_iop_roi_t *const roi_in,
+                                  const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_lens_data_t *const d = (dt_iop_lens_data_t *)piece->data;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+
+  if(!d->lens || !d->lens->Maker || d->crop <= 0.0f)
+    return _slang_copy(dev_in, dev_out, owidth, oheight);
+
+  const char *ldkernel = NULL;
+  switch(dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP)->id)
+  {
+    case DT_INTERPOLATION_BILINEAR:
+      ldkernel = "lens_distort_bilinear";
+      break;
+    case DT_INTERPOLATION_BICUBIC:
+      ldkernel = "lens_distort_bicubic";
+      break;
+    case DT_INTERPOLATION_LANCZOS2:
+      ldkernel = "lens_distort_lanczos2";
+      break;
+    case DT_INTERPOLATION_LANCZOS3:
+      ldkernel = "lens_distort_lanczos3";
+      break;
+    default:
+      return 1;
+  }
+
+  const float orig_w = roi_in->scale * piece->buf_in.width;
+  const float orig_h = roi_in->scale * piece->buf_in.height;
+
+  dt_pthread_mutex_lock(&darktable.plugin_threadsafe);
+  int modflags;
+  const lfModifier *modifier =
+    _get_modifier(&modflags, orig_w, orig_h, d,
+                  LF_MODIFY_DISTORTION | LF_MODIFY_GEOMETRY | LF_MODIFY_SCALE, FALSE);
+  dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
+
+  // without TCA the three channels share the green coordinates, so the
+  // kernel's first channel is the mask
+  dt_iop_lens_grid_t grid = { NULL, 0, 0, 0, 0, 0, 0 };
+  int err;
+  if(!(modflags & (LF_MODIFY_TCA | LF_MODIFY_DISTORTION | LF_MODIFY_GEOMETRY | LF_MODIFY_SCALE))
+     || !_lens_grid_build(modifier, FALSE, TRUE, roi_out->x, roi_out->y, owidth, oheight, &grid))
+    err = _slang_copy(dev_in, dev_out, owidth, oheight);
+  else
+  {
+    const int iwidth = roi_in->width;
+    const int iheight = roi_in->height;
+    const int roi_in_x = roi_in->x;
+    const int roi_in_y = roi_in->y;
+    const int do_nan_checks = d->do_nan_checks;
+    const int coord_step = grid.step;
+    const int coord_gwidth = grid.gwidth;
+    const size_t coords_size = sizeof(float) * 6 * grid.gwidth * grid.gheight;
+    err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                   SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
+                                   SLBUF(grid.data, coords_size), SLARG(do_nan_checks),
+                                   SLARG(coord_step), SLARG(coord_gwidth));
+  }
+  dt_free_align(grid.data);
+  delete modifier;
+  return err;
+}
+
+// _distort_mask_md() on the device: pass_mode takes the green channel's
+// distortion for every channel
+static int _distort_mask_slang_md(dt_iop_module_t *self,
+                                  dt_dev_pixelpipe_iop_t *piece,
+                                  dt_slang_gpu_image_t *dev_in,
+                                  dt_slang_gpu_image_t *dev_out,
+                                  const dt_iop_roi_t *const roi_in,
+                                  const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_lens_data_t *d = (dt_iop_lens_data_t *)piece->data;
+
+  if(!d->nc || d->modify_flags == DT_IOP_LENS_MODFLAG_NONE)
+    return _slang_copy(dev_in, dev_out, roi_out->width, roi_out->height);
+
+  const float w2 = 0.5f * roi_in->scale * piece->buf_in.width;
+  const float h2 = 0.5f * roi_in->scale * piece->buf_in.height;
+  const float r = 1.0f / dt_fast_hypotf(w2, h2);
+  const int knots = d->nc;
+
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+  const int itor_id = itor->id;
+  const int itor_width = itor->width;
+  const int pass_mode = 1;
+
+  return dt_slang_gpu_run_2d_args("basic", "md_lens_correction", roi_out->width, roi_out->height,
+                                  SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                  SLBUF(d->knots_dist, sizeof(d->knots_dist)), SLBUF(d->cor_rgb, sizeof(d->cor_rgb)),
+                                  SLARG(roi_out->width), SLARG(roi_out->height),
+                                  SLARG(roi_in->width), SLARG(roi_in->height),
+                                  SLARG(w2), SLARG(h2), SLARG(r), SLARG(d->scale_md),
+                                  SLARG(roi_in->x), SLARG(roi_in->y), SLARG(roi_out->x), SLARG(roi_out->y),
+                                  SLARG(knots), SLARG(itor_id), SLARG(itor_width), SLARG(pass_mode));
+}
+
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_lens_data_t *d = (dt_iop_lens_data_t *)piece->data;
+
+  if(d->method != DT_IOP_LENS_METHOD_LENSFUN && d->method != DT_IOP_LENS_METHOD_EMBEDDED_METADATA)
+    return !dt_iop_copy_image_roi_slang(dev_out, dev_in, roi_in, roi_out);
+
+  // clipped as in distort_mask()
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 1, NULL);
+  int err = !tmp;
+  if(!err && d->method == DT_IOP_LENS_METHOD_LENSFUN)
+    err = _distort_mask_slang_lf(self, piece, dev_in, tmp, roi_in, roi_out);
+  else if(!err)
+    err = _distort_mask_slang_md(self, piece, dev_in, tmp, roi_in, roi_out);
+  if(!err) err = dt_iop_image_clip_slang(dev_out, tmp, width, height);
+  dt_slang_gpu_image_free(tmp);
+  return !err;
+}
 #endif
 
 void tiling_callback(dt_iop_module_t *self,

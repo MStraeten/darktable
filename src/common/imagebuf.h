@@ -123,6 +123,13 @@ int dt_iop_copy_image_roi_slang(struct dt_slang_gpu_image_t *out,
                                 struct dt_slang_gpu_image_t *in,
                                 const dt_iop_roi_t *const roi_in,
                                 const dt_iop_roi_t *const roi_out);
+// out = CLIP(in) for the first channel of 1-channel masks on the Slang
+// device, as the CPU distort_mask() functions clip their samples. Returns 0
+// on success
+int dt_iop_image_clip_slang(struct dt_slang_gpu_image_t *out,
+                            struct dt_slang_gpu_image_t *in,
+                            const int width,
+                            const int height);
 #endif
 
 // Copy one image buffer to another, multiplying each element by the

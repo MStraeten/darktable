@@ -273,6 +273,15 @@ int dt_iop_copy_image_roi_slang(dt_slang_gpu_image_t *out,
   const int dy = same ? 0 : roi_out->y - roi_in->y;
   return dt_iop_image_blit_slang(out, in, iwidth, iheight, owidth, oheight, dx, dy);
 }
+
+int dt_iop_image_clip_slang(dt_slang_gpu_image_t *out,
+                            dt_slang_gpu_image_t *in,
+                            const int width,
+                            const int height)
+{
+  return dt_slang_gpu_run_2d_args("basic", "mask_clip", width, height,
+                                  SLIMG_DEV(in), SLIMG_DEV(out), SLARG(width), SLARG(height));
+}
 #endif
 
 void dt_iop_image_scaled_copy(float *const restrict buf,

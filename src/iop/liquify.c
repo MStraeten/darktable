@@ -1644,6 +1644,24 @@ gboolean process_slang(dt_iop_module_t *self,
   dt_free_align((void *)map);
   return !err;
 }
+
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  // the warp of process_slang() on the 1-channel mask, clipped as in distort_mask()
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 1, NULL);
+  const gboolean ok = tmp
+    && process_slang(self, piece, dev_in, tmp, roi_in, roi_out)
+    && !dt_iop_image_clip_slang(dev_out, tmp, width, height);
+  dt_slang_gpu_image_free(tmp);
+  return ok;
+}
 #endif
 
 void init_global(dt_iop_module_so_t *self)

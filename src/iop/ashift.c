@@ -3772,67 +3772,14 @@ error:
 #endif
 
 #ifdef HAVE_SLANG_GPU
-gboolean process_slang(dt_iop_module_t *self,
-                       dt_dev_pixelpipe_iop_t *piece,
-                       dt_slang_gpu_image_t *dev_in,
-                       dt_slang_gpu_image_t *dev_out,
-                       const dt_iop_roi_t *const roi_in,
-                       const dt_iop_roi_t *const roi_out)
+// the warp of process_slang(), on 1- or 4-channel images
+static gboolean _warp_slang(dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
 {
   const dt_iop_ashift_data_t *d = piece->data;
-  dt_iop_ashift_gui_data_t *g = self->gui_data;
-
-  // only for preview pipe: collect input buffer data and do some other
-  // evaluations, as process_cl() does
-  if(self->dev->gui_attached && g && dt_pipe_is_preview(piece->pipe))
-  {
-    dt_boundingbox_t points = { 0.0f,
-                                0.0f,
-                                (float)piece->buf_in.width,
-                                (float)piece->buf_in.height };
-
-    const float ivec[2] = { points[2] - points[0], points[3] - points[1] };
-    const float ivecl = dt_fast_hypotf(ivec[0], ivec[1]);
-
-    dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe, self->iop_order,
-                                      DT_DEV_TRANSFORM_DIR_FORW_EXCL, points, 2);
-
-    const float ovec[2] = { points[2] - points[0], points[3] - points[1] };
-    const float ovecl = dt_fast_hypotf(ovec[0], ovec[1]);
-
-    const float alpha =
-      acosf(CLAMP((ivec[0] * ovec[0] + ivec[1] * ovec[1]) / (ivecl * ovecl), -1.0f, 1.0f));
-    const int isflipped =
-      fabsf(fmodf(alpha + M_PI_F, M_PI_F) - M_PI_2f) < M_PI_4f;
-
-    const dt_hash_t hash = dt_dev_hash_plus(self->dev, self->dev->preview_pipe,
-                                           self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_EXCL);
-
-    dt_iop_gui_enter_critical_section(self);
-    g->isflipped = isflipped;
-
-    const size_t requested_size = (size_t)roi_in->width * roi_in->height;
-    if(g->buf == NULL || (size_t)g->buf_width * g->buf_height < requested_size)
-    {
-      dt_free_align(g->buf);
-      g->buf = dt_alloc_align_float(4 * requested_size);
-    }
-
-    int err = 0;
-    if(g->buf)
-    {
-      err = dt_slang_gpu_image_read(dev_in, g->buf);
-
-      g->buf_width = roi_in->width;
-      g->buf_height = roi_in->height;
-      g->buf_x_off = roi_in->x;
-      g->buf_y_off = roi_in->y;
-      g->buf_scale = roi_in->scale;
-      g->buf_hash = hash;
-    }
-    dt_iop_gui_leave_critical_section(self);
-    if(err) return FALSE;
-  }
 
   const int width = roi_out->width;
   const int height = roi_out->height;
@@ -3891,6 +3838,88 @@ gboolean process_slang(dt_iop_module_t *self,
                                    SLARG(iwidth), SLARG(iheight), SLARG(iroi), SLARG(oroi),
                                    SLARG(in_scale), SLARG(out_scale), SLARG(clip),
                                    SLBUF(ihomograph, sizeof(ihomograph)));
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_ashift_gui_data_t *g = self->gui_data;
+
+  // only for preview pipe: collect input buffer data and do some other
+  // evaluations, as process_cl() does
+  if(self->dev->gui_attached && g && dt_pipe_is_preview(piece->pipe))
+  {
+    dt_boundingbox_t points = { 0.0f,
+                                0.0f,
+                                (float)piece->buf_in.width,
+                                (float)piece->buf_in.height };
+
+    const float ivec[2] = { points[2] - points[0], points[3] - points[1] };
+    const float ivecl = dt_fast_hypotf(ivec[0], ivec[1]);
+
+    dt_dev_distort_backtransform_plus(self->dev, self->dev->preview_pipe, self->iop_order,
+                                      DT_DEV_TRANSFORM_DIR_FORW_EXCL, points, 2);
+
+    const float ovec[2] = { points[2] - points[0], points[3] - points[1] };
+    const float ovecl = dt_fast_hypotf(ovec[0], ovec[1]);
+
+    const float alpha =
+      acosf(CLAMP((ivec[0] * ovec[0] + ivec[1] * ovec[1]) / (ivecl * ovecl), -1.0f, 1.0f));
+    const int isflipped =
+      fabsf(fmodf(alpha + M_PI_F, M_PI_F) - M_PI_2f) < M_PI_4f;
+
+    const dt_hash_t hash = dt_dev_hash_plus(self->dev, self->dev->preview_pipe,
+                                           self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_EXCL);
+
+    dt_iop_gui_enter_critical_section(self);
+    g->isflipped = isflipped;
+
+    const size_t requested_size = (size_t)roi_in->width * roi_in->height;
+    if(g->buf == NULL || (size_t)g->buf_width * g->buf_height < requested_size)
+    {
+      dt_free_align(g->buf);
+      g->buf = dt_alloc_align_float(4 * requested_size);
+    }
+
+    int err = 0;
+    if(g->buf)
+    {
+      err = dt_slang_gpu_image_read(dev_in, g->buf);
+
+      g->buf_width = roi_in->width;
+      g->buf_height = roi_in->height;
+      g->buf_x_off = roi_in->x;
+      g->buf_y_off = roi_in->y;
+      g->buf_scale = roi_in->scale;
+      g->buf_hash = hash;
+    }
+    dt_iop_gui_leave_critical_section(self);
+    if(err) return FALSE;
+  }
+
+  return _warp_slang(piece, dev_in, dev_out, roi_in, roi_out);
+}
+
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  // clipped as in distort_mask()
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 1, NULL);
+  const gboolean ok = tmp
+    && _warp_slang(piece, dev_in, tmp, roi_in, roi_out)
+    && !dt_iop_image_clip_slang(dev_out, tmp, width, height);
+  dt_slang_gpu_image_free(tmp);
+  return ok;
 }
 #endif
 
