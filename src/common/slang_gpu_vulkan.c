@@ -1434,6 +1434,10 @@ typedef struct dt_slang_import_t
 // pinning the pages costs about 0.1 ms per MB, and below this the copy
 // through a staging buffer is cheaper
 #define DT_SLANG_IMPORT_MIN (4 << 20)
+// importing a whole 61 MP readback, 981 MB, on a Radeon 780M pushed the host
+// heap over its budget, and _make_room() evicted 2.9 GB of pooled images
+// that the next export allocated again
+#define DT_SLANG_IMPORT_MAX (128 << 20)
 
 static void _import_free(dt_slang_import_t *imp)
 {
@@ -1524,6 +1528,15 @@ static int _image_transfer_rect(dt_slang_gpu_image_t *img,
   const size_t bpp = sizeof(float) * img->channels;
   const size_t row = bpp * w;
   const size_t span = pitch * (h - 1) + row;
+  if(_vk.host_import && span > DT_SLANG_IMPORT_MAX && h > 1)
+  {
+    const int band = MAX(1, DT_SLANG_IMPORT_MAX / pitch);
+    for(int b = 0; b < h; b += band)
+      if(_image_transfer_rect(img, (char *)host + b * pitch, pitch, x, y + b, w, MIN(band, h - b), to_device))
+        return 1;
+    return 0;
+  }
+
   VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                              .imageOffset = { x, y, 0 },
                              .imageExtent = { w, h, 1 } };
