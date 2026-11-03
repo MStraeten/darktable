@@ -5063,27 +5063,78 @@ static int _retouch_heal_slang(dt_slang_gpu_image_t *layer,
 {
   const int width = roi_mask_scaled->width;
   const int height = roi_mask_scaled->height;
+  const int subwidth = (width + 1) / 2;
+  const int red = 1;
+  const int black = 0;
+
+  // the relaxation factor and exit threshold of _heal_laplace_loop()
+  size_t nmask = 0;
+  for(size_t k = 0; k < (size_t)width * height; k++)
+    nmask += mask_scaled[k] != 0.0f;
+  const float w = ((2.0f - 1.0f / (0.1575f * sqrtf(nmask) + 0.8f)) * .25f);
+  const float epsilon = (0.1 / 255);
+  const float err_exit = epsilon * epsilon * w * w;
+
+  const int groups = ((subwidth + 15) / 16) * ((height + 15) / 16);
+  const size_t splitsize = sizeof(float) * 4 * subwidth * (height + 2);
+  const int zero = 0;
+
   dt_slang_gpu_image_t *src = dt_slang_gpu_image_new(width, height, 4, NULL);
   dt_slang_gpu_image_t *dest = dt_slang_gpu_image_new(width, height, 4, NULL);
-  float *img_src = dt_alloc_align_float((size_t)4 * width * height);
-  float *img_dest = dt_alloc_align_float((size_t)4 * width * height);
+  dt_slang_gpu_buffer_t *split_red = dt_slang_gpu_buffer_new_uninit(splitsize);
+  dt_slang_gpu_buffer_t *split_black = dt_slang_gpu_buffer_new_uninit(splitsize);
+  dt_slang_gpu_buffer_t *partial_red = dt_slang_gpu_buffer_new_uninit(sizeof(float) * groups);
+  dt_slang_gpu_buffer_t *partial_black = dt_slang_gpu_buffer_new_uninit(sizeof(float) * groups);
+  dt_slang_gpu_buffer_t *converged = dt_slang_gpu_buffer_new(sizeof(int), &zero);
 
-  // the solver runs on the CPU, as for OpenCL
-  int err = !src || !dest || !img_src || !img_dest
+  // the solver of dt_heal_cl(): the convergence test runs on the device after
+  // each iteration, and the flag is read back every few iterations
+  int err = !src || !dest || !split_red || !split_black || !partial_red || !partial_black || !converged
     || _rt_copy_in_to_out_slang(layer, roi_layer, src, roi_mask_scaled, dx, dy, angle, cx, cy)
     || _rt_copy_in_to_out_slang(layer, roi_layer, dest, roi_mask_scaled, 0, 0, 0.0f, 0.0f, 0.0f)
-    || dt_slang_gpu_image_read(src, img_src)
-    || dt_slang_gpu_image_read(dest, img_dest);
-  if(!err)
+    || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_sub", subwidth, height + 2,
+                                SLIMG_DEV(dest), SLIMG_DEV(src), SLBUF_DEV(split_red),
+                                SLARG(width), SLARG(height), SLARG(subwidth), SLARG(red))
+    || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_sub", subwidth, height + 2,
+                                SLIMG_DEV(dest), SLIMG_DEV(src), SLBUF_DEV(split_black),
+                                SLARG(width), SLARG(height), SLARG(subwidth), SLARG(black));
+
+  for(int iter = 0; iter < max_iter && !err; iter++)
   {
-    dt_heal(img_src, img_dest, mask_scaled, width, height, 4, max_iter);
-    // src is free again, and serves as the scratch image of the blend
-    err = dt_slang_gpu_image_write(dest, img_dest)
-      || _rt_copy_image_masked_slang(dest, layer, roi_layer, mask, roi_mask_scaled, src, opacity);
+    err = dt_slang_gpu_run_2d_args("retouch", "retouch_heal_iterate", subwidth, height,
+                                   SLBUF_DEV(split_black), SLBUF_DEV(split_red), SLIMG_DEV(mask),
+                                   SLARG(width), SLARG(height), SLARG(subwidth), SLARG(black), SLARG(w),
+                                   SLBUF_DEV(converged), SLBUF_DEV(partial_black))
+      || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_iterate", subwidth, height,
+                                  SLBUF_DEV(split_red), SLBUF_DEV(split_black), SLIMG_DEV(mask),
+                                  SLARG(width), SLARG(height), SLARG(subwidth), SLARG(red), SLARG(w),
+                                  SLBUF_DEV(converged), SLBUF_DEV(partial_red))
+      || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_converged", 16, 16,
+                                  SLBUF_DEV(partial_black), SLBUF_DEV(partial_red),
+                                  SLARG(groups), SLARG(err_exit), SLBUF_DEV(converged));
+    if(!err && (iter + 1) % 32 == 0)
+    {
+      int done = 0;
+      err = dt_slang_gpu_buffer_read(converged, &done, sizeof(int));
+      if(done) break;
+    }
   }
 
-  dt_free_align(img_src);
-  dt_free_align(img_dest);
+  // src is free again once the solution is added, and serves as the
+  // scratch image of the blend
+  dt_slang_gpu_image_t *healed = dt_slang_gpu_image_new(width, height, 4, NULL);
+  err = err || !healed
+    || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_add", width, height,
+                                SLBUF_DEV(split_red), SLBUF_DEV(split_black), SLIMG_DEV(src), SLIMG_DEV(healed),
+                                SLARG(width), SLARG(height), SLARG(subwidth))
+    || _rt_copy_image_masked_slang(healed, layer, roi_layer, mask, roi_mask_scaled, dest, opacity);
+
+  dt_slang_gpu_image_free(healed);
+  dt_slang_gpu_buffer_free(split_red);
+  dt_slang_gpu_buffer_free(split_black);
+  dt_slang_gpu_buffer_free(partial_red);
+  dt_slang_gpu_buffer_free(partial_black);
+  dt_slang_gpu_buffer_free(converged);
   dt_slang_gpu_image_free(src);
   dt_slang_gpu_image_free(dest);
   return err;
