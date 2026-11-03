@@ -521,6 +521,8 @@ static int _slang_lattice(dt_slang_gpu_image_t *dev_in,
                           dt_slang_gpu_image_t *dev_out,
                           const int width,
                           const int height,
+                          const int x0,
+                          const int y0,
                           const float sigma[5])
 {
   const size_t npixels = (size_t)width * height;
@@ -529,13 +531,16 @@ static int _slang_lattice(dt_slang_gpu_image_t *dev_in,
 
   // the scale factors of the PermutohedralLattice constructor, computed the
   // same way so the vertices match the CPU's
-  float prm[10];
+  float prm[12];
   for(int i = 0; i < 5; i++)
   {
     prm[i] = sigma[i];
     prm[5 + i] = 1.0f / (sqrtf((float)(i + 1) * (i + 2)));
     prm[5 + i] *= (5 + 1) * sqrtf(2.0 / 3);
   }
+  // the roi origin, for the image coordinates process() uses
+  prm[10] = x0;
+  prm[11] = y0;
 
   // the CPU's estimate of the vertex count, which it uses to size its
   // tables. A run that needs more entries starts again with the count it
@@ -688,7 +693,7 @@ gboolean process_slang(dt_iop_module_t *self,
   }
 
   for(int k = 0; k < 5; k++) sigma[k] = 1.0f / sigma[k];
-  return !_slang_lattice(dev_in, dev_out, width, height, sigma);
+  return !_slang_lattice(dev_in, dev_out, width, height, roi_in->x, roi_in->y, sigma);
 }
 #endif
 

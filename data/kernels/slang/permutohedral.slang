@@ -40,8 +40,10 @@ import common;
 
 static const int D = 5;
 
-// the prm buffer: 1/sigma for x, y, r, g, b, then the lattice's scale factors
+// the prm buffer: 1/sigma for x, y, r, g, b, the lattice's scale factors,
+// then the roi origin in the image
 static const int PRM_SCALE = 5;
+static const int PRM_ORIGIN = 10;
 
 int _sext16(const int v)
 {
@@ -94,8 +96,8 @@ void _simplex(const int x, const int y, const float4 p, StructuredBuffer<float> 
               out int keys[(D + 1) * D], out float weight[D + 1])
 {
   float position[D];
-  position[0] = float(x) * prm[0];
-  position[1] = float(y) * prm[1];
+  position[0] = (float(x) + prm[PRM_ORIGIN]) * prm[0];
+  position[1] = (float(y) + prm[PRM_ORIGIN + 1]) * prm[1];
   position[2] = p.x * prm[2];
   position[3] = p.y * prm[3];
   position[4] = p.z * prm[4];
