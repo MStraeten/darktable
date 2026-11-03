@@ -57,7 +57,7 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
   echo "- opencl devices: $(grep -E "^ +DEVICE: +[0-9]+: '" "$OUT/opencl.log" | sed -E "s/.*DEVICE: +[0-9]+: ('[^']*').*/\1/" | tr '\n' ' ')"
   echo "- export size: $([ "$SIZE" = 0 ] && echo full resolution || echo "${SIZE} px"), resourcelevel: $RESOURCES"
   for p in cpu opencl slang; do
-    tl=$(grep -E '\*tiled\*|process (fast )?tiled' "$OUT/$p.log" | sed -E 's/.*\[export\] +([a-z0-9_]+).*/\1/' | sort | uniq -c | awk '{printf "%s(%s) ", $2, $1}')
+    tl=$(grep -E '\*(fast )?tiled\*|process (fast )?tiled' "$OUT/$p.log" | sed -E 's/.*\[export\] +([a-z0-9_]+).*/\1/' | sort | uniq -c | awk '{printf "%s(%s) ", $2, $1}')
     echo "- tiled on $p: ${tl:-none}"
   done
   echo; echo "pipe totals in ms, one process per path, $N exports each"; echo
