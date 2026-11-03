@@ -336,6 +336,29 @@ float _tpdf(uint urandom)
   return frandom < 0.5f ? (sqrt(2.0f * frandom) - 1.0f) : (1.0f - sqrt(2.0f * (1.0f - frandom)));
 }
 
+// dither_random in ../extended.cl: random dither with the noise of each
+// pixel seeded by its position, as in _process_random()
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void dither_random(uint3 gid : SV_DispatchThreadID,
+                   uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                   uniform float dither)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  uint2 tea_state = uint2(uint(y * width + x), 0u);
+  _encrypt_tea(tea_state);
+  const float dith = dither * _tpdf(tea_state.x);
+
+  // CLIP() of the CPU code, which also maps NaN to 0
+  const float4 v = in.read(int2(x, y)) + dith;
+  out.write(int2(x, y), float4(v.x >= 0.0f ? min(v.x, 1.0f) : 0.0f, v.y >= 0.0f ? min(v.y, 1.0f) : 0.0f,
+                               v.z >= 0.0f ? min(v.z, 1.0f) : 0.0f, v.w >= 0.0f ? min(v.w, 1.0f) : 0.0f));
+}
+
 /* kernel for the vignette plugin. */
 [shader("compute")]
 [numthreads(16, 16, 1)]
