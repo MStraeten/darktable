@@ -91,6 +91,8 @@ typedef struct dt_slang_vulkan_t
   gboolean timestamps; // the queue can time kernels
   float timestamp_period; // ns per timestamp tick
   VkDeviceSize pool_budget; // bytes the image and buffer pools may keep together
+  VkDeviceSize host_cap;    // integrated GPU: bytes of system memory the host heaps may hold, 0 for no cap
+  uint32_t host_heaps;      // bit mask of the heaps that are system memory
   gboolean memory_budget;   // VK_EXT_memory_budget reports the free device memory
   gboolean discrete;        // the device has memory of its own, which OpenCL shares
   gboolean host_import;     // VK_EXT_external_memory_host: copies read and write host memory directly
@@ -111,12 +113,35 @@ static gboolean _device_heap(const uint32_t h)
   return !_vk.discrete || (_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
 }
 
+// darktable's use of the host heaps, see host_cap
+static VkDeviceSize _host_usage(const VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget)
+{
+  VkDeviceSize used = 0;
+  for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
+    if(_vk.host_heaps & (1u << h)) used += budget->heapUsage[h];
+  return used;
+}
+
 // the part of heap h's budget darktable may fill. An integrated GPU shares
 // its memory with the desktop, so 2% of each heap stays free there
 static VkDeviceSize _usable_budget(const VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget, const uint32_t h)
 {
   const VkDeviceSize reserve = _vk.discrete ? 0 : _vk.memprops.memoryHeaps[h].size / 50;
   return budget->heapBudget[h] > reserve ? budget->heapBudget[h] - reserve : 0;
+}
+
+// bytes by which size more on heap h would exceed its budget or host_cap
+static VkDeviceSize _shortfall(const VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget, const uint32_t h,
+                               const VkDeviceSize size)
+{
+  const VkDeviceSize usable = _usable_budget(budget, h);
+  VkDeviceSize over = budget->heapUsage[h] + size > usable ? budget->heapUsage[h] + size - usable : 0;
+  if(_vk.host_cap && (_vk.host_heaps & (1u << h)))
+  {
+    const VkDeviceSize used = _host_usage(budget) + size;
+    if(used > _vk.host_cap) over = MAX(over, used - _vk.host_cap);
+  }
+  return over;
 }
 
 // --------------------------------------------------------------------------------------------
@@ -219,6 +244,30 @@ static gboolean _init_device(void)
       all_heaps += _vk.memprops.memoryHeaps[h].size;
     }
   if(!_vk.discrete) _vk.pool_budget = all_heaps / 2;
+
+  // an integrated GPU's memory is system memory, except a carve-out the
+  // firmware reserves, which shows as a device local heap next to a host
+  // one. Like OpenCL's unified_fraction, a quarter of it is the default cap:
+  // without one the pools grew until other programs were killed for memory,
+  // which the kernel does not account to darktable
+  if(!_vk.discrete)
+  {
+    uint32_t local = 0;
+    for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
+      if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local |= 1u << h;
+    const uint32_t all = (1u << _vk.memprops.memoryHeapCount) - 1;
+    _vk.host_heaps = local == all ? all : all & ~local;
+    _vk.host_cap = darktable.dtresources.total_memory / 4;
+  }
+  const int cap = dt_conf_get_int("slang_gpu_memory");
+  if(cap > 0)
+  {
+    if(!_vk.discrete) _vk.host_cap = MIN(_vk.host_cap, (VkDeviceSize)cap << 20);
+    _vk.pool_budget = MIN(_vk.pool_budget, (VkDeviceSize)cap << 20);
+  }
+  if(_vk.host_cap) _vk.pool_budget = MIN(_vk.pool_budget, _vk.host_cap / 2);
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] pools keep up to %" PRIu64 " MB, system memory capped at %" PRIu64 " MB",
+           (uint64_t)(_vk.pool_budget >> 20), (uint64_t)(_vk.host_cap >> 20));
 
   uint32_t next = 0;
   vkEnumerateDeviceExtensionProperties(_vk.pdev, NULL, &next, NULL);
@@ -677,7 +726,7 @@ static gboolean _heap_has_room(const uint32_t h, const VkDeviceSize size)
   VkPhysicalDeviceMemoryProperties2 props2
       = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
   vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
-  return budget.heapUsage[h] + size <= _usable_budget(&budget, h);
+  return _shortfall(&budget, h, size) == 0;
 }
 
 // memory for a device image or buffer, device local if possible. On an
@@ -1212,7 +1261,7 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
   VkPhysicalDeviceMemoryProperties2 props2
       = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
   vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
-  if(budget.heapUsage[heap] + size <= _usable_budget(&budget, heap)) return;
+  if(_shortfall(&budget, heap, size) == 0) return;
 
   // an integrated GPU's heaps share one pool of memory, and the large
   // staging buffers kept for reuse grew to more than the host heap during
@@ -1221,7 +1270,7 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
   if(!_vk.discrete && _vk.staging)
   {
     VkDeviceSize staged = 0;
-    while(_vk.staging && budget.heapUsage[heap] + size > _usable_budget(&budget, heap))
+    while(_vk.staging && _shortfall(&budget, heap, size) > 0)
     {
       GList *oldest = g_list_last(_vk.staging);
       staged += ((const dt_slang_staging_t *)oldest->data)->size;
@@ -1231,10 +1280,10 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
     }
     dt_print(DT_DEBUG_SLANG, "[slang_gpu] freeing %" PRIu64 " MB of idle staging buffers for %" PRIu64 " MB",
              (uint64_t)(staged >> 20), (uint64_t)(size >> 20));
-    if(budget.heapUsage[heap] + size <= _usable_budget(&budget, heap)) return;
+    if(_shortfall(&budget, heap, size) == 0) return;
   }
 
-  const VkDeviceSize need = budget.heapUsage[heap] + size - _usable_budget(&budget, heap);
+  const VkDeviceSize need = _shortfall(&budget, heap, size);
   VkDeviceSize found = 0;
   uint64_t until = 0;
   for(GList *l = _vk.doomed_images; l; l = g_list_next(l))
@@ -2146,13 +2195,33 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
     {
       // a module's images may be spread over all heaps, see _alloc_on_device(),
       // and _make_room() frees the idle staging buffers for them
-      VkDeviceSize total = 0;
+      VkDeviceSize total = 0, total_host = 0, free_host = 0;
       for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
       {
         const VkDeviceSize usable = _usable_budget(&budget, h);
-        total += usable;
-        if(usable > budget.heapUsage[h]) best += usable - budget.heapUsage[h];
+        const VkDeviceSize free = usable > budget.heapUsage[h] ? usable - budget.heapUsage[h] : 0;
+        if(_vk.host_heaps & (1u << h))
+        {
+          total_host += usable;
+          free_host += free;
+        }
+        else
+        {
+          total += usable;
+          best += free;
+        }
       }
+      if(_vk.host_cap)
+      {
+        const VkDeviceSize used = _host_usage(&budget);
+        total_host = MIN(total_host, _vk.host_cap);
+        // the usage counts more than darktable's images on some drivers
+        // (lavapipe reports the whole process), so tiles get at least a
+        // quarter of the cap rather than none
+        free_host = MIN(free_host, MAX(_vk.host_cap > used ? _vk.host_cap - used : 0, _vk.host_cap / 4));
+      }
+      total += total_host;
+      best += free_host;
       for(GList *l = _vk.staging; l; l = g_list_next(l))
         pooled += ((const dt_slang_staging_t *)l->data)->size;
       best = MIN(total, best + pooled);
@@ -2162,7 +2231,8 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
     for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
       if(_device_heap(h))
       {
-        const VkDeviceSize usable = _vk.memprops.memoryHeaps[h].size / 4 * 3;
+        VkDeviceSize usable = _vk.memprops.memoryHeaps[h].size / 4 * 3;
+        if(_vk.host_cap && (_vk.host_heaps & (1u << h))) usable = MIN(usable, _vk.host_cap);
         best = _vk.discrete ? MAX(best, usable) : best + usable;
       }
   const int cap = dt_conf_get_int("slang_gpu_memory");
