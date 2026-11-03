@@ -639,11 +639,20 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size);
 static gboolean _allocate(const VkMemoryAllocateInfo *mai, VkDeviceMemory *mem)
 {
   const uint32_t heap = _vk.memprops.memoryTypes[mai->memoryTypeIndex].heapIndex;
+  const double start = dt_get_debug_wtime();
   if(!_vk.discrete || (_vk.memprops.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
     _make_room(heap, mai->allocationSize);
+  const double made_room = dt_get_debug_wtime();
   VkResult res = vkAllocateMemory(_vk.dev, mai, NULL, mem);
   if(res == VK_ERROR_OUT_OF_DEVICE_MEMORY && _reclaim())
     res = vkAllocateMemory(_vk.dev, mai, NULL, mem);
+  // a 61 MP export on a Radeon 780M stalled for 1.9 s around an allocation
+  // in a nearly full heap; this tells the pool's share from the driver's
+  const double end = dt_get_debug_wtime();
+  if(end - start > 0.05)
+    dt_print(DT_DEBUG_PERF, "[slang_gpu] allocating %" PRIu64 " MB on heap %u took %.3f secs"
+             " (%.3f making room, %.3f in the driver)", (uint64_t)(mai->allocationSize >> 20), heap,
+             end - start, made_room - start, end - made_room);
   return res == VK_SUCCESS;
 }
 
