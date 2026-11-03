@@ -1,7 +1,7 @@
 #!/bin/bash
 # full-pipe benchmark of a typical scene-referred edit (denoise profiled, lens,
 # exposure, tone equalizer, color calibration, sharpen, color equalizer, AgX)
-# on mire1.cr2: CPU vs OpenCL vs Slang, N exports in one darktable-cli process each
+# on one raw: CPU vs OpenCL vs Slang, N exports in one darktable-cli process each
 #
 # usage: bench.sh <darktable checkout with build/> [N=5] [SIZE=0]
 # SIZE is the export's longest side in pixels; 0 exports at full resolution
@@ -9,6 +9,7 @@
 # RESOURCES sets darktable's resourcelevel (default: "default", what users get;
 # "reference" uses fixed, machine-independent memory limits and tiles more)
 # extra darktable-cli arguments for every run can be passed in BENCH_ARGS
+# IMG sets the raw to export (default: the integration tests' mire1.cr2)
 set -u
 # darktable prints its timings in the user's locale ("took 1,637 secs" in
 # German), which the patterns below do not read
@@ -18,7 +19,11 @@ RESOURCES=${RESOURCES:-default}
 HERE=$(cd "$(dirname "$0")" && pwd)
 CLI=$SRC/build/bin/darktable-cli
 [ -x "$CLI" ] || CLI=$(ls -d $SRC/build/bin/darktable-cli* 2>/dev/null | head -1)
-IMG=$SRC/src/tests/integration/images/mire1.cr2
+IMG=${IMG:-$SRC/src/tests/integration/images/mire1.cr2}
+[ -f "$IMG" ] || { echo "no such image: $IMG" >&2; exit 1; }
+IMG=$(cd "$(dirname "$IMG")" && pwd)/$(basename "$IMG")
+# darktable picks the loader by extension, so the links keep the raw's own
+EXT=${IMG##*.}
 DE=$SRC/src/tests/integration/deltae
 # deltae is normally built by the integration test runner; build it here
 # the same way when nobody has run those tests yet
@@ -28,7 +33,7 @@ if [ ! -x "$DE" ] && [ -f "$SRC/src/tests/integration/src/deltae.c" ]; then
 fi
 OUT=$PWD/fullpipe-results
 rm -rf "$OUT"; mkdir -p "$OUT/in"
-for i in $(seq 1 $N); do ln -s "$IMG" "$OUT/in/img$i.cr2"; done
+for i in $(seq 1 $N); do ln -s "$IMG" "$OUT/in/img$i.$EXT"; done
 
 run() { # <name> [extra args]
   local name=$1; shift
@@ -53,6 +58,7 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
   echo "- os: $(uname -srm)"
   echo "- cpu: ${cpu# }"
   echo "- commit: $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null)"
+  echo "- image: $(basename "$IMG")"
   echo "- slang device: $(grep -m1 -oE 'using (Vulkan|Metal) device .*' "$OUT/slang.log" | cut -d' ' -f2-)"
   echo "- opencl devices: $(grep -E "^ +DEVICE: +[0-9]+: '" "$OUT/opencl.log" | sed -E "s/.*DEVICE: +[0-9]+: ('[^']*').*/\1/" | tr '\n' ' ')"
   echo "- export size: $([ "$SIZE" = 0 ] && echo full resolution || echo "${SIZE} px"), resourcelevel: $RESOURCES"
