@@ -17,8 +17,8 @@
 */
 
 // the module histograms of dt_histogram_helper() in src/common/histogram.c,
-// counted on the device. OpenCL has no such kernel: it reads the whole image
-// back and counts on the host. Here only the bins come back.
+// counted on the device, as histogram_collect in basic.cl does for OpenCL.
+// Only the bins come back.
 
 import color_conversion;
 
