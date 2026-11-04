@@ -1660,7 +1660,10 @@ void md_vignette(uint3 gid : SV_DispatchThreadID,
 
   float4 pixel = in.Areadpixel(x, y);
   const float mask = pixel.w;
-  pixel /= max(1e-4f, spline);
+  const float div = max(1e-4f, spline);
+  pixel.x = fp32_div(pixel.x, div);
+  pixel.y = fp32_div(pixel.y, div);
+  pixel.z = fp32_div(pixel.z, div);
   pixel.w = mask;
   out.write(int2(x, y), pixel);
 }
@@ -1724,8 +1727,9 @@ void md_lens_correction(uint3 gid : SV_DispatchThreadID,
   const int y = gid.y;
   if(x >= owidth || y >= oheight) return;
 
-  const float cx = (float(roox + x) - w2) / scale;
-  const float cy = (float(rooy + y) - h2) / scale;
+  const float iscale = fp32_div(1.0f, scale);
+  const float cx = (float(roox + x) - w2) * iscale;
+  const float cy = (float(rooy + y) - h2) * iscale;
   const float radius = r * dt_fast_hypot(cx, cy);
   const float limw = float(iwidth) - 1.0f;
   const float limh = float(iheight) - 1.0f;
@@ -2058,20 +2062,20 @@ void _ashift(const uint3 gid, ImageIn in, ImageOut out, const int width, const i
   // convert output pixel coordinates to original image coordinates
   pout[0] = roi_out.x + x + clip.x;
   pout[1] = roi_out.y + y + clip.y;
-  pout[0] /= out_scale;
-  pout[1] /= out_scale;
+  pout[0] = fp32_div(pout[0], out_scale);
+  pout[1] = fp32_div(pout[1], out_scale);
   pout[2] = 1.0f;
 
-  // apply homograph
+  // apply homograph, with fma in the order of _mat3mulv_fma() in ashift.c
   for(int i = 0; i < 3; i++)
   {
     pin[i] = 0.0f;
-    for(int j = 0; j < 3; j++) pin[i] += homograph[3 * i + j] * pout[j];
+    for(int j = 0; j < 3; j++) pin[i] = fma(homograph[3 * i + j], pout[j], pin[i]);
   }
 
   // convert to input pixel coordinates
-  pin[0] /= pin[2];
-  pin[1] /= pin[2];
+  pin[0] = fp32_div(pin[0], pin[2]);
+  pin[1] = fp32_div(pin[1], pin[2]);
   pin[0] *= in_scale;
   pin[1] *= in_scale;
   pin[0] -= roi_in.x;
@@ -2121,7 +2125,9 @@ void _ashift(const uint3 gid, ImageIn in, ImageOut out, const int width, const i
         weight += w;
       }
 
-    pixel = (tx >= -1 && ty >= -1 && tx < iwidth && ty < iheight) ? pixel / weight : float4(0.0f);
+    // as ashift_bicubic in ../basic.cl, only the lanczos weights are normalized
+    if(lanczos != 0) pixel /= weight;
+    pixel = (tx >= -1 && ty >= -1 && tx < iwidth && ty < iheight) ? pixel : float4(0.0f);
   }
   out.write(int2(x, y), pixel);
 }
