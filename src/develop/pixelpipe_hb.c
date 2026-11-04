@@ -2375,7 +2375,13 @@ static gboolean _slang_possible(dt_dev_pixelpipe_t *pipe,
 {
   const int ch_in = input_format->channels;
   const int ch_out = out_format->channels;
+  // as on OpenCL: a 100% crop of a host-cached full demosaiced image is far
+  // cheaper on the host than uploading the whole image for it
+  const gboolean host_crop = roi_out->scale >= 1.0f
+    && !(pipe->slang_image && pipe->slang_host == input)
+    && dt_iop_module_is(module, "demosaicscale");
   return module->process_slang
+    && !host_crop
     && piece->process_cl_ready
     && pipe->slang_enabled
     && dt_slang_gpu_enabled()
