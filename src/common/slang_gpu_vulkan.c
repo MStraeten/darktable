@@ -103,6 +103,20 @@ typedef struct dt_slang_vulkan_t
 static dt_slang_vulkan_t _vk = { 0 };
 static GMutex _vk_lock;
 static GThread *_prepare_thread = NULL;
+// guards _vk.kernels and _building. Kernels are built outside _vk_lock, so
+// that the background preload does not hold up pipes, which Vulkan allows:
+// without a pipeline cache, creating pipelines and layouts needs no
+// external synchronization
+static GMutex _kernels_lock;
+static GCond _kernels_built;
+// keys of the kernels whose pipeline a thread is building
+static GHashTable *_building = NULL;
+// the background preload makes way for pipes: it waits while one is
+// building a kernel and until none has asked for one for a while
+static gint _pipes_waiting = 0;
+static gint64 _last_pipe_request = 0;
+static gint _preload_stop = 0;
+#define DT_SLANG_PRELOAD_IDLE_US 250000
 
 // whether device images and buffers may live in heap h. An integrated GPU,
 // such as an AMD APU, has only a BIOS carve-out of 0.5-2 GB as device local
@@ -521,16 +535,8 @@ error:
   return FALSE;
 }
 
-static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry)
+static dt_slang_kernel_t *_build_kernel(const char *program, const char *entry)
 {
-  gchar *key = g_strdup_printf("%s:%s", program, entry);
-  dt_slang_kernel_t *k = g_hash_table_lookup(_vk.kernels, key);
-  if(k)
-  {
-    g_free(key);
-    return k;
-  }
-
   char datadir[PATH_MAX] = { 0 };
   dt_loc_get_datadir(datadir, sizeof(datadir));
   gchar *spv = g_strdup_printf("%s/kernels/slang/%s.spv", datadir, program);
@@ -540,12 +546,11 @@ static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry)
   {
     dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't read %s", spv);
     g_free(spv);
-    g_free(key);
     g_free(code);
     return NULL;
   }
 
-  k = g_new0(dt_slang_kernel_t, 1);
+  dt_slang_kernel_t *k = g_new0(dt_slang_kernel_t, 1);
   if(!_reflect((const uint32_t *)code, len / 4, entry, k))
   {
     dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't find the parameters of %s in %s", entry, spv);
@@ -588,7 +593,6 @@ static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry)
     goto error;
   }
 
-  g_hash_table_insert(_vk.kernels, key, k);
   g_free(spv);
   g_free(code);
   return k;
@@ -596,13 +600,49 @@ static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry)
 error:
   _destroy_kernel(k);
   g_free(spv);
-  g_free(key);
   g_free(code);
   return NULL;
 }
 
+static dt_slang_kernel_t *_get_kernel(const char *program, const char *entry, const gboolean from_pipe)
+{
+  gchar *key = g_strdup_printf("%s:%s", program, entry);
+  if(from_pipe) g_atomic_int_inc(&_pipes_waiting);
+  // the preload and a pipe needing the same kernel build it once
+  g_mutex_lock(&_kernels_lock);
+  if(from_pipe) _last_pipe_request = g_get_monotonic_time();
+  if(!_building) _building = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  while(g_hash_table_contains(_building, key)) g_cond_wait(&_kernels_built, &_kernels_lock);
+  dt_slang_kernel_t *k = g_hash_table_lookup(_vk.kernels, key);
+  if(!k) g_hash_table_add(_building, g_strdup(key));
+  g_mutex_unlock(&_kernels_lock);
+  if(!k)
+  {
+    k = _build_kernel(program, entry);
+    g_mutex_lock(&_kernels_lock);
+    if(k) g_hash_table_insert(_vk.kernels, g_strdup(key), k);
+    g_hash_table_remove(_building, key);
+    g_cond_broadcast(&_kernels_built);
+    g_mutex_unlock(&_kernels_lock);
+  }
+  if(from_pipe) g_atomic_int_add(&_pipes_waiting, -1);
+  g_free(key);
+  return k;
+}
+
+static gboolean _pipe_busy(void)
+{
+  g_mutex_lock(&_kernels_lock);
+  const gboolean busy = g_atomic_int_get(&_pipes_waiting)
+                        || g_get_monotonic_time() - _last_pipe_request < DT_SLANG_PRELOAD_IDLE_US;
+  g_mutex_unlock(&_kernels_lock);
+  return busy;
+}
+
 // creates the pipelines of every entry point in every .spv in kernels/slang,
-// which takes longer than running them the first time
+// which takes longer than running them the first time. It builds one at a
+// time and only while no pipe is dispatching, so that a pipe's own builds
+// do not queue behind it
 static void _preload_kernels(void)
 {
   char datadir[PATH_MAX] = { 0 };
@@ -610,7 +650,7 @@ static void _preload_kernels(void)
   gchar *dirname = g_build_filename(datadir, "kernels", "slang", NULL);
   GDir *dir = g_dir_open(dirname, 0, NULL);
   const gchar *file;
-  while(dir && (file = g_dir_read_name(dir)))
+  while(dir && (file = g_dir_read_name(dir)) && !g_atomic_int_get(&_preload_stop))
   {
     if(!g_str_has_suffix(file, ".spv")) continue;
     gchar *path = g_build_filename(dirname, file, NULL);
@@ -625,10 +665,12 @@ static void _preload_kernels(void)
       {
         const uint32_t op = w[i] & 0xffff, n = w[i] >> 16;
         if(n == 0 || i + n > words) break;
+        if(g_atomic_int_get(&_preload_stop)) break;
         if(op == 15 && n > 3) // OpEntryPoint
         {
           gchar *entry = g_strndup((const char *)(w + i + 3), sizeof(uint32_t) * (n - 3));
-          _get_kernel(program, entry);
+          while(!g_atomic_int_get(&_preload_stop) && _pipe_busy()) g_usleep(10000);
+          if(!g_atomic_int_get(&_preload_stop)) _get_kernel(program, entry, FALSE);
           g_free(entry);
         }
         i += n;
@@ -651,16 +693,26 @@ static gpointer _prepare(gpointer data)
     _vk.initialized = TRUE;
     _vk.usable = _init_device();
   }
-  if(_vk.usable) _preload_kernels();
+  const gboolean usable = _vk.usable;
   g_mutex_unlock(&_vk_lock);
-  dt_print(DT_DEBUG_PERF, "[slang_gpu] preparing the Vulkan device and kernels took %.3f secs",
+  dt_print(DT_DEBUG_PERF, "[slang_gpu] preparing the Vulkan device took %.3f secs",
            dt_get_debug_wtime() - start);
+  // there are about 400 pipelines, and without a warm shader cache a driver
+  // can take tens of milliseconds for each, so they are built in the
+  // background and a module builds what it needs itself
+  if(usable)
+  {
+    _preload_kernels();
+    dt_print(DT_DEBUG_PERF, "[slang_gpu] building the Vulkan kernels in the background %s after %.3f secs",
+             g_atomic_int_get(&_preload_stop) ? "stopped" : "finished", dt_get_debug_wtime() - start);
+  }
   return NULL;
 }
 
 void dt_slang_gpu_prepare(void)
 {
   if(!dt_conf_get_bool("slang_gpu") || _prepare_thread) return;
+  g_atomic_int_set(&_preload_stop, 0);
   _prepare_thread = g_thread_new("slang_gpu", _prepare, NULL);
 }
 
@@ -1654,6 +1706,7 @@ static int _image_transfer(dt_slang_gpu_image_t *img, void *host, const gboolean
 
 void dt_slang_gpu_cleanup(void)
 {
+  g_atomic_int_set(&_preload_stop, 1);
   if(_prepare_thread) g_thread_join(_prepare_thread);
   _prepare_thread = NULL;
   g_mutex_lock(&_vk_lock);
@@ -1667,6 +1720,8 @@ void dt_slang_gpu_cleanup(void)
   g_list_free_full(_vk.buffers, (GDestroyNotify)_buffer_free);
   g_list_free_full(_vk.staging, (GDestroyNotify)_staging_destroy);
   if(_vk.kernels) g_hash_table_destroy(_vk.kernels);
+  if(_building) g_hash_table_destroy(_building);
+  _building = NULL;
   if(_vk.pool) vkDestroyCommandPool(_vk.dev, _vk.pool, NULL);
   if(_vk.dev) vkDestroyDevice(_vk.dev, NULL);
   if(_vk.instance) vkDestroyInstance(_vk.instance, NULL);
@@ -1959,16 +2014,13 @@ int dt_slang_gpu_buffer_read(dt_slang_gpu_buffer_t *buf, void *host, const size_
 // --------------------------------------------------------------------------------------------
 // dispatch
 
-static int _run(const char *program,
+static int _run(dt_slang_kernel_t *k,
                 const char *entry,
                 const int width,
                 const int height,
                 const int nargs,
                 const dt_slang_arg_t *args)
 {
-  dt_slang_kernel_t *k = _get_kernel(program, entry);
-  if(!k) return 1;
-
   // match the arguments to the kernel's parameters, images and buffers to
   // descriptor bindings and values to push constants, each in order
   int res_arg[DT_SLANG_MAX_PARAMS], nres = 0, nvals = 0;
@@ -2251,10 +2303,14 @@ int dt_slang_gpu_run_2d(const char *program,
 {
   if(!dt_slang_gpu_enabled()) return 1;
 
+  // built outside _vk_lock, so that another pipe can dispatch meanwhile
+  dt_slang_kernel_t *k = _get_kernel(program, kernel, TRUE);
+  if(!k) return 1;
+
   // one queue for all pipes: pipes running in parallel take turns here. The
   // time of each kernel is logged from GPU timestamps once it has finished
   g_mutex_lock(&_vk_lock);
-  const int err = _run(program, kernel, width, height, nargs, args);
+  const int err = _run(k, kernel, width, height, nargs, args);
   g_mutex_unlock(&_vk_lock);
   return err;
 }
