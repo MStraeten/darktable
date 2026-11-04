@@ -85,6 +85,18 @@ static GMutex _mtl_lock;
 // guards _mtl.staging only, which command buffer completion handlers refill
 static GMutex _staging_lock;
 static GThread *_prepare_thread = NULL;
+// guards _mtl.kernels and _building: off Apple GPUs the preload builds
+// kernels while pipes run
+static GMutex _kernels_lock;
+static GCond _kernels_built;
+// keys of the kernels whose pipeline a thread is building
+static NSMutableSet<NSString *> *_building = nil;
+// the background preload makes way for pipes: it waits while one is
+// building a kernel and until none has asked for one for a while
+static gint _pipes_waiting = 0;
+static gint64 _last_pipe_request = 0;
+static gint _preload_stop = 0;
+#define DT_SLANG_PRELOAD_IDLE_US 250000
 
 // --------------------------------------------------------------------------------------------
 // device
@@ -199,6 +211,7 @@ gboolean dt_slang_gpu_enabled(void)
 
 void dt_slang_gpu_cleanup(void)
 {
+  g_atomic_int_set(&_preload_stop, 1);
   if(_prepare_thread) g_thread_join(_prepare_thread);
   _prepare_thread = NULL;
   g_mutex_lock(&_mtl_lock);
@@ -297,11 +310,9 @@ static gboolean _reflect(MTLComputePipelineReflection *refl, DtSlangKernel *k)
   return TRUE;
 }
 
-static DtSlangKernel *_get_kernel(const char *program, const char *entry)
+static DtSlangKernel *_build_kernel(const char *program, const char *entry)
 {
-  NSString *key = [NSString stringWithFormat:@"%s:%s", program, entry];
-  DtSlangKernel *k = _mtl.kernels[key];
-  if(k) return k;
+  DtSlangKernel *k = nil;
 
   // one library per entry point, see data/kernels/slang/CMakeLists.txt. A
   // library keeps its file open until it is released, and there are more
@@ -344,27 +355,64 @@ static DtSlangKernel *_get_kernel(const char *program, const char *entry)
              name.UTF8String);
     return nil;
   }
-  _mtl.kernels[key] = k;
   return k;
 }
 
+static DtSlangKernel *_get_kernel(const char *program, const char *entry, const gboolean from_pipe)
+{
+  NSString *key = [NSString stringWithFormat:@"%s:%s", program, entry];
+  if(from_pipe) g_atomic_int_inc(&_pipes_waiting);
+  // a pipeline built twice at once can come back from the AMD driver
+  // with incomplete reflection, so a second caller waits for the first
+  g_mutex_lock(&_kernels_lock);
+  if(from_pipe) _last_pipe_request = g_get_monotonic_time();
+  if(!_building) _building = [NSMutableSet set];
+  while([_building containsObject:key]) g_cond_wait(&_kernels_built, &_kernels_lock);
+  DtSlangKernel *k = _mtl.kernels[key];
+  if(!k) [_building addObject:key];
+  g_mutex_unlock(&_kernels_lock);
+  if(!k)
+  {
+    k = _build_kernel(program, entry);
+    g_mutex_lock(&_kernels_lock);
+    if(k) _mtl.kernels[key] = k;
+    [_building removeObject:key];
+    g_cond_broadcast(&_kernels_built);
+    g_mutex_unlock(&_kernels_lock);
+  }
+  if(from_pipe) g_atomic_int_add(&_pipes_waiting, -1);
+  return k;
+}
+
+static gboolean _pipe_busy(void)
+{
+  g_mutex_lock(&_kernels_lock);
+  const gboolean busy = g_atomic_int_get(&_pipes_waiting)
+                        || g_get_monotonic_time() - _last_pipe_request < DT_SLANG_PRELOAD_IDLE_US;
+  g_mutex_unlock(&_kernels_lock);
+  return busy;
+}
+
 // loads every <program>.<entry>.metallib in kernels/slang and builds its
-// pipeline, which takes longer than running the kernel the first time
-static void _preload_kernels(void)
+// pipeline, which takes longer than running the kernel the first time.
+// With yield set it builds one at a time and only while no pipe is
+// dispatching, so that a pipe's own builds do not queue behind it
+static void _preload_kernels(const gboolean yield)
 {
   char datadir[PATH_MAX] = { 0 };
   dt_loc_get_datadir(datadir, sizeof(datadir));
   gchar *dirname = g_build_filename(datadir, "kernels", "slang", NULL);
   GDir *dir = g_dir_open(dirname, 0, NULL);
   const gchar *file;
-  while(dir && (file = g_dir_read_name(dir)))
+  while(dir && (file = g_dir_read_name(dir)) && !g_atomic_int_get(&_preload_stop))
   {
     if(!g_str_has_suffix(file, ".metallib")) continue;
+    while(yield && !g_atomic_int_get(&_preload_stop) && _pipe_busy()) g_usleep(10000);
     gchar **parts = g_strsplit(file, ".", 3);
     // drains the library each _get_kernel() call leaves behind, so that its
     // file is closed before the next one is opened
     if(g_strv_length(parts) == 3)
-      @autoreleasepool { _get_kernel(parts[0], parts[1]); }
+      @autoreleasepool { _get_kernel(parts[0], parts[1], FALSE); }
     g_strfreev(parts);
   }
   if(dir) g_dir_close(dir);
@@ -375,6 +423,7 @@ static gpointer _prepare(gpointer data)
 {
   const double start = dt_get_debug_wtime();
   g_mutex_lock(&_mtl_lock);
+  gboolean background = FALSE;
   @autoreleasepool
   {
     if(!_mtl.initialized)
@@ -382,22 +431,32 @@ static gpointer _prepare(gpointer data)
       _mtl.initialized = TRUE;
       _mtl.usable = _init_device();
     }
-    // the driver compiles each pipeline for the GPU, about 90 ms a kernel
-    // on an AMD Radeon without a warm shader cache: building all of them
-    // held up the first export for 35 s, against 3 s for building the ones
-    // it uses. Apple GPUs build them quickly, so there the preload pays
-    // off by overlapping with loading the image
-    if(_mtl.usable && [_mtl.dev supportsFamily:MTLGPUFamilyApple1]) _preload_kernels();
+    // Apple GPUs build the pipelines quickly, so they are all built before
+    // the first module runs, overlapping with loading the image. Other
+    // drivers take about 90 ms a kernel without a warm shader cache, 35 s
+    // for all of them on an AMD Radeon, so there they are built in the
+    // background and a module builds what it needs itself
+    if(_mtl.usable && [_mtl.dev supportsFamily:MTLGPUFamilyApple1])
+      _preload_kernels(FALSE);
+    else
+      background = _mtl.usable;
   }
   g_mutex_unlock(&_mtl_lock);
   dt_print(DT_DEBUG_PERF, "[slang_gpu] preparing the Metal device and kernels took %.3f secs",
            dt_get_debug_wtime() - start);
+  if(background)
+  {
+    @autoreleasepool { _preload_kernels(TRUE); }
+    dt_print(DT_DEBUG_PERF, "[slang_gpu] building the Metal kernels in the background took %.3f secs",
+             dt_get_debug_wtime() - start);
+  }
   return NULL;
 }
 
 void dt_slang_gpu_prepare(void)
 {
   if(!dt_conf_get_bool("slang_gpu") || _prepare_thread) return;
+  g_atomic_int_set(&_preload_stop, 0);
   _prepare_thread = g_thread_new("slang_gpu", _prepare, NULL);
 }
 
@@ -726,7 +785,7 @@ static int _run(const char *program,
                 const int nargs,
                 const dt_slang_arg_t *args)
 {
-  DtSlangKernel *k = _get_kernel(program, entry);
+  DtSlangKernel *k = _get_kernel(program, entry, TRUE);
   if(!k) return 1;
 
   // ARC objects are declared before the first goto, which must not skip their initialization
