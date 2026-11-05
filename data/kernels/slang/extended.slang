@@ -164,10 +164,10 @@ void colorbalancergb(uint3 gid : SV_DispatchThreadID,
 
     // convert to JCh
     float JC[2] = { Jab.x, dt_hypot(Jab.y, Jab.z) }; // brightness/chroma vector
-    const float h = atan2(Jab.z, Jab.y);              // hue: (a, b) angle
+    const float h = dt_atan2(Jab.z, Jab.y);              // hue: (a, b) angle
 
     // project JC onto S, the saturation eigenvector, with orthogonal vector O
-    const float T = atan2(JC[1], JC[0]); // angle of the eigenvector over the hue plane
+    const float T = dt_atan2(JC[1], JC[0]); // angle of the eigenvector over the hue plane
     const float sin_T = dtcl_sin(T);
     const float cos_T = dtcl_cos(T);
     const float M_rot_dir[2][2] = { { cos_T, sin_T },

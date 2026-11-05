@@ -114,7 +114,7 @@ float satcurve_s_in_norm(float4 rgb_in, StructuredBuffer<float> matrix_in, Struc
     const float4 jab = XYZ_to_JzAzBz(xyz);
     const float Jz = max(jab.x, 0.f);
     const float Cz = dt_hypot(jab.y, jab.z);
-    const float h = atan2(jab.z, jab.y);
+    const float h = dt_atan2(jab.z, jab.y);
     const float gamut = max(satcurve_lookup_gamut(gamut_lut, h), FLT_MIN);
     return (Jz > 0.f ? Cz / Jz : 0.f) / gamut;
   }
@@ -216,7 +216,7 @@ void satcurvergb(uint3 gid : SV_DispatchThreadID,
 
     const float Jz = max(jab.x, 0.f);
     const float Cz = dt_hypot(jab.y, jab.z);
-    const float h = atan2(jab.z, jab.y);
+    const float h = dt_atan2(jab.z, jab.y);
     const float ch = dtcl_cos(h), sh = dtcl_sin(h);
     const float gamut = max(satcurve_lookup_gamut(gamut_lut, h), FLT_MIN);
     const float raw_s_in = (Jz > 0.f ? Cz / Jz : 0.f) / gamut;

@@ -173,7 +173,7 @@ float4 HSL_2_RGB(float4 HSL)
 
 float4 JzAzBz_to_JzCzhz(float4 JzAzBz)
 {
-  const float h = atan2(JzAzBz.z, JzAzBz.y) / DT_2PI_F;
+  const float h = dt_atan2(JzAzBz.z, JzAzBz.y) / DT_2PI_F;
   float4 JzCzhz;
   JzCzhz.x = JzAzBz.x;
   JzCzhz.y = dt_fast_hypot(JzAzBz.y, JzAzBz.z);
@@ -1059,7 +1059,7 @@ void blendop_rgb_hsl(uint3 gid : SV_DispatchThreadID,
       // blend color vectors of input and output
       d = ta.y * dtcl_cos(DT_2PI_F * ta.x) * (1.0f - opacity) + tb.y * dtcl_cos(DT_2PI_F * tb.x) * opacity;
       s = ta.y * dtcl_sin(DT_2PI_F * ta.x) * (1.0f - opacity) + tb.y * dtcl_sin(DT_2PI_F * tb.x) * opacity;
-      to.x = fmod(atan2(s, d) / DT_2PI_F + 1.0f, 1.0f);
+      to.x = fmod(dt_atan2(s, d) / DT_2PI_F + 1.0f, 1.0f);
       to.y = dt_fast_hypot(s, d);
       to.z = ta.z;
       to.w = ta.w;

@@ -62,7 +62,7 @@ void histogram_collect(uint3 gid : SV_DispatchThreadID,
   else
   {
     // dt_Lab_2_LCH()
-    const float h = atan2(p.z, p.y);
+    const float h = dt_atan2(p.z, p.y);
     const float H = h > 0.0f ? h / DT_2PI_F : 1.0f - abs(h) / DT_2PI_F;
     const float C = sqrt(p.y * p.y + p.z * p.z);
     b = float3(max_bin / 100.0f, max_bin / (128.0f * 1.41421356237309504880f), max_bin) * float3(p.x, C, H);

@@ -55,7 +55,7 @@ public float4 matrix_product_float4(float4 xyz, float matrix[12])
 
 public float4 Lab_2_LCH(float4 Lab)
 {
-  float H = atan2(Lab.z, Lab.y);
+  float H = dt_atan2(Lab.z, Lab.y);
 
   H = (H > 0.0f) ? H / DT_2PI_F : 1.0f - abs(H) / DT_2PI_F;
 
@@ -721,7 +721,7 @@ public float4 xyY_to_dt_UCS_JCH(float4 xyY, float L_white)
 
   return float4(L_star / L_white,
                 15.932993652962535f * dtcl_pow(L_star, 0.6523997524738018f) * dtcl_pow(M2, 0.6007557017508491f) / L_white,
-                atan2(UV_star_prime.y, UV_star_prime.x),
+                dt_atan2(UV_star_prime.y, UV_star_prime.x),
                 0.0f);
 }
 

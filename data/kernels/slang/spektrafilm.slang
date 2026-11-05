@@ -699,7 +699,7 @@ void spektrafilm_scan(uint3 gid : SV_DispatchThreadID,
     const float3 lab = sf_xyz_to_oklab(mats, sf_mat3(mats, SF_M_RGB2XYZ, rgb));
     const float L = sf_knee(lab.x, 0.7f, 1.0f, 2.2f);
     const float C = dt_hypot(lab.y, lab.z);
-    const float hh = atan2(lab.z, lab.y);
+    const float hh = dt_atan2(lab.z, lab.y);
     const float C_max = max(sf_cmax_lookup(cmax_table, cmax_nl, cmax_nh, L, hh), 1e-9f);
     const float d = sf_knee(C / C_max, 0.0f, 1.0f, 6.0f);
     const float C_new = d * C_max;

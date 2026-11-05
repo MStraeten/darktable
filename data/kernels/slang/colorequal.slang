@@ -48,7 +48,7 @@ float4 dt_UCS_LUV_to_JCH(float L_star, float L_white, float2 UV_star_prime)
   return float4(L_star / L_white,
                 15.932993652962535f * dtcl_pow(L_star, 0.6523997524738018f) * dtcl_pow(M2, 0.6007557017508491f)
                   / L_white,
-                atan2(UV_star_prime.y, UV_star_prime.x),
+                dt_atan2(UV_star_prime.y, UV_star_prime.x),
                 0.0f);
 }
 

@@ -100,7 +100,7 @@ float4 _denoised(ImageIn in, int x, int y, int width, int height)
 // dt_Lab_2_LCH()
 float4 _lch(float4 Lab)
 {
-  const float h = atan2(Lab.z, Lab.y);
+  const float h = dt_atan2(Lab.z, Lab.y);
   const float H = h > 0.0f ? h / DT_2PI_F : 1.0f - abs(h) / DT_2PI_F;
   return float4(Lab.x, sqrt(Lab.y * Lab.y + Lab.z * Lab.z), H, 0.0f);
 }
@@ -138,7 +138,7 @@ float4 _jzczhz(float4 rgb, ProfileInfo info, ImageIn lut)
                             0.0122982f * D50.x - 0.0204830f * D50.y + 1.3299098f * D50.z,
                             0.0f);
   const float4 JzAzBz = XYZ_to_JzAzBz(D65);
-  const float h = atan2(JzAzBz.z, JzAzBz.y) / DT_2PI_F;
+  const float h = dt_atan2(JzAzBz.z, JzAzBz.y) / DT_2PI_F;
   return float4(JzAzBz.x, sqrt(JzAzBz.y * JzAzBz.y + JzAzBz.z * JzAzBz.z), h >= 0.0f ? h : 1.0f + h, 0.0f);
 }
 

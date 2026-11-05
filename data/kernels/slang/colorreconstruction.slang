@@ -73,7 +73,7 @@ void colorreconstruction_splat(uint3 gid : SV_DispatchThreadID,
         weight = sqrt(pixel.y * pixel.y + pixel.z * pixel.z);
       else if(precedence == COLORRECONSTRUCT_PRECEDENCE_HUE)
       {
-        float m = atan2(pixel.z, pixel.y) - params.x;
+        float m = dt_atan2(pixel.z, pixel.y) - params.x;
         // readjust m into [-pi, +pi] interval
         m = m > M_PI_F ? m - DT_2PI_F : (m < -M_PI_F ? m + DT_2PI_F : m);
         weight = exp(-m * m / params.y);

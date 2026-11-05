@@ -93,6 +93,16 @@ public vector<float, N> dt_cbrt<let N : int>(vector<float, N> x)
 
 public float dt_fast_hypot(float x, float y) { return dt_hypot(x, y); }
 
+// atan2() with C's results when y and x are both zero, which SPIR-V and Metal
+// leave undefined: +-0 or +-pi by the signs of the zeros. Gray pixels have
+// a = b = 0, and the hue of those decides blend masks and hue curves
+public float dt_atan2(float y, float x)
+{
+  if(x == 0.0f && y == 0.0f)
+    return (asuint(x) >> 31) != 0 ? copysign(M_PI_F, y) : y;
+  return atan2(y, x);
+}
+
 // a + b and a - b that the driver may not rearrange. slangc ignores precise
 // on the SPIR-V target, and without the NoContraction decoration lavapipe
 // simplifies the compensation term of Kahan_sum, (t2 - m) - t1, to 0. Metal

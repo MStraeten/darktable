@@ -2266,7 +2266,7 @@ void colorzones_v3(uint3 gid : SV_DispatchThreadID,
 
   const float a = pixel.y;
   const float b = pixel.z;
-  const float h = fmod(atan2(b, a) + DT_2PI_F, DT_2PI_F) / DT_2PI_F;
+  const float h = fmod(dt_atan2(b, a) + DT_2PI_F, DT_2PI_F) / DT_2PI_F;
   const float C = dt_fast_hypot(b, a);
 
   float select = h;
