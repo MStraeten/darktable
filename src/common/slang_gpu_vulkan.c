@@ -34,9 +34,11 @@
 #define DT_SLANG_MAX_PARAMS 32
 // Vulkan guarantees 128 bytes of push constants, most devices have 256
 #define DT_SLANG_PUSH_SIZE 256
-// denoiseprofile holds ten full-size images at once
-#define DT_SLANG_POOL_SIZE 12
-#define DT_SLANG_BUFFER_POOL_SIZE 12
+// denoiseprofile holds ten full-size images at once, demosaic eight buffers
+// and colorequal six. The pools' bytes are capped by pool_budget; capped at
+// 12 entries, the buffers of one export pushed out those of the next
+#define DT_SLANG_POOL_SIZE 32
+#define DT_SLANG_BUFFER_POOL_SIZE 32
 #define DT_SLANG_STAGING_POOL_SIZE 8
 // staging buffers larger than DT_SLANG_DIRECT_BUFFER, for images and for
 // tables such as lens's coordinates
@@ -84,6 +86,7 @@ typedef struct dt_slang_vulkan_t
   GList *staging;      // staging buffers no batch uses, for reuse
   GList *doomed_images;  // evicted from the pools, freed once no batch uses them
   GList *doomed_buffers;
+  GList *stale;        // dt_slang_stale_t, handles of reused image memory, destroyed once no batch uses them
   GQueue inflight;     // submitted batches, oldest first
   uint64_t submitted;  // serial of the last submitted batch
   uint64_t retired;    // serial of the last finished one
@@ -776,6 +779,7 @@ typedef struct dt_slang_mem_t
   VkDeviceMemory image_mem;
   VkImageView view;
   gboolean coherent;     // the mapped memory needs no invalidation before host reads
+  uint32_t heap;         // of a mapped buffer's memory
 } dt_slang_mem_t;
 
 static gboolean _reclaim(void);
@@ -829,10 +833,10 @@ static gboolean _heap_has_room(const uint32_t h, const VkDeviceSize size)
   return _shortfall(&budget, h, size) == 0;
 }
 
-// memory for a device image or buffer, device local if possible. On an
-// integrated GPU it goes to another heap once the carve-out is full, instead
-// of evicting the pools to squeeze into it
-static gboolean _alloc_on_device(const VkMemoryRequirements *req, VkDeviceMemory *mem)
+// memory for a device image or buffer, device local if possible, in the
+// memory type stored in *type. On an integrated GPU it goes to another heap
+// once the carve-out is full, instead of evicting the pools to squeeze into it
+static gboolean _alloc_on_device(const VkMemoryRequirements *req, VkDeviceMemory *mem, uint32_t *type)
 {
   uint32_t local;
   if(!_memtype(req->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &local)
@@ -851,9 +855,10 @@ static gboolean _alloc_on_device(const VkMemoryRequirements *req, VkDeviceMemory
   if(other != UINT32_MAX && !_heap_has_room(local_heap, req->size)
      && _heap_has_room(_vk.memprops.memoryTypes[other].heapIndex, req->size))
     mai.memoryTypeIndex = other;
+  *type = mai.memoryTypeIndex;
   if(_allocate(&mai, mem)) return TRUE;
   if(other == UINT32_MAX || mai.memoryTypeIndex == other) return FALSE;
-  mai.memoryTypeIndex = other;
+  mai.memoryTypeIndex = *type = other;
   return _allocate(&mai, mem);
 }
 
@@ -876,6 +881,7 @@ static gboolean _alloc_mapped(dt_slang_mem_t *m,
   while(i < n && !_memtype(req.memoryTypeBits, want[i], &type)) i++;
   if(i == n) return FALSE;
   m->coherent = (_vk.memprops.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+  m->heap = _vk.memprops.memoryTypes[type].heapIndex;
   const VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                      .allocationSize = req.size,
                                      .memoryTypeIndex = type };
@@ -920,7 +926,8 @@ static gboolean _alloc_device(dt_slang_mem_t *m, const VkDeviceSize size)
   if(vkCreateBuffer(_vk.dev, &bci, NULL, &m->buffer) != VK_SUCCESS) return FALSE;
   VkMemoryRequirements req;
   vkGetBufferMemoryRequirements(_vk.dev, m->buffer, &req);
-  return _alloc_on_device(&req, &m->buffer_mem)
+  uint32_t type;
+  return _alloc_on_device(&req, &m->buffer_mem, &type)
          && vkBindBufferMemory(_vk.dev, m->buffer, m->buffer_mem, 0) == VK_SUCCESS;
 }
 
@@ -971,15 +978,22 @@ static void _memory_barrier(VkCommandBuffer cb)
                        0, 1, &mb, 0, NULL, 0, NULL);
 }
 
+static VkFormat _image_format(const int channels)
+{
+  return channels == 1 ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+}
+
+#define DT_SLANG_IMAGE_USAGE (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT \
+                              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+
+// an image without memory
 static gboolean _create_image(VkImage *image,
-                              VkDeviceMemory *mem,
-                              VkImageView *view,
                               const int width,
                               const int height,
                               const int channels,
                               const VkImageUsageFlags usage)
 {
-  const VkFormat format = channels == 1 ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+  const VkFormat format = _image_format(channels);
   const VkImageCreateInfo ici = {
     .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
     .imageType = VK_IMAGE_TYPE_2D,
@@ -992,18 +1006,28 @@ static gboolean _create_image(VkImage *image,
     .usage = usage,
     .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
   };
-  if(vkCreateImage(_vk.dev, &ici, NULL, image) != VK_SUCCESS) return FALSE;
-  VkMemoryRequirements req;
-  vkGetImageMemoryRequirements(_vk.dev, *image, &req);
-  if(!_alloc_on_device(&req, mem)
-     || vkBindImageMemory(_vk.dev, *image, *mem, 0) != VK_SUCCESS)
-    return FALSE;
+  return vkCreateImage(_vk.dev, &ici, NULL, image) == VK_SUCCESS;
+}
+
+static gboolean _create_view(VkImageView *view, const VkImage image, const int channels)
+{
   const VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                                      .image = *image,
+                                      .image = image,
                                       .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                                      .format = format,
+                                      .format = _image_format(channels),
                                       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
   return vkCreateImageView(_vk.dev, &vci, NULL, view) == VK_SUCCESS;
+}
+
+// image memory is allocated in 16 sizes per power of two, so that images a
+// few rows or columns apart share pooled memory: a 61 MP export uses
+// 9692x6636 and 9624x6626 images, 988 and 981 MB, and allocated four to six
+// of them anew on every export on a Radeon 780M, at 50-200 ms each
+static VkDeviceSize _size_class(const VkDeviceSize size)
+{
+  VkDeviceSize step = 64 << 10;
+  while(step << 5 <= size) step <<= 1;
+  return (size + step - 1) & ~(step - 1);
 }
 
 static void _free_mem(dt_slang_mem_t *m)
@@ -1037,9 +1061,27 @@ struct dt_slang_gpu_image_t
   VkImage image;
   VkDeviceMemory mem;
   VkImageView view;
+  VkDeviceSize mem_size; // of mem, a _size_class()
+  uint32_t mem_type;
   int width, height, channels;
   uint64_t last_use; // serial of the last batch that may use it, once freed
 };
+
+// the image and view of a pooled image whose memory went to another one,
+// destroyed once the batches that may use them have finished
+typedef struct dt_slang_stale_t
+{
+  VkImage image;
+  VkImageView view;
+  uint64_t last_use;
+} dt_slang_stale_t;
+
+static void _stale_free(dt_slang_stale_t *st)
+{
+  if(st->view) vkDestroyImageView(_vk.dev, st->view, NULL);
+  if(st->image) vkDestroyImage(_vk.dev, st->image, NULL);
+  g_free(st);
+}
 
 // device buffers live in device memory; the host fills, clears and reads
 // them with transfer commands
@@ -1135,7 +1177,7 @@ static void _staging_release(dt_slang_staging_t *s)
 
 static size_t _image_bytes(const dt_slang_gpu_image_t *img)
 {
-  return sizeof(float) * img->channels * img->width * img->height;
+  return img->mem_size;
 }
 
 // images and buffers evicted from the pools are freed once the batches that
@@ -1143,6 +1185,17 @@ static size_t _image_bytes(const dt_slang_gpu_image_t *img)
 // up during a chain of kernels without reads.
 static void _free_doomed(void)
 {
+  for(GList *l = _vk.stale; l;)
+  {
+    GList *next = g_list_next(l);
+    dt_slang_stale_t *st = l->data;
+    if(st->last_use <= _vk.retired)
+    {
+      _stale_free(st);
+      _vk.stale = g_list_delete_link(_vk.stale, l);
+    }
+    l = next;
+  }
   for(GList *l = _vk.doomed_images; l;)
   {
     GList *next = g_list_next(l);
@@ -1366,20 +1419,31 @@ static void _make_room(const uint32_t heap, const VkDeviceSize size)
   // an integrated GPU's heaps share one pool of memory, and the large
   // staging buffers kept for reuse grew to more than the host heap during
   // a 64 MP export, shrinking the device heap's budget with it. No batch
-  // uses an idle one, so the oldest go first and without a wait.
+  // uses an idle one, so the oldest go first and without a wait. Only those
+  // counted against this heap's budget or host_cap help: on a Radeon 780M
+  // the device heap freed the host heap's staging on every export, and the
+  // next export allocated it again
   if(!_vk.discrete && _vk.staging)
   {
     VkDeviceSize staged = 0;
-    while(_vk.staging && _shortfall(&budget, heap, size) > 0)
+    for(GList *l = g_list_last(_vk.staging); l && _shortfall(&budget, heap, size) > 0;)
     {
-      GList *oldest = g_list_last(_vk.staging);
-      staged += ((const dt_slang_staging_t *)oldest->data)->size;
-      _staging_destroy(oldest->data);
-      _vk.staging = g_list_delete_link(_vk.staging, oldest);
-      vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
+      GList *prev = g_list_previous(l);
+      const dt_slang_staging_t *s = l->data;
+      const uint32_t from = s->mem.heap;
+      if(from == heap
+         || (_vk.host_cap && (_vk.host_heaps & (1u << from)) && (_vk.host_heaps & (1u << heap))))
+      {
+        staged += s->size;
+        _staging_destroy(l->data);
+        _vk.staging = g_list_delete_link(_vk.staging, l);
+        vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
+      }
+      l = prev;
     }
-    dt_print(DT_DEBUG_SLANG, "[slang_gpu] freeing %" PRIu64 " MB of idle staging buffers for %" PRIu64 " MB",
-             (uint64_t)(staged >> 20), (uint64_t)(size >> 20));
+    if(staged)
+      dt_print(DT_DEBUG_SLANG, "[slang_gpu] freeing %" PRIu64 " MB of idle staging buffers for %" PRIu64 " MB",
+               (uint64_t)(staged >> 20), (uint64_t)(size >> 20));
     if(_shortfall(&budget, heap, size) == 0) return;
   }
 
@@ -1585,7 +1649,8 @@ typedef struct dt_slang_import_t
 #define DT_SLANG_IMPORT_MIN (4 << 20)
 // importing a whole 61 MP readback, 981 MB, on a Radeon 780M pushed the host
 // heap over its budget, and _make_room() evicted 2.9 GB of pooled images
-// that the next export allocated again
+// that the next export allocated again. Larger uploads are imported in
+// bands of this size, larger reads go through _read_banded()
 #define DT_SLANG_IMPORT_MAX (128 << 20)
 
 static void _import_free(dt_slang_import_t *imp)
@@ -1660,6 +1725,69 @@ static void _copy_rows(void *dst, const size_t dst_pitch, const void *src, const
     memcpy((char *)dst + y * dst_pitch, (const char *)src + y * src_pitch, row);
 }
 
+// reads above DT_SLANG_IMPORT_MAX go through two staging buffers of this
+// size, the CPU copying one out while the device fills the other. Importing
+// the host memory instead pinned it at about 0.5 ms per MB on a Radeon 780M,
+// 0.4 of the 1.2 s that the final read of a 61 MP export took
+#define DT_SLANG_READ_BAND (64 << 20)
+
+static int _read_banded(dt_slang_gpu_image_t *img,
+                        void *host,
+                        const size_t pitch,
+                        const int x,
+                        const int y,
+                        const int w,
+                        const int h)
+{
+  const size_t row = sizeof(float) * img->channels * w;
+  const int band = MAX(1, (int)MIN(DT_SLANG_READ_BAND / row, (size_t)h));
+  const int bands = (h + band - 1) / band;
+  dt_slang_staging_t *s[2] = { _staging_acquire(row * band, FALSE), NULL };
+  if(s[0]) s[1] = _staging_acquire(row * band, FALSE);
+  if(!s[1])
+  {
+    if(s[0]) _staging_release(s[0]);
+    return 1;
+  }
+  uint64_t serial[2] = { 0, 0 };
+  gboolean ok = TRUE;
+  // band k goes to s[k & 1], and is queued before band k - 1 is copied out
+  for(int k = 0; k <= bands && ok; k++)
+  {
+    if(k < bands)
+    {
+      dt_slang_batch_t *b = _batch_begin(NULL, 0, 0);
+      ok = b != NULL;
+      if(ok)
+      {
+        const VkBufferImageCopy copy = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                         .imageOffset = { x, y + k * band, 0 },
+                                         .imageExtent = { w, MIN(band, h - k * band), 1 } };
+        vkCmdCopyImageToBuffer(b->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, s[k & 1]->mem.buffer, 1, &copy);
+        _host_read_barrier(b->cb);
+        ok = _batch_submit(b, FALSE);
+        serial[k & 1] = _vk.submitted;
+      }
+    }
+    if(ok && k > 0)
+    {
+      const int j = k - 1;
+      _wait_until(serial[j & 1]);
+      ok = !_vk.lost;
+      if(ok)
+      {
+        _invalidate(&s[j & 1]->mem);
+        _copy_rows((char *)host + (size_t)j * band * pitch, pitch, s[j & 1]->mem.map, row, row,
+                   MIN(band, h - j * band));
+      }
+    }
+  }
+  if(!ok) _wait_all();
+  _staging_release(s[0]);
+  _staging_release(s[1]);
+  return ok ? 0 : 1;
+}
+
 // copies between the rectangle x, y, w x h of img and host, whose rows are
 // pitch bytes apart. With the host memory imported the GPU copies it
 // directly, and both directions wait for the copy, as the caller may change
@@ -1677,6 +1805,7 @@ static int _image_transfer_rect(dt_slang_gpu_image_t *img,
   const size_t bpp = sizeof(float) * img->channels;
   const size_t row = bpp * w;
   const size_t span = pitch * (h - 1) + row;
+  if(!to_device && span > DT_SLANG_IMPORT_MAX && h > 1) return _read_banded(img, host, pitch, x, y, w, h);
   if(_vk.host_import && span > DT_SLANG_IMPORT_MAX && h > 1)
   {
     const int band = MAX(1, DT_SLANG_IMPORT_MAX / pitch);
@@ -1766,6 +1895,7 @@ void dt_slang_gpu_cleanup(void)
   g_list_free_full(_vk.spare, (GDestroyNotify)_batch_destroy);
   g_list_free_full(_vk.images, (GDestroyNotify)_image_free);
   g_list_free_full(_vk.buffers, (GDestroyNotify)_buffer_free);
+  g_list_free_full(_vk.stale, (GDestroyNotify)_stale_free);
   g_list_free_full(_vk.staging, (GDestroyNotify)_staging_destroy);
   if(_vk.kernels) g_hash_table_destroy(_vk.kernels);
   if(_building) g_hash_table_destroy(_building);
@@ -1812,9 +1942,41 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
   img->height = height;
   img->channels = channels;
   gboolean ok = (uint32_t)width <= _vk.max_image_dim && (uint32_t)height <= _vk.max_image_dim
-    && _create_image(&img->image, &img->mem, &img->view, width, height, channels,
-                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT
-                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    && _create_image(&img->image, width, height, channels, DT_SLANG_IMAGE_USAGE);
+  if(ok)
+  {
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(_vk.dev, img->image, &req);
+    req.size = _size_class(req.size);
+    // the memory of a pooled image of another size in the same class; its
+    // own image may still be in use, so it is destroyed later
+    dt_slang_gpu_image_t *pooled = NULL;
+    for(GList *l = _vk.images; l && !pooled; l = g_list_next(l))
+    {
+      dt_slang_gpu_image_t *p = l->data;
+      if(p->mem_size == req.size && (req.memoryTypeBits & (1u << p->mem_type)))
+      {
+        pooled = p;
+        _vk.images = g_list_delete_link(_vk.images, l);
+      }
+    }
+    if(pooled)
+    {
+      img->mem = pooled->mem;
+      img->mem_type = pooled->mem_type;
+      dt_slang_stale_t *st = g_new0(dt_slang_stale_t, 1);
+      st->image = pooled->image;
+      st->view = pooled->view;
+      st->last_use = pooled->last_use;
+      _vk.stale = g_list_prepend(_vk.stale, st);
+      g_free(pooled);
+    }
+    else
+      ok = _alloc_on_device(&req, &img->mem, &img->mem_type);
+    img->mem_size = req.size;
+    ok = ok && vkBindImageMemory(_vk.dev, img->image, img->mem, 0) == VK_SUCCESS
+         && _create_view(&img->view, img->image, channels);
+  }
   if(ok)
   {
     dt_slang_batch_t *b = _batch_begin(NULL, 0, 0);
@@ -2169,9 +2331,16 @@ static int _run(dt_slang_kernel_t *k,
       const gboolean out = arg->kind == DT_SLANG_ARG_IMAGE_OUT;
       dt_slang_mem_t *m = g_new0(dt_slang_mem_t, 1);
       b->mems = g_list_prepend(b->mems, m);
-      if(!_create_image(&m->image, &m->image_mem, &m->view, arg->width, arg->height, arg->channels,
+      VkMemoryRequirements req;
+      uint32_t type;
+      if(!_create_image(&m->image, arg->width, arg->height, arg->channels,
                         out ? VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                             : VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+        goto done;
+      vkGetImageMemoryRequirements(_vk.dev, m->image, &req);
+      if(!_alloc_on_device(&req, &m->image_mem, &type)
+         || vkBindImageMemory(_vk.dev, m->image, m->image_mem, 0) != VK_SUCCESS
+         || !_create_view(&m->view, m->image, arg->channels))
         goto done;
       images[r] = m->image;
       const size_t bytes = sizeof(float) * arg->channels * arg->width * arg->height;
@@ -2268,7 +2437,10 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
   if(_vk.memory_budget)
   {
     // the budget covers other applications too, and what the pools keep
-    // counts as used although it would be freed for the module
+    // counts as used although it would be freed for the module. So does what
+    // was evicted from them and waits for its batches: after a tiled
+    // denoiseprofile on a Radeon 780M that left sharpen and colorequal
+    // 150-200 MB short, and both ran in tiles
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget
         = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
     VkPhysicalDeviceMemoryProperties2 props2
@@ -2276,11 +2448,12 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
     vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
     VkDeviceSize pooled = 0;
     for(GList *l = _vk.images; l; l = g_list_next(l))
-    {
-      const dt_slang_gpu_image_t *i = l->data;
-      pooled += sizeof(float) * i->channels * i->width * i->height;
-    }
+      pooled += _image_bytes(l->data);
+    for(GList *l = _vk.doomed_images; l; l = g_list_next(l))
+      pooled += _image_bytes(l->data);
     for(GList *l = _vk.buffers; l; l = g_list_next(l))
+      pooled += ((const dt_slang_gpu_buffer_t *)l->data)->size;
+    for(GList *l = _vk.doomed_buffers; l; l = g_list_next(l))
       pooled += ((const dt_slang_gpu_buffer_t *)l->data)->size;
     if(_vk.discrete)
     {
