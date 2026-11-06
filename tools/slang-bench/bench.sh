@@ -80,7 +80,7 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
     echo "| $p | $t | ${med:--} | ${over:--} |"
   done
   echo
-  echo "- slang device and kernel preparation at startup: $(grep -m1 -oE 'preparing the (Metal|Vulkan) device and kernels took [0-9.]+ secs' "$OUT/slang.log" | sed -E 's/.*took ([0-9.]+) secs/\1 s/')"
+  echo "- slang device and kernel preparation at startup: $(grep -m1 -oE 'preparing the (Metal|Vulkan) device( and kernels)? took [0-9.]+ secs' "$OUT/slang.log" | sed -E 's/.*took ([0-9.]+) secs/\1 s/')"
   echo; echo "module runs over all $N exports:"; echo
   for p in opencl slang; do
     echo "- $p: $(grep -c "processed .* on GPU" "$OUT/$p.log") on GPU; on CPU: $(grep "processed .* on CPU" "$OUT/$p.log" | sed -E "s/.*processed .([a-z0-9_]+). on CPU.*/\1/" | sort | uniq -c | awk '{printf "%s(%s) ", $2, $1}')"
