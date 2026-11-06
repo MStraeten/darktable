@@ -1162,6 +1162,160 @@ void dt_gaussian_free_cl_global(dt_gaussian_cl_global_t *g)
 }
 
 #endif
+#ifdef HAVE_SLANG_GPU
+int dt_gaussian_blur_slang(dt_slang_gpu_image_t *dev_in,
+                           dt_slang_gpu_image_t *dev_out,
+                           const int width,
+                           const int height,
+                           const float sigma,
+                           const float max,
+                           const float min)
+{
+  float a0, a1, a2, a3, b1, b2, coefp, coefn;
+  _compute_gauss_params(sigma, DT_IOP_GAUSSIAN_ZERO, &a0, &a1, &a2, &a3, &b1, &b2, &coefp, &coefn);
+
+  const size_t size = sizeof(float) * width * height;
+  dt_slang_gpu_buffer_t *temp1 = dt_slang_gpu_buffer_new(size, NULL);
+  dt_slang_gpu_buffer_t *temp2 = dt_slang_gpu_buffer_new(size, NULL);
+  int err = !temp1 || !temp2;
+
+  // the steps of dt_gaussian_blur_cl(): vertical pass, transpose, vertical
+  // pass over the transposed image, transpose back
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("gaussian", "gaussian_image_to_buffer_1c", width, height,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(temp1), SLARG(width), SLARG(height));
+  if(!err)
+    err = dt_slang_gpu_run_1d_args("gaussian", "gaussian_column_1c", width,
+                                   SLBUF_DEV(temp1), SLBUF_DEV(temp2), SLARG(width), SLARG(height),
+                                   SLARG(a0), SLARG(a1), SLARG(a2), SLARG(a3), SLARG(b1), SLARG(b2),
+                                   SLARG(coefp), SLARG(coefn), SLARG(max), SLARG(min));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("gaussian", "gaussian_transpose_1c", width, height,
+                                   SLBUF_DEV(temp2), SLBUF_DEV(temp1), SLARG(width), SLARG(height));
+  if(!err)
+    err = dt_slang_gpu_run_1d_args("gaussian", "gaussian_column_1c", height,
+                                   SLBUF_DEV(temp1), SLBUF_DEV(temp2), SLARG(height), SLARG(width),
+                                   SLARG(a0), SLARG(a1), SLARG(a2), SLARG(a3), SLARG(b1), SLARG(b2),
+                                   SLARG(coefp), SLARG(coefn), SLARG(max), SLARG(min));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("gaussian", "gaussian_transpose_1c", height, width,
+                                   SLBUF_DEV(temp2), SLBUF_DEV(temp1), SLARG(height), SLARG(width));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("gaussian", "gaussian_buffer_to_image_1c", width, height,
+                                   SLBUF_DEV(temp1), SLIMG_DEV(dev_out), SLARG(width), SLARG(height));
+
+  dt_slang_gpu_buffer_free(temp1);
+  dt_slang_gpu_buffer_free(temp2);
+  return err;
+}
+
+int dt_gaussian_blur_4c_slang(dt_slang_gpu_image_t *dev_in,
+                              dt_slang_gpu_image_t *dev_out,
+                              const int width,
+                              const int height,
+                              const float sigma,
+                              const dt_gaussian_order_t order,
+                              const float *const max,
+                              const float *const min)
+{
+  float a0, a1, a2, a3, b1, b2, coefp, coefn;
+  _compute_gauss_params(sigma, order, &a0, &a1, &a2, &a3, &b1, &b2, &coefp, &coefn);
+
+  const dt_slang_arg_t arg_max = { DT_SLANG_ARG_VALUE, max, 4 * sizeof(float), 0, 0, 0 };
+  const dt_slang_arg_t arg_min = { DT_SLANG_ARG_VALUE, min, 4 * sizeof(float), 0, 0, 0 };
+
+  const size_t size = sizeof(float) * 4 * width * height;
+  dt_slang_gpu_buffer_t *temp1 = dt_slang_gpu_buffer_new_uninit(size);
+  dt_slang_gpu_buffer_t *temp2 = dt_slang_gpu_buffer_new_uninit(size);
+
+  // the steps of dt_gaussian_blur_cl() for 4 channels
+  const int err = !temp1 || !temp2
+    || dt_slang_gpu_run_2d_args("gaussian", "gaussian_image_to_buffer_4c", width, height,
+                                SLIMG_DEV(dev_in), SLBUF_DEV(temp1), SLARG(width), SLARG(height))
+    || dt_slang_gpu_run_1d_args("gaussian", "gaussian_column_4c", width,
+                                SLBUF_DEV(temp1), SLBUF_DEV(temp2), SLARG(width), SLARG(height),
+                                SLARG(a0), SLARG(a1), SLARG(a2), SLARG(a3), SLARG(b1), SLARG(b2),
+                                SLARG(coefp), SLARG(coefn), arg_max, arg_min)
+    || dt_slang_gpu_run_2d_args("gaussian", "gaussian_transpose_4c", width, height,
+                                SLBUF_DEV(temp2), SLBUF_DEV(temp1), SLARG(width), SLARG(height))
+    || dt_slang_gpu_run_1d_args("gaussian", "gaussian_column_4c", height,
+                                SLBUF_DEV(temp1), SLBUF_DEV(temp2), SLARG(height), SLARG(width),
+                                SLARG(a0), SLARG(a1), SLARG(a2), SLARG(a3), SLARG(b1), SLARG(b2),
+                                SLARG(coefp), SLARG(coefn), arg_max, arg_min)
+    || dt_slang_gpu_run_2d_args("gaussian", "gaussian_transpose_4c", height, width,
+                                SLBUF_DEV(temp2), SLBUF_DEV(temp1), SLARG(height), SLARG(width))
+    || dt_slang_gpu_run_2d_args("gaussian", "gaussian_buffer_to_image_4c", width, height,
+                                SLBUF_DEV(temp1), SLIMG_DEV(dev_out), SLARG(width), SLARG(height));
+
+  dt_slang_gpu_buffer_free(temp1);
+  dt_slang_gpu_buffer_free(temp2);
+  return err;
+}
+
+int dt_gaussian_fast_blur_slang_buffer(dt_slang_gpu_buffer_t *dev_in,
+                                       dt_slang_gpu_buffer_t *dev_out,
+                                       const int width,
+                                       const int height,
+                                       const float sigma,
+                                       const float min,
+                                       const float max)
+{
+  float kern[25];
+  _calc_9x9_gauss_coeffs(kern, sigma);
+  const int ch = 1;
+  return dt_slang_gpu_run_2d_args("gaussian", "gaussian_kernel_9x9", width, height,
+                                  SLBUF_DEV(dev_in), SLBUF_DEV(dev_out), SLARG(width), SLARG(height),
+                                  SLARG(ch), SLBUF(kern, sizeof(kern)), SLARG(min), SLARG(max));
+}
+
+int dt_gaussian_mean_blur_slang(dt_slang_gpu_buffer_t *buf,
+                                const int width,
+                                const int height,
+                                const int ch,
+                                const float sigma)
+{
+  if(ch != 1 && ch != 2 && ch != 4) return 1;
+
+  float a0, a1, a2, a3, b1, b2, coefp, coefn;
+  _compute_gauss_params(sigma, DT_IOP_GAUSSIAN_ZERO, &a0, &a1, &a2, &a3, &b1, &b2, &coefp, &coefn);
+
+  // the clamp bounds of dt_gaussian_mean_blur_cl(), as wide as a pixel
+  const float range = 1.0e9f;
+  const dt_aligned_pixel_t max = { range, range, range, range };
+  const dt_aligned_pixel_t min = { -range, -range, -range, -range };
+  const dt_slang_arg_t arg_max = { DT_SLANG_ARG_VALUE, max, ch * sizeof(float), 0, 0, 0 };
+  const dt_slang_arg_t arg_min = { DT_SLANG_ARG_VALUE, min, ch * sizeof(float), 0, 0, 0 };
+
+  char column[32], transpose[32];
+  snprintf(column, sizeof(column), "gaussian_column_%dc", ch);
+  snprintf(transpose, sizeof(transpose), "gaussian_transpose_%dc", ch);
+
+  const size_t size = sizeof(float) * ch * width * height;
+  dt_slang_gpu_buffer_t *temp1 = dt_slang_gpu_buffer_new(size, NULL);
+  dt_slang_gpu_buffer_t *temp2 = dt_slang_gpu_buffer_new(size, NULL);
+
+  // the steps of dt_gaussian_blur_cl_buffer(): vertical pass, transpose,
+  // vertical pass over the transposed buffer, transpose back
+  const int err = !temp1 || !temp2
+    || dt_slang_gpu_run_1d_args("gaussian", column, width,
+                                SLBUF_DEV(buf), SLBUF_DEV(temp2), SLARG(width), SLARG(height),
+                                SLARG(a0), SLARG(a1), SLARG(a2), SLARG(a3), SLARG(b1), SLARG(b2),
+                                SLARG(coefp), SLARG(coefn), arg_max, arg_min)
+    || dt_slang_gpu_run_2d_args("gaussian", transpose, width, height,
+                                SLBUF_DEV(temp2), SLBUF_DEV(temp1), SLARG(width), SLARG(height))
+    || dt_slang_gpu_run_1d_args("gaussian", column, height,
+                                SLBUF_DEV(temp1), SLBUF_DEV(temp2), SLARG(height), SLARG(width),
+                                SLARG(a0), SLARG(a1), SLARG(a2), SLARG(a3), SLARG(b1), SLARG(b2),
+                                SLARG(coefp), SLARG(coefn), arg_max, arg_min)
+    || dt_slang_gpu_run_2d_args("gaussian", transpose, height, width,
+                                SLBUF_DEV(temp2), SLBUF_DEV(buf), SLARG(height), SLARG(width));
+
+  dt_slang_gpu_buffer_free(temp1);
+  dt_slang_gpu_buffer_free(temp2);
+  return err;
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

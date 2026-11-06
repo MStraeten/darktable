@@ -815,6 +815,304 @@ error:
 }
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// process_opposed_cl() on the Slang kernels. Returns TRUE on success.
+// reads back the per work-group sums of highlights_chroma_sums(_linear) and
+// adds them up in double, as the CPU code does; only these come back, never
+// the image. The kernels run in 16x16 work groups.
+static gboolean _chroma_sums_collect_slang(dt_slang_gpu_buffer_t *accu_buf,
+                                           const size_t groups,
+                                           double sums[3],
+                                           int cnts[3],
+                                           gboolean *anyclipped)
+{
+  float *accu = dt_alloc_align_float(8 * groups);
+  const gboolean ok = accu && !dt_slang_gpu_buffer_read(accu_buf, accu, sizeof(float) * 8 * groups);
+  if(ok)
+  {
+    double clipped = 0.0;
+    for(size_t k = 0; k < groups; k++)
+    {
+      for_three_channels(c)
+      {
+        sums[c] += accu[8*k + c];
+        cnts[c] += (int)accu[8*k + 4 + c];
+      }
+      clipped += accu[8*k + 7];
+    }
+    *anyclipped = clipped > 0.0;
+  }
+  dt_free_align(accu);
+  return ok;
+}
+
+static gboolean process_opposed_slang(dt_iop_module_t *self,
+                                      dt_dev_pixelpipe_iop_t *piece,
+                                      dt_slang_gpu_image_t *dev_in,
+                                      dt_slang_gpu_image_t *dev_out,
+                                      const dt_iop_roi_t *const roi_in,
+                                      const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_highlights_data_t *d = piece->data;
+  dt_iop_highlights_gui_data_t *g = self->gui_data;
+  const uint32_t filters = piece->filters;
+
+  const float clipval = highlights_clip_magics[DT_IOP_HIGHLIGHTS_OPPOSED] * d->clip;
+  const dt_iop_buffer_dsc_t *dsc = &piece->pipe->dsc;
+  const gboolean wbon = dsc->temperature.enabled;
+  const dt_aligned_pixel_t icoeffs = { wbon ? dsc->temperature.coeffs[0] : 1.0f,
+                                       wbon ? dsc->temperature.coeffs[1] : 1.0f,
+                                       wbon ? dsc->temperature.coeffs[2] : 1.0f,
+                                       1.0f };
+
+  const dt_aligned_pixel_t clips = { clipval * icoeffs[0], clipval * icoeffs[1], clipval * icoeffs[2], 1.0f};
+
+  const dt_dev_wb_t *wb = &piece->pipe->wb;
+  const gboolean late = wb->late_correction;
+  dt_aligned_pixel_t correction;
+  dt_dev_wb_get_rgb_correction(wb, late, correction);
+
+  dt_aligned_pixel_t chrominance = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  const dt_hash_t opphash = _opposed_hash(piece);
+  const gboolean fullpipe = dt_pipe_is_full(piece->pipe);
+
+  gboolean is_hashed = FALSE;
+  gboolean unclipped = FALSE;
+  if(self->dev->gui_attached && g)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    is_hashed = opphash == g->opphash;
+    unclipped = !g->oppclipped;
+    if(is_hashed)
+    {
+      for_three_channels(c)
+        chrominance[c] = g->oppchroma[c];
+    }
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  if(is_hashed && unclipped)
+  {
+    // a copy, as clipping at FLT_MAX changes nothing
+    const dt_aligned_pixel_t noclip = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+    const int dx = roi_out->x;
+    const int dy = roi_out->y;
+    return !dt_slang_gpu_run_2d_args("basic", "highlights_1f_clip", roi_out->width, roi_out->height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                     SLARG(roi_in->width), SLARG(roi_in->height),
+                                     SLARG(roi_out->width), SLARG(roi_out->height),
+                                     SLARG(noclip), SLARG(dx), SLARG(dy),
+                                     SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+  }
+
+  gboolean ok = TRUE;
+  if(!is_hashed)
+  {
+    // We don't have valid chrominance correction so go the hard way
+    const int iwidth = roi_in->width;
+    const int iheight = roi_in->height;
+    const int mwidth  = iwidth / 3;
+    const int mheight = iheight / 3;
+    const int msize = mwidth * mheight;
+    // three byte planes, packed four to a word in the Slang buffers
+    const size_t mbufsize = 3 * (size_t)msize;
+    const int mwords = (mbufsize + 3) / 4;
+    const int clear_width = 4096;
+    const int clear_height = (mwords + clear_width - 1) / clear_width;
+
+    const size_t groups = (size_t)((iwidth + 15) / 16) * ((iheight + 15) / 16);
+
+    dt_slang_gpu_buffer_t *inmask = dt_slang_gpu_buffer_new(sizeof(uint32_t) * mwords, NULL);
+    dt_slang_gpu_buffer_t *outmask = dt_slang_gpu_buffer_new(sizeof(uint32_t) * mwords, NULL);
+    dt_slang_gpu_buffer_t *accu = dt_slang_gpu_buffer_new(sizeof(float) * 8 * groups, NULL);
+
+    double sums[3] = { 0.0, 0.0, 0.0 };
+    int cnts[3] = { 0, 0, 0 };
+    gboolean anyclipped = FALSE;
+
+    ok = inmask && outmask && accu
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_clearmask", clear_width, clear_height,
+                                   SLBUF_DEV(inmask), SLARG(clear_width), SLARG(mwords))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_clearmask", clear_width, clear_height,
+                                   SLBUF_DEV(outmask), SLARG(clear_width), SLARG(mwords))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_initmask", mwidth, mheight,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(inmask),
+                                   SLARG(msize), SLARG(mwidth), SLARG(mheight), SLARG(iwidth), SLARG(iheight),
+                                   SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)),
+                                   SLBUF(clips, sizeof(clips)))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_dilatemask", mwidth, mheight,
+                                   SLBUF_DEV(inmask), SLBUF_DEV(outmask),
+                                   SLARG(msize), SLARG(mwidth), SLARG(mheight))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_chroma_sums", iwidth, iheight,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(outmask),
+                                   SLARG(msize), SLARG(mwidth), SLARG(mheight), SLARG(iwidth), SLARG(iheight),
+                                   SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)),
+                                   SLBUF(clips, sizeof(clips)), SLBUF(correction, sizeof(correction)),
+                                   SLBUF_DEV(accu))
+      && _chroma_sums_collect_slang(accu, groups, sums, cnts, &anyclipped);
+
+    if(ok)
+    {
+      for_three_channels(c)
+        chrominance[c] = cnts[c] > 100 ? (float)(sums[c] / (double)cnts[c]) : 0.0f;
+
+      if(self->dev->gui_attached && g && fullpipe)
+      {
+        dt_iop_gui_enter_critical_section(self);
+        for_three_channels(c)
+          g->oppchroma[c] = chrominance[c];
+        g->opphash = opphash;
+        g->oppclipped = anyclipped;
+        g->oppresult = TRUE;
+        dt_iop_gui_leave_critical_section(self);
+      }
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
+          "opposed chroma", piece->pipe, self, DT_DEVICE_NONE, NULL, NULL,
+          "%12.7f (%d)%12.7f (%d)%12.7f (%d) clipped=%s",
+          chrominance[0], cnts[0],
+          chrominance[1], cnts[1],
+          chrominance[2], cnts[2],
+          STR_YESNO(anyclipped));
+    }
+    dt_slang_gpu_buffer_free(inmask);
+    dt_slang_gpu_buffer_free(outmask);
+    dt_slang_gpu_buffer_free(accu);
+  }
+
+  return ok
+    && !dt_slang_gpu_run_2d_args("basic", "highlights_opposed", roi_out->width, roi_out->height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                 SLARG(roi_out->width), SLARG(roi_out->height),
+                                 SLARG(roi_in->width), SLARG(roi_in->height),
+                                 SLARG(roi_out->x), SLARG(roi_out->y),
+                                 SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)),
+                                 SLBUF(clips, sizeof(clips)), SLBUF(chrominance, sizeof(chrominance)), SLBUF(correction, sizeof(correction)));
+}
+
+// _process_linear_opposed_cl() on the Slang kernels, into dev_out of the
+// size of roi_in. Returns TRUE on success.
+static gboolean _process_linear_opposed_slang(dt_iop_module_t *self,
+                                              dt_dev_pixelpipe_iop_t *piece,
+                                              dt_slang_gpu_image_t *dev_in,
+                                              dt_slang_gpu_image_t *dev_out,
+                                              const dt_iop_roi_t *const roi_in)
+{
+  dt_iop_highlights_data_t *d = piece->data;
+  dt_iop_highlights_gui_data_t *g = self->gui_data;
+
+  const float clipval = highlights_clip_magics[DT_IOP_HIGHLIGHTS_OPPOSED] * d->clip;
+  const dt_iop_buffer_dsc_t *dsc = &piece->pipe->dsc;
+  const gboolean wbon = dsc->temperature.enabled;
+  const dt_aligned_pixel_t icoeffs = { wbon ? dsc->temperature.coeffs[0] : 1.0f,
+                                       wbon ? dsc->temperature.coeffs[1] : 1.0f,
+                                       wbon ? dsc->temperature.coeffs[2] : 1.0f,
+                                       1.0f };
+  const dt_aligned_pixel_t clips = { clipval * icoeffs[0], clipval * icoeffs[1], clipval * icoeffs[2], 1.0f };
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int mwidth  = width / 3;
+  const int mheight = height / 3;
+  const int msize = mwidth * mheight;
+
+  dt_aligned_pixel_t chrominance = {0.0f, 0.0f, 0.0f, 0.0f};
+  const dt_hash_t opphash = _opposed_hash(piece);
+  const gboolean fullpipe = dt_pipe_is_full(piece->pipe);
+
+  gboolean is_hashed = FALSE;
+  gboolean unclipped = FALSE;
+  if(self->dev->gui_attached && g)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    is_hashed = opphash == g->opphash;
+    unclipped = !g->oppclipped;
+    if(is_hashed)
+    {
+      for_three_channels(c)
+        chrominance[c] = g->oppchroma[c];
+    }
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  if(is_hashed && unclipped)
+  {
+    const int zero = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(width), SLARG(height), SLARG(zero), SLARG(zero));
+  }
+
+  gboolean ok = TRUE;
+  if(!is_hashed)
+  {
+    // three byte planes, packed four to a word in the Slang buffers
+    const size_t mbufsize = 3 * (size_t)msize;
+    const int mwords = (mbufsize + 3) / 4;
+    const int clear_width = 4096;
+    const int clear_height = (mwords + clear_width - 1) / clear_width;
+
+    const size_t groups = (size_t)((width + 15) / 16) * ((height + 15) / 16);
+
+    dt_slang_gpu_buffer_t *inmask = dt_slang_gpu_buffer_new(sizeof(uint32_t) * mwords, NULL);
+    dt_slang_gpu_buffer_t *outmask = dt_slang_gpu_buffer_new(sizeof(uint32_t) * mwords, NULL);
+    dt_slang_gpu_buffer_t *accu = dt_slang_gpu_buffer_new(sizeof(float) * 8 * groups, NULL);
+
+    double sums[3] = { 0.0, 0.0, 0.0 };
+    int cnts[3] = { 0, 0, 0 };
+    gboolean anyclipped = FALSE;
+
+    ok = inmask && outmask && accu
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_clearmask", clear_width, clear_height,
+                                   SLBUF_DEV(inmask), SLARG(clear_width), SLARG(mwords))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_clearmask", clear_width, clear_height,
+                                   SLBUF_DEV(outmask), SLARG(clear_width), SLARG(mwords))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_initmask_linear", mwidth, mheight,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(inmask),
+                                   SLARG(msize), SLARG(mwidth), SLARG(mheight), SLARG(width), SLARG(height),
+                                   SLARG(clips))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_dilatemask", mwidth, mheight,
+                                   SLBUF_DEV(inmask), SLBUF_DEV(outmask),
+                                   SLARG(msize), SLARG(mwidth), SLARG(mheight))
+      && !dt_slang_gpu_run_2d_args("basic", "highlights_chroma_sums_linear", width, height,
+                                   SLIMG_DEV(dev_in), SLBUF_DEV(outmask),
+                                   SLARG(msize), SLARG(mwidth), SLARG(mheight), SLARG(width), SLARG(height),
+                                   SLARG(clips), SLBUF_DEV(accu))
+      && _chroma_sums_collect_slang(accu, groups, sums, cnts, &anyclipped);
+
+    if(ok && anyclipped)
+    {
+      for_three_channels(c)
+        chrominance[c] = cnts[c] > 30 ? (float)(sums[c] / (double)cnts[c]) : 0.0f;
+
+      if(self->dev->gui_attached && g && fullpipe)
+      {
+        dt_iop_gui_enter_critical_section(self);
+        for_three_channels(c)
+          g->oppchroma[c] = chrominance[c];
+        g->opphash = opphash;
+        g->oppclipped = anyclipped;
+        g->oppresult = TRUE;
+        dt_iop_gui_leave_critical_section(self);
+      }
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_VERBOSE,
+          "opposed chroma", piece->pipe, self, DT_DEVICE_NONE, roi_in, NULL,
+          "RGB %3.4f %3.4f %3.4f clipped=%s",
+          chrominance[0], chrominance[1], chrominance[2],
+          STR_YESNO(anyclipped));
+    }
+    dt_slang_gpu_buffer_free(inmask);
+    dt_slang_gpu_buffer_free(outmask);
+    dt_slang_gpu_buffer_free(accu);
+  }
+
+  return ok
+    && !dt_slang_gpu_run_2d_args("basic", "highlights_opposed_linear", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLARG(clips), SLARG(chrominance));
+}
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

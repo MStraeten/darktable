@@ -16,6 +16,7 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "common/slang_gpu.h"
 #include "common/interpolation.h"
 #include "common/opencl.h"
 #include "common/imagebuf.h"
@@ -112,6 +113,19 @@ void distort_mask(dt_iop_module_t *self,
   dt_interpolation_resample_mask(itor, out, roi_out, in, roi_in);
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  return !dt_interpolation_resample_mask_slang(itor, dev_out, roi_out, dev_in, roi_in);
+}
+#endif
+
 #ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
@@ -121,6 +135,19 @@ int process_cl(dt_iop_module_t *self,
                const dt_iop_roi_t *const roi_out)
 {
   return dt_iop_clip_and_zoom_cl(piece->pipe->devid, dev_out, dev_in, roi_out, roi_in);
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  return !dt_interpolation_resample_slang(itor, dev_out, roi_out, dev_in, roi_in);
 }
 #endif
 

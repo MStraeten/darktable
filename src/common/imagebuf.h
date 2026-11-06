@@ -106,6 +106,32 @@ void dt_iop_copy_image_roi(float *const __restrict__ out,
                            const dt_iop_roi_t *const __restrict__ roi_in,
                            const dt_iop_roi_t *const __restrict__ roi_out);
 
+#ifdef HAVE_SLANG_GPU
+struct dt_slang_gpu_image_t;
+// out(x, y) = in(x + dx, y + dy) for 1- or 4-channel images on the Slang
+// device, zero where that falls outside in. Returns 0 on success
+int dt_iop_image_blit_slang(struct dt_slang_gpu_image_t *out,
+                            struct dt_slang_gpu_image_t *in,
+                            const int iwidth,
+                            const int iheight,
+                            const int owidth,
+                            const int oheight,
+                            const int dx,
+                            const int dy);
+// dt_iop_copy_image_roi() for images on the Slang device. Returns 0 on success
+int dt_iop_copy_image_roi_slang(struct dt_slang_gpu_image_t *out,
+                                struct dt_slang_gpu_image_t *in,
+                                const dt_iop_roi_t *const roi_in,
+                                const dt_iop_roi_t *const roi_out);
+// out = CLIP(in) for the first channel of 1-channel masks on the Slang
+// device, as the CPU distort_mask() functions clip their samples. Returns 0
+// on success
+int dt_iop_image_clip_slang(struct dt_slang_gpu_image_t *out,
+                            struct dt_slang_gpu_image_t *in,
+                            const int width,
+                            const int height);
+#endif
+
 // Copy one image buffer to another, multiplying each element by the
 // specified scale factor
 void dt_iop_image_scaled_copy(float *const __restrict__ buf,

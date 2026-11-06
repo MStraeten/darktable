@@ -46,6 +46,8 @@ else ()
     set(TESTBUILD_OPENCL_PROGRAMS OFF)
 endif ()
 
+option(USE_SLANG "Compile the Slang GPU kernels (needs slangc)" OFF)
+
 if(APPLE)
     option(USE_MAC_INTEGRATION "Enable macOS integration" ON)
 else(APPLE)

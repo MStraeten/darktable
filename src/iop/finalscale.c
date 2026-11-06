@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/slang_gpu.h"
 #include "common/interpolation.h"
 #include "common/opencl.h"
 #include "common/imagebuf.h"
@@ -150,7 +151,13 @@ void modify_roi_in(dt_iop_module_t *self,
   }
 
 #ifdef HAVE_OPENCL
-  if(roi_out->scale > 1.0f && !piece->pipe->tiling
+  // process_cl_ready also gates process_slang(), which has its own tiler and
+  // keeps the image on the device
+  gboolean on_slang = FALSE;
+#ifdef HAVE_SLANG_GPU
+  on_slang = piece->pipe->slang_enabled && dt_slang_gpu_enabled();
+#endif
+  if(roi_out->scale > 1.0f && !piece->pipe->tiling && !on_slang
      && !_upscale_fits_device(piece, roi_in, roi_out))
     piece->process_cl_ready = FALSE;
 #endif
@@ -183,6 +190,19 @@ void distort_mask(dt_iop_module_t *self,
   dt_interpolation_resample_mask(itor, out, roi_out, in, roi_in);
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  return !dt_interpolation_resample_mask_slang(itor, dev_out, roi_out, dev_in, roi_in);
+}
+#endif
+
 #ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
@@ -204,6 +224,26 @@ int process_cl(dt_iop_module_t *self,
     return dt_iop_clip_and_zoom_roi_cl(devid, dev_out, dev_in, roi_out, roi_in);
   else
     return dt_iop_clip_and_zoom_cl(devid, dev_out, dev_in, roi_out, roi_in);
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  // as process_cl(): a tile of an export is placed by its roi offsets
+  if(dt_pipe_is_export(piece->pipe) && piece->pipe->tiling)
+    return !dt_interpolation_resample_tile_slang(itor, dev_out, roi_out, dev_in, roi_in);
+
+  // the export pipe's buffers hold exactly the rois, as in dt_iop_clip_and_zoom_roi()
+  dt_iop_roi_t iroi = *roi_in, oroi = *roi_out;
+  if(dt_pipe_is_export(piece->pipe)) iroi.x = iroi.y = oroi.x = oroi.y = 0;
+  return !dt_interpolation_resample_slang(itor, dev_out, &oroi, dev_in, &iroi);
 }
 #endif
 

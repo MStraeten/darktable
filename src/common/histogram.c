@@ -25,6 +25,7 @@
 #include "common/darktable.h"
 #include "common/histogram.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop.h"
 
 typedef void((*_histogram_worker)(const dt_dev_histogram_collection_params_t *const params,
@@ -441,6 +442,71 @@ error:
   dt_opencl_release_mem_object(dev_bins);
   dt_ioppr_free_iccprofile_params_cl(&profile_info_cl, &profile_lut_cl, &dev_profile_info, &dev_profile_lut);
   return FALSE;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean dt_histogram_helper_slang(dt_dev_histogram_collection_params_t *histogram_params,
+                                   dt_dev_histogram_stats_t *histogram_stats,
+                                   const dt_iop_colorspace_type_t cst,
+                                   const dt_iop_colorspace_type_t cst_to,
+                                   struct dt_slang_gpu_image_t *img,
+                                   uint32_t **histogram,
+                                   uint32_t *histogram_max,
+                                   const gboolean compensate_middle_grey,
+                                   const dt_iop_order_iccprofile_info_t *const profile_info)
+{
+  dt_times_t start_time = { 0 };
+  dt_get_perf_times(&start_time);
+
+  // raw histograms count 16-bit integers, which the device image no longer holds
+  int mode;
+  if(cst == IOP_CS_RGB)
+    mode = compensate_middle_grey && profile_info ? 1 : 0;
+  else if(cst == IOP_CS_LAB)
+    mode = cst_to != IOP_CS_LCH ? 2 : 3;
+  else
+    return FALSE;
+
+  const dt_histogram_roi_t *const roi = histogram_params->roi;
+  const int crop[4] = { roi->crop_x, roi->crop_y, roi->width - roi->crop_right, roi->height - roi->crop_bottom };
+  if(crop[2] <= crop[0] || crop[3] <= crop[1]) return FALSE;
+  const int bins_count = histogram_params->bins_count;
+  const size_t buf_size = (size_t)4 * bins_count * sizeof(uint32_t);
+
+  dt_colorspaces_iccprofile_info_slang_t info;
+  int lut_w = 0, lut_h = 0;
+  float *lut = dt_ioppr_build_iccprofile_params_slang(mode == 1 ? profile_info : NULL, &info, &lut_w, &lut_h);
+  dt_slang_gpu_buffer_t *bins = lut ? dt_slang_gpu_buffer_new(buf_size, NULL) : NULL;
+  int err = !bins
+    || dt_slang_gpu_run_2d_args("histogram", "histogram_collect", crop[2] - crop[0], crop[3] - crop[1],
+                                SLIMG_DEV(img), SLBUF_DEV(bins), SLARG(crop), SLARG(bins_count), SLARG(mode),
+                                SLBUF(&info, sizeof(info)), SLIMG_IN(lut, lut_w, lut_h, 1));
+  free(lut);
+
+  // the buffer as in _hist_worker(), which the caller frees
+  if(!err && (!(*histogram) || histogram_stats->buf_size < buf_size))
+  {
+    dt_free_align(*histogram);
+    *histogram = dt_alloc_aligned(buf_size);
+    if(*histogram)
+      histogram_stats->buf_size = buf_size;
+    else
+      err = 1;
+  }
+  err = err || dt_slang_gpu_buffer_read(bins, *histogram, buf_size);
+  dt_slang_gpu_buffer_free(bins);
+  if(err) return FALSE;
+
+  histogram_stats->ch = 3u;
+  histogram_stats->bins_count = bins_count;
+  histogram_stats->pixels = (crop[2] - crop[0]) * (crop[3] - crop[1]);
+  _histogram_max(histogram_stats, cst, cst_to, *histogram, histogram_max);
+
+  dt_print(DT_DEBUG_PERF,
+           "histogram calculation on the slang device %u bins %d -> %d compensate %d %u pixels took %.3f secs",
+           bins_count, cst, cst_to, mode == 1, histogram_stats->pixels, dt_get_lap_time(&start_time.clock));
+  return TRUE;
 }
 #endif
 

@@ -710,6 +710,114 @@ void process(dt_iop_module_t *self,
   free_gray_image(&trans_map_filtered);
 }
 
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
+// the window sizes of the GPU paths, and the ambient light and maximal depth
+// as far as the preview pipe provides them; *distance_max is NAN otherwise
+static void _gpu_ambient_from_preview(dt_iop_module_t *self,
+                                      dt_dev_pixelpipe_iop_t *piece,
+                                      const dt_iop_roi_t *const roi_in,
+                                      int *w1,
+                                      int *w2,
+                                      rgb_pixel *A0,
+                                      float *distance_max)
+{
+  dt_iop_hazeremoval_gui_data_t *const g = (dt_iop_hazeremoval_gui_data_t*)self->gui_data;
+  dt_iop_hazeremoval_params_t *d = piece->data;
+
+  const float wscale = d->adaptive ? CLIP((float)roi_in->scale / (float)piece->pipe->iscale) : 1.0f;
+  /*  To make the darkroom experience and data taken from preview pipe (not only internal but also pickers ...)
+      more consistent we modify the windowing sizes (positive integers) according to the pipe scaling.
+      w1: to determine the dark channel and the transition map
+      w2: for the guided filter
+  */
+  *w1 = 2 + (int)ceilf(4.0f * wscale);
+  *w2 = 3 + (int)ceilf(6.0f * wscale);
+
+  const gboolean gui = self->dev->gui_attached && g;
+  const gboolean fullpipes = dt_pipe_is_canvas(piece->pipe);
+  const gboolean hq = darktable.develop->late_scaling.enabled;
+  (*A0)[0] = (*A0)[1] = (*A0)[2] = NAN;
+  (*A0)[3] = 0.0f;
+  *distance_max = NAN;
+
+  /*  hazeremoval module needs the color and the haziness (which yields distance_max) of the most hazy
+      region of the image.
+      In the full pixelpipes without using HQ processing mode we only see the roi_in area and thus we
+      can't get reliable data.
+      Therefore, we try to get A0 and distance_max from the PREVIEW pixelpipe.
+  */
+  if(gui && fullpipes && !hq)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    const dt_hash_t hash = g->hash;
+    dt_iop_gui_leave_critical_section(self);
+    // Note that the case 'hash == DT_INVALID_HASH' on first invocation in a session
+    // implies that g->distance_max is NAN, which initiates special
+    // handling below to avoid inconsistent results.  In all other
+    // cases we make sure that the preview pipe has left us with
+    // proper readings for distance_max and A0.  If data are not yet
+    // there we need to wait (with timeout).
+    if(hash != DT_INVALID_HASH
+       && !dt_dev_sync_pixelpipe_hash(self->dev, piece->pipe,
+                                      self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL,
+                                      &self->gui_lock, &g->hash))
+    {
+      dt_control_log(_("inconsistent output"));
+    }
+
+    dt_iop_gui_enter_critical_section(self);
+    (*A0)[0] = g->A0[0];
+    (*A0)[1] = g->A0[1];
+    (*A0)[2] = g->A0[2];
+    *distance_max = g->distance_max;
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  // As we can't receive data from preview we at least leave a note to the user
+  if(dt_pipe_is_image(piece->pipe) && !hq)
+    dt_control_log(_("inconsistent output"));
+}
+
+// keeps the ambient light and maximal depth computed by the preview pipe,
+// or by the full pipe in HQ mode, for the other pipes
+static void _gpu_store_ambient(dt_iop_module_t *self,
+                               dt_dev_pixelpipe_iop_t *piece,
+                               const rgb_pixel A0,
+                               const float distance_max)
+{
+  dt_iop_hazeremoval_gui_data_t *const g = (dt_iop_hazeremoval_gui_data_t*)self->gui_data;
+  const gboolean gui = self->dev->gui_attached && g;
+  const gboolean fullhq = darktable.develop->late_scaling.enabled && dt_pipe_is_full(piece->pipe);
+  /*  max distance and A0 for ambient light are stored and kept for the opther pipes by the preview pipe.
+      If we run in HQ mode let's keep the fullpipe data too for slightly improved results.
+  */
+  const gboolean storing = gui && (dt_pipe_is_preview(piece->pipe) || fullhq);
+  if(storing)
+  {
+    dt_hash_t hash = dt_dev_hash_plus(self->dev, piece->pipe,
+                                      self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL);
+    dt_iop_gui_enter_critical_section(self);
+    g->A0[0] = A0[0];
+    g->A0[1] = A0[1];
+    g->A0[2] = A0[2];
+    g->distance_max = distance_max;
+    g->hash = hash;
+    dt_iop_gui_leave_critical_section(self);
+    if(distance_max <= 0.0f)
+      dt_control_log(_("haze removal could not calculate ambient light due to image content"));
+  }
+}
+// the float of a key from _sort_key() in hazeremoval.cl
+static float _key_to_float(const uint32_t key)
+{
+  const uint32_t u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+  float v;
+  memcpy(&v, &u, sizeof(v));
+  return v;
+}
+
+#endif
+
 #ifdef HAVE_OPENCL
 
 // calculate diffusive ambient light and the maximal depth in the image
@@ -795,14 +903,6 @@ error:
   return err;
 }
 
-
-static float _key_to_float(const uint32_t key)
-{
-  const uint32_t u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
-  float v;
-  memcpy(&v, &u, sizeof(v));
-  return v;
-}
 
 // work groups of up to 16x16 covering the image, for the kernels that
 // reduce in local memory; the local size is a power of two
@@ -1038,92 +1138,28 @@ int process_cl(dt_iop_module_t *self,
                const dt_iop_roi_t *const roi_in,
                const dt_iop_roi_t *const roi_out)
 {
-  dt_iop_hazeremoval_gui_data_t *const g = (dt_iop_hazeremoval_gui_data_t*)self->gui_data;
   dt_iop_hazeremoval_params_t *d = piece->data;
 
   const int devid = piece->pipe->devid;
   const int width = roi_in->width;
   const int height = roi_in->height;
-  const float wscale = d->adaptive ? CLIP((float)roi_in->scale / (float)piece->pipe->iscale) : 1.0f;
-  /*  To make the darkroom experience and data taken from preview pipe (not only internal but also pickers ...)
-      more consistent we modify the windowing sizes (positive integers) according to the pipe scaling.
-      w1: to determine the dark channel and the transition map
-      w2: for the guided filter
-  */
-  const int w1 = 2 + (int)ceilf(4.0f * wscale);
-  const int w2 = 3 + (int)ceilf(6.0f * wscale);
 
   // module parameters
   const float strength = d->strength; // strength of haze removal
   const float distance = d->distance; // maximal distance from camera to remove haze
   const float eps = sqrtf(0.025f);    // regularization parameter for guided filter
   const gboolean compatibility_mode = d->compatibility_mode;
-  const gboolean gui = self->dev->gui_attached && g;
-  const gboolean fullpipes = dt_pipe_is_canvas(piece->pipe);
-  const gboolean hq = darktable.develop->late_scaling.enabled;
-  const gboolean fullhq = hq && dt_pipe_is_full(piece->pipe);
-  /*  max distance and A0 for ambient light are stored and kept for the opther pipes by the preview pipe.
-      If we run in HQ mode let's keep the fullpipe data too for slightly improved results.
-  */
-  const gboolean storing = gui && (dt_pipe_is_preview(piece->pipe) || fullhq);
-  rgb_pixel A0 = { NAN, NAN, NAN, 0.0f };
-  float distance_max = NAN;
 
-  /*  hazeremoval module needs the color and the haziness (which yields distance_max) of the most hazy
-      region of the image.
-      In the full pixelpipes without using HQ processing mode we only see the roi_in area and thus we
-      can't get reliable data.
-      Therefore, we try to get A0 and distance_max from the PREVIEW pixelpipe.
-  */
-  if(gui && fullpipes && !hq)
-  {
-    dt_iop_gui_enter_critical_section(self);
-    const dt_hash_t hash = g->hash;
-    dt_iop_gui_leave_critical_section(self);
-    // Note that the case 'hash == DT_INVALID_HASH' on first invocation in a session
-    // implies that g->distance_max is NAN, which initiates special
-    // handling below to avoid inconsistent results.  In all other
-    // cases we make sure that the preview pipe has left us with
-    // proper readings for distance_max and A0.  If data are not yet
-    // there we need to wait (with timeout).
-    if(hash != DT_INVALID_HASH
-       && !dt_dev_sync_pixelpipe_hash(self->dev, piece->pipe,
-                                      self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL,
-                                      &self->gui_lock, &g->hash))
-    {
-      dt_control_log(_("inconsistent output"));
-    }
-
-    dt_iop_gui_enter_critical_section(self);
-    A0[0] = g->A0[0];
-    A0[1] = g->A0[1];
-    A0[2] = g->A0[2];
-    distance_max = g->distance_max;
-    dt_iop_gui_leave_critical_section(self);
-  }
-
-  // As we can't receive data from preview we at least leave a note to the user
-  if(dt_pipe_is_image(piece->pipe) && !hq)
-    dt_control_log(_("inconsistent output"));
+  int w1, w2;
+  rgb_pixel A0;
+  float distance_max;
+  _gpu_ambient_from_preview(self, piece, roi_in, &w1, &w2, &A0, &distance_max);
 
   // In all other cases we calculate distance_max and A0 here.
   if(dt_isnan(distance_max))
     distance_max = _ambient_light_cl(self, devid, img_in, w1, &A0, compatibility_mode);
 
-  if(storing)
-  {
-    dt_hash_t hash = dt_dev_hash_plus(self->dev, piece->pipe,
-                                      self->iop_order, DT_DEV_TRANSFORM_DIR_BACK_INCL);
-    dt_iop_gui_enter_critical_section(self);
-    g->A0[0] = A0[0];
-    g->A0[1] = A0[1];
-    g->A0[2] = A0[2];
-    g->distance_max = distance_max;
-    g->hash = hash;
-    dt_iop_gui_leave_critical_section(self);
-    if(distance_max <= 0.0f)
-      dt_control_log(_("haze removal could not calculate ambient light due to image content"));
-  }
+  _gpu_store_ambient(self, piece, A0, distance_max);
 
   cl_mem trans_map = NULL;
   cl_mem trans_map_filtered = NULL;
@@ -1165,6 +1201,199 @@ error:
   dt_opencl_release_mem_object(trans_map);
   dt_opencl_release_mem_object(trans_map_filtered);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// the row and column passes of a box minimum (max FALSE) or maximum, in place
+static int _box_slang(dt_slang_gpu_image_t *img, const int width, const int height, const int w,
+                      const gboolean max)
+{
+  dt_slang_gpu_image_t *temp = dt_slang_gpu_image_new(width, height, 1, NULL);
+  int err = !temp
+    || dt_slang_gpu_run_2d_args("hazeremoval", max ? "hazeremoval_box_max_x" : "hazeremoval_box_min_x",
+                                width, height, SLARG(width), SLARG(height), SLIMG_DEV(img), SLIMG_DEV(temp),
+                                SLARG(w))
+    || dt_slang_gpu_run_2d_args("hazeremoval", max ? "hazeremoval_box_max_y" : "hazeremoval_box_min_y",
+                                width, height, SLARG(width), SLARG(height), SLIMG_DEV(temp), SLIMG_DEV(img),
+                                SLARG(w));
+  dt_slang_gpu_image_free(temp);
+  return err;
+}
+
+// the quantile of the dark channel, or with brightness set of the summed
+// colors of the pixels whose dark channel is at least crit, as
+// _quantile_cl() finds it
+static gboolean _quantile_slang(dt_slang_gpu_image_t *dark,
+                                dt_slang_gpu_image_t *img,
+                                const int width,
+                                const int height,
+                                const int brightness,
+                                const float crit,
+                                const float quantile,
+                                float *value)
+{
+  dt_slang_gpu_buffer_t *hist = dt_slang_gpu_buffer_new(sizeof(uint32_t) * 4 * 256, NULL);
+  if(!hist) return FALSE;
+
+  uint32_t counts[4 * 256];
+  uint32_t prefix = 0, prefix_mask = 0;
+  size_t k = 0;
+  gboolean ok = TRUE;
+  for(int pass = 0; pass < 4 && ok; pass++)
+  {
+    const int shift = 24 - 8 * pass;
+    ok = !dt_slang_gpu_run_2d_args("hazeremoval", "hazeremoval_histogram", width, height,
+                                   SLARG(width), SLARG(height), SLIMG_DEV(dark), SLIMG_DEV(img),
+                                   SLARG(brightness), SLARG(crit), SLARG(prefix), SLARG(prefix_mask),
+                                   SLARG(shift), SLARG(pass), SLBUF_DEV(hist))
+      && !dt_slang_gpu_buffer_read(hist, counts, sizeof(uint32_t) * 256 * (pass + 1));
+    if(!ok) break;
+
+    const uint32_t *h = counts + 256 * pass;
+    if(pass == 0)
+    {
+      size_t total = 0;
+      for(int b = 0; b < 256; b++) total += h[b];
+      k = (size_t)(total * quantile);
+      if(k >= total)
+      {
+        ok = FALSE;
+        break;
+      }
+    }
+
+    int bin = 0;
+    while(bin < 255 && k >= h[bin])
+    {
+      k -= h[bin];
+      bin++;
+    }
+    prefix |= (uint32_t)bin << shift;
+    prefix_mask |= 0xffu << shift;
+  }
+  dt_slang_gpu_buffer_free(hist);
+  if(ok) *value = _key_to_float(prefix);
+  return ok;
+}
+
+// _ambient_light_cl() on the Slang device; NAN if it fails, so that the
+// caller falls back to the host
+static float _ambient_light_slang(dt_slang_gpu_image_t *img,
+                                  const int width,
+                                  const int height,
+                                  const int w1,
+                                  rgb_pixel *pA0)
+{
+  const float dark_channel_quantil = 0.95f;
+  const float bright_quantil = 0.95f;
+  const size_t groups = (size_t)((width + 15) / 16) * ((height + 15) / 16);
+
+  dt_slang_gpu_image_t *dark = dt_slang_gpu_image_new(width, height, 1, NULL);
+  dt_slang_gpu_buffer_t *accu = dt_slang_gpu_buffer_new_uninit(4 * sizeof(float) * groups);
+  float *sums = dt_alloc_align_float(4 * groups);
+  float crit_haze_level = 0.0f, crit_brightness = 0.0f;
+  gboolean ok = dark && accu && sums
+    && !dt_slang_gpu_run_2d_args("hazeremoval", "hazeremoval_dark_channel", width, height,
+                                 SLARG(width), SLARG(height), SLIMG_DEV(img), SLIMG_DEV(dark))
+    && !_box_slang(dark, width, height, w1, FALSE)
+    && _quantile_slang(dark, img, width, height, 0, 0.0f, dark_channel_quantil, &crit_haze_level)
+    && _quantile_slang(dark, img, width, height, 1, crit_haze_level, bright_quantil, &crit_brightness)
+    && !dt_slang_gpu_run_2d_args("hazeremoval", "hazeremoval_ambient_sums", width, height,
+                                 SLARG(width), SLARG(height), SLIMG_DEV(dark), SLIMG_DEV(img),
+                                 SLARG(crit_haze_level), SLARG(crit_brightness), SLBUF_DEV(accu))
+    && !dt_slang_gpu_buffer_read(accu, sums, 4 * sizeof(float) * groups);
+
+  float distance_max = NAN;
+  if(ok)
+  {
+    double A0[4] = { 0.0, 0.0, 0.0, 0.0 };
+    for(size_t g = 0; g < groups; g++)
+      for(int c = 0; c < 4; c++) A0[c] += sums[4 * g + c];
+    if(A0[3] > 0.0)
+      for(int c = 0; c < 3; c++) A0[c] /= A0[3];
+    (*pA0)[0] = A0[0];
+    (*pA0)[1] = A0[1];
+    (*pA0)[2] = A0[2];
+    distance_max = crit_haze_level > 0 ? -1.125f * logf(crit_haze_level) : logf(FLT_MAX) / 2;
+  }
+
+  dt_free_align(sums);
+  dt_slang_gpu_buffer_free(accu);
+  dt_slang_gpu_image_free(dark);
+  return distance_max;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_hazeremoval_params_t *d = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // module parameters
+  const float strength = d->strength; // strength of haze removal
+  const float distance = d->distance; // maximal distance from camera to remove haze
+  const float eps = sqrtf(0.025f);    // regularization parameter for guided filter
+  const gboolean compatibility_mode = d->compatibility_mode;
+
+  int w1, w2;
+  rgb_pixel A0;
+  float distance_max;
+  _gpu_ambient_from_preview(self, piece, roi_in, &w1, &w2, &A0, &distance_max);
+
+  // In all other cases we calculate distance_max and A0 here, on the device
+  // as process_cl() does, or for the compatibility mode on the host
+  if(dt_isnan(distance_max) && !compatibility_mode)
+    distance_max = _ambient_light_slang(dev_in, width, height, w1, &A0);
+  if(dt_isnan(distance_max))
+  {
+    float *in = dt_alloc_align_float((size_t)4 * width * height);
+    if(!in || dt_slang_gpu_image_read(dev_in, in))
+    {
+      dt_free_align(in);
+      return FALSE;
+    }
+    const const_rgb_image img_in = (const_rgb_image){ in, width, height, 4 };
+    distance_max = _ambient_light(img_in, w1, &A0, compatibility_mode);
+    dt_free_align(in);
+  }
+
+  _gpu_store_ambient(self, piece, A0, distance_max);
+
+  dt_slang_gpu_image_t *trans_map = dt_slang_gpu_image_new(width, height, 1, NULL);
+  dt_slang_gpu_image_t *trans_map_filtered = dt_slang_gpu_image_new(width, height, 1, NULL);
+  int err = !trans_map || !trans_map_filtered;
+
+  // calculate the transition map, then refine it
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("hazeremoval", "hazeremoval_transision_map", width, height,
+                                   SLARG(width), SLARG(height), SLIMG_DEV(dev_in), SLIMG_DEV(trans_map),
+                                   SLARG(strength), SLARG(A0[0]), SLARG(A0[1]), SLARG(A0[2]))
+          || _box_slang(trans_map, width, height, w1, TRUE)
+          || _box_slang(trans_map, width, height, w1, FALSE);
+
+  // apply guided filter with no clipping
+  if(!err)
+    err = guided_filter_slang(dev_in, trans_map, trans_map_filtered, width, height, w2, eps, 1.f,
+                              -FLT_MAX, FLT_MAX);
+
+  // finally, calculate the haze-free image
+  const float t_min = CLAMP(expf(-distance * distance_max), 1.0f / 1024.0f, 1.0f);
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("hazeremoval", "hazeremoval_dehaze", width, height,
+                                   SLARG(width), SLARG(height), SLIMG_DEV(dev_in),
+                                   SLIMG_DEV(trans_map_filtered), SLIMG_DEV(dev_out), SLARG(t_min),
+                                   SLARG(A0));
+
+  dt_slang_gpu_image_free(trans_map);
+  dt_slang_gpu_image_free(trans_map_filtered);
+  return !err;
 }
 #endif
 

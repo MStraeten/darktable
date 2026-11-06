@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/colorspaces_inline_conversions.h"
 #include "common/iop_profile.h"
+#include "common/slang_gpu.h"
 #include "common/opencl.h"
 #include "develop/format.h"
 #include "develop/imageop.h"
@@ -721,6 +722,122 @@ gboolean dt_color_picker_helper_cl(const int devid,
 
   dt_free_align(stats);
   return err == CL_SUCCESS;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean dt_color_picker_helper_slang(const dt_iop_buffer_dsc_t *dsc,
+                                      struct dt_slang_gpu_image_t *img,
+                                      const dt_iop_roi_t *roi,
+                                      const int *const box,
+                                      const gboolean denoise,
+                                      lib_colorpicker_stats pick,
+                                      const dt_iop_colorspace_type_t image_cst,
+                                      const dt_iop_colorspace_type_t picker_cst,
+                                      const dt_iop_order_iccprofile_info_t *const profile)
+{
+  dt_times_t start_time = { 0 };
+  dt_get_perf_times(&start_time);
+
+  const gboolean mosaic = dsc->channels == 1u && dsc->filters != 0u;
+  int mode = 0;
+  if(dsc->channels == 4u)
+  {
+    const dt_iop_colorspace_type_t effective_cst =
+      image_cst == IOP_CS_RAW ? IOP_CS_RGB : image_cst;
+    if(effective_cst == IOP_CS_LAB && picker_cst == IOP_CS_LCH)
+      mode = 1;
+    else if(effective_cst == IOP_CS_RGB && picker_cst == IOP_CS_HSL)
+      mode = 2;
+    else if(effective_cst == IOP_CS_RGB && picker_cst == IOP_CS_JZCZHZ)
+    {
+      // a profile without a matrix needs LittleCMS
+      if(profile && !dt_is_valid_colormatrix(profile->matrix_in[0][0])) return FALSE;
+      mode = 3;
+    }
+    // the CPU code reports any other conversion
+    else if(effective_cst != picker_cst && picker_cst != IOP_CS_NONE)
+      return FALSE;
+  }
+  else if(!mosaic)
+    return FALSE;
+
+  // about 4096 tiles, so that the device has enough work items and the
+  // statistics read back stay small
+  const int bw = box[2] - box[0];
+  const int bh = box[3] - box[1];
+  const int side = MAX(1, (int)ceil(sqrt((double)bw * bh / 4096.0)));
+  const int tile[2] = { MIN(side, bw), MIN(side, bh) };
+  const int tiles[2] = { (bw + tile[0] - 1) / tile[0], (bh + tile[1] - 1) / tile[1] };
+  const size_t n = (size_t)tiles[0] * tiles[1];
+  const int ibox[4] = { box[0], box[1], box[2], box[3] };
+
+  dt_slang_gpu_buffer_t *dev_stats = dt_slang_gpu_buffer_new_uninit(n * 16 * sizeof(float));
+  float *stats = dt_alloc_align_float(n * 16);
+  int err = !dev_stats || !stats;
+  if(!err && mosaic)
+  {
+    int xtrans[36];
+    for(int k = 0; k < 36; k++) xtrans[k] = dsc->xtrans[k / 6][k % 6];
+    const int offset[2] = { roi->x, roi->y };
+    const uint32_t filters = dsc->filters;
+    err = dt_slang_gpu_run_2d_args("color_picker", "color_picker_stats_mosaic", tiles[0], tiles[1],
+                                   SLIMG_DEV(img), SLBUF_DEV(dev_stats), SLARG(ibox), SLARG(tile),
+                                   SLARG(tiles), SLARG(offset), SLARG(filters),
+                                   SLBUF(xtrans, sizeof(xtrans)));
+  }
+  else if(!err)
+  {
+    dt_colorspaces_iccprofile_info_slang_t info;
+    int lut_w = 0, lut_h = 0;
+    float *lut = dt_ioppr_build_iccprofile_params_slang(mode == 3 ? profile : NULL, &info, &lut_w, &lut_h);
+    // without a profile the pixels are taken as XYZ D50, as in rgb_to_JzCzhz()
+    if(mode == 3 && !profile)
+      for(int k = 0; k < 9; k++) info.matrix_in[k] = k % 4 == 0 ? 1.0f : 0.0f;
+    const int width = roi->width;
+    const int height = roi->height;
+    const int dn = denoise ? 1 : 0;
+    err = !lut
+      || dt_slang_gpu_run_2d_args("color_picker", "color_picker_stats_4ch", tiles[0], tiles[1],
+                                  SLIMG_DEV(img), SLBUF_DEV(dev_stats), SLARG(width), SLARG(height),
+                                  SLARG(ibox), SLARG(tile), SLARG(tiles), SLARG(mode), SLARG(dn),
+                                  SLBUF(&info, sizeof(info)), SLIMG_IN(lut, lut_w, lut_h, 1));
+    free(lut);
+  }
+  err = err || dt_slang_gpu_buffer_read(dev_stats, stats, n * 16 * sizeof(float));
+  dt_slang_gpu_buffer_free(dev_stats);
+
+  if(!err)
+  {
+    double sum[4] = { 0.0 };
+    double count[4] = { 0.0 };
+    for_four_channels(c)
+    {
+      pick[DT_PICK_MIN][c] = FLT_MAX;
+      pick[DT_PICK_MAX][c] = -FLT_MAX;
+    }
+    for(size_t i = 0; i < n; i++)
+      for_four_channels(c)
+      {
+        const float *const s = stats + 16 * i;
+        sum[c] += s[c];
+        pick[DT_PICK_MIN][c] = MIN(pick[DT_PICK_MIN][c], s[4 + c]);
+        pick[DT_PICK_MAX][c] = MAX(pick[DT_PICK_MAX][c], s[8 + c]);
+        count[c] += s[12 + c];
+      }
+    // a mosaic averages each color over its own pixels
+    for_four_channels(c)
+      pick[DT_PICK_MEAN][c] = mosaic ? (count[c] > 0.0 ? sum[c] / count[c] : 0.0f)
+                                     : sum[c] / ((double)bw * bh);
+
+    dt_print(DT_DEBUG_PERF,
+             "dt_color_picker_helper_slang stats reading %u channels (filters %u) cst %d -> %d "
+             "size %d denoised %d took %.3f secs",
+             dsc->channels, dsc->filters, image_cst, picker_cst, bw * bh, denoise,
+             dt_get_lap_time(&start_time.clock));
+  }
+  dt_free_align(stats);
+  return !err;
 }
 #endif
 

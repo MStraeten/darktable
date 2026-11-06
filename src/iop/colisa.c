@@ -19,6 +19,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/debug.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -146,6 +147,28 @@ error:
   dt_opencl_release_mem_object(dev_ccoeffs);
   dt_opencl_release_mem_object(dev_cm);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colisa_data_t *d = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  return !dt_slang_gpu_run_2d_args("basic", "colisa", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(d->saturation), SLIMG_IN(d->ctable, 256, 256, 1),
+                                   SLBUF(d->cunbounded_coeffs, sizeof(float) * 3),
+                                   SLIMG_IN(d->ltable, 256, 256, 1),
+                                   SLBUF(d->lunbounded_coeffs, sizeof(float) * 3));
 }
 #endif
 

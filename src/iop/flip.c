@@ -26,6 +26,7 @@
 #include "common/debug.h"
 #include "common/image.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -296,6 +297,19 @@ void distort_mask(dt_iop_module_t *self,
                           roi_in->width, roi_in->height, stride, d->orientation);
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  // the flip kernel of process_slang() reads and writes one channel as well
+  return process_slang(self, piece, dev_in, dev_out, roi_in, roi_out);
+}
+#endif
+
 void modify_roi_out(dt_iop_module_t *self,
                     dt_dev_pixelpipe_iop_t *piece,
                     dt_iop_roi_t *roi_out,
@@ -368,6 +382,26 @@ void process(dt_iop_module_t *self,
                           roi_in->width, roi_in->height,
                           stride, d->orientation);
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_flip_data_t *data = piece->data;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+  const int orientation = data->orientation;
+  return !dt_slang_gpu_run_2d_args("basic", "flip", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(owidth), SLARG(oheight),
+    SLARG(orientation));
+}
+#endif
 
 #ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self,

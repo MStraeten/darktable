@@ -24,6 +24,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/tea.h"
 #include "control/control.h"
 #include "develop/blend.h"
@@ -849,20 +850,23 @@ void process(dt_iop_module_t *self,
 }
 
 
-#ifdef HAVE_OPENCL
-int process_cl(dt_iop_module_t *self,
-               dt_dev_pixelpipe_iop_t *piece,
-               cl_mem dev_in, cl_mem dev_out,
-               const dt_iop_roi_t *const roi_in,
-               const dt_iop_roi_t *const roi_out)
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
+// the arguments of the GPU kernels, in their order after width and height
+typedef struct _vignette_gpu_params_t
 {
-  dt_iop_vignette_data_t *data = piece->data;
-  dt_iop_vignette_global_data_t *gd = self->global_data;
+  float scale[2];
+  float roi_center_scaled[2];
+  float expt[2];
+  float dscale, fscale, brightness, saturation, dither;
+  int unbound;
+} _vignette_gpu_params_t;
 
-  const int devid = piece->pipe->devid;
-  const int width = roi_out->width;
-  const int height = roi_out->height;
-
+static void _vignette_gpu_params(const dt_iop_vignette_data_t *data,
+                                 const dt_dev_pixelpipe_iop_t *piece,
+                                 const dt_iop_roi_t *const roi_in,
+                                 const dt_iop_roi_t *const roi_out,
+                                 _vignette_gpu_params_t *p)
+{
   const dt_iop_roi_t *buf_in = &piece->buf_in;
 
   /* Center coordinates of buf_in, these should not consider buf_in->{x,y}! */
@@ -927,24 +931,71 @@ int process_cl(dt_iop_module_t *self,
       dither = 0.0f;
   }
 
-  float scale[2] = { xscale, yscale };
-  float roi_center_scaled_f[2] = { roi_center_scaled.x, roi_center_scaled.y };
-  float expt[2] = { exp1, exp2 };
-  const float brightness = data->brightness;
-  const float saturation = data->saturation;
-  const int unbound = data->unbound;
+  p->scale[0] = xscale;
+  p->scale[1] = yscale;
+  p->roi_center_scaled[0] = roi_center_scaled.x;
+  p->roi_center_scaled[1] = roi_center_scaled.y;
+  p->expt[0] = exp1;
+  p->expt[1] = exp2;
+  p->dscale = dscale;
+  p->fscale = fscale;
+  p->brightness = data->brightness;
+  p->saturation = data->saturation;
+  p->dither = dither;
+  p->unbound = data->unbound;
+}
+#endif
+
+#ifdef HAVE_OPENCL
+int process_cl(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               cl_mem dev_in, cl_mem dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_vignette_data_t *data = piece->data;
+  dt_iop_vignette_global_data_t *gd = self->global_data;
+
+  const int devid = piece->pipe->devid;
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  _vignette_gpu_params_t p;
+  _vignette_gpu_params(data, piece, roi_in, roi_out, &p);
 
   return dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_vignette, width, height,
                                           CLARG(dev_in), CLARG(dev_out),
                                           CLARG(width), CLARG(height),
-                                          CLARG(scale),
-                                          CLARG(roi_center_scaled_f),
-                                          CLARG(expt),
-                                          CLARG(dscale), CLARG(fscale),
-                                          CLARG(brightness),
-                                          CLARG(saturation),
-                                          CLARG(dither),
-    CLARG(unbound));
+                                          CLARG(p.scale),
+                                          CLARG(p.roi_center_scaled),
+                                          CLARG(p.expt),
+                                          CLARG(p.dscale), CLARG(p.fscale),
+                                          CLARG(p.brightness),
+                                          CLARG(p.saturation),
+                                          CLARG(p.dither),
+    CLARG(p.unbound));
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  _vignette_gpu_params_t p;
+  _vignette_gpu_params(piece->data, piece, roi_in, roi_out, &p);
+
+  return !dt_slang_gpu_run_2d_args("extended", "vignette", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(p.scale), SLARG(p.roi_center_scaled), SLARG(p.expt),
+                                   SLARG(p.dscale), SLARG(p.fscale), SLARG(p.brightness),
+                                   SLARG(p.saturation), SLARG(p.dither), SLARG(p.unbound));
 }
 #endif
 

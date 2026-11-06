@@ -22,6 +22,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/imagebuf.h"
 #include "common/math.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "dtgtk/drawingarea.h"
@@ -643,6 +644,29 @@ error:
   dt_opencl_release_mem_object(dev_a);
   dt_opencl_release_mem_object(dev_b);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorzones_data_t *d = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const int channel = d->channel;
+
+  return !dt_slang_gpu_run_2d_args("basic",
+                                   d->mode == DT_IOP_COLORZONES_MODE_SMOOTH ? "colorzones_v3" : "colorzones",
+                                   width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(channel), SLIMG_IN(d->lut[0], 256, 256, 1),
+                                   SLIMG_IN(d->lut[1], 256, 256, 1), SLIMG_IN(d->lut[2], 256, 256, 1));
 }
 #endif
 

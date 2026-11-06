@@ -21,7 +21,21 @@
 #include "develop/pixelpipe.h"
 #include "libs/lib.h"
 #include "libs/colorpicker.h"
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+#endif
 #include <stdlib.h>
+
+// a cacheline may be the memory of a Slang device image that a queued
+// kernel still uses, see dt_slang_gpu_image_alias()
+static inline void _free_line(void *mem)
+{
+#ifdef HAVE_SLANG_GPU
+  dt_slang_gpu_free_align(mem);
+#else
+  dt_free_align(mem);
+#endif
+}
 
 gboolean dt_dev_pixelpipe_cache_init(dt_dev_pixelpipe_t *pipe,
                                      const int entries,
@@ -67,7 +81,7 @@ gboolean dt_dev_pixelpipe_cache_init(dt_dev_pixelpipe_t *pipe,
   // but will only fail to generate thumbnails for example.
   for(int k = 0; k < cache->entries; k++)
   {
-    dt_free_align(cache->data[k]);
+    _free_line(cache->data[k]);
     cache->size[k] = 0;
     cache->data[k] = NULL;
   }
@@ -89,7 +103,7 @@ void dt_dev_pixelpipe_cache_cleanup(dt_dev_pixelpipe_t *pipe)
 
   for(int k = 0; k < cache->entries; k++)
   {
-    dt_free_align(cache->data[k]);
+    _free_line(cache->data[k]);
     cache->data[k] = NULL;
   }
   free(cache->data);
@@ -328,7 +342,7 @@ gboolean dt_dev_pixelpipe_cache_get(dt_dev_pixelpipe_t *pipe,
   if(((cache->entries == DT_PIPECACHE_MIN) && (cache->size[cline] < size))
      || ((cache->entries > DT_PIPECACHE_MIN) && (cache->size[cline] != size)))
   {
-    dt_free_align(cache->data[cline]);
+    _free_line(cache->data[cline]);
     cache->allmem -= cache->size[cline];
     cache->data[cline] = (void *)dt_alloc_aligned(size);
     if(cache->data[cline])
@@ -434,7 +448,7 @@ static size_t _free_cacheline(dt_dev_pixelpipe_cache_t *cache, const int k)
 {
   const size_t removed = cache->size[k];
 
-  dt_free_align(cache->data[k]);
+  _free_line(cache->data[k]);
   cache->allmem -= removed;
   cache->size[k] = 0;
   cache->data[k] = NULL;

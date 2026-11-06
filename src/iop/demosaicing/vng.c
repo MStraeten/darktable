@@ -328,49 +328,29 @@ finish:
   }
 }
 
-#ifdef HAVE_OPENCL
-static cl_int process_vng_cl(const dt_iop_module_t *self,
-                             const dt_dev_pixelpipe_iop_t *piece,
-                             cl_mem dev_in,
-                             cl_mem dev_out,
-                             cl_mem dev_xtrans,
-                             const uint8_t (*const xtrans)[6],
-                             const int width,
-                             const int height,
-                             const uint32_t filters,
-                             const int border,
-                             const gboolean only_vng_linear)
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
+// the lookup table of the linear interpolation and, unless only_vng_linear,
+// the byte code of the gradients that the GPU kernels walk. Returns the
+// lookup table, or NULL; the caller frees it and *ips_out
+static int32_t (*_vng_gpu_tables(const uint32_t filters4,
+                                 const uint8_t (*const xtrans)[6],
+                                 const gboolean only_vng_linear,
+                                 int **ips_out,
+                                 size_t *ips_size_out,
+                                 int code[16][16]))[16][32]
 {
-  const dt_iop_demosaic_global_data_t *gd = self->global_data;
-  const gboolean is_xtrans = (filters == 9u);
-
-  // separate out G1 and G2 in Bayer patterns
-  uint32_t filters4;
-  if(is_xtrans)
-    filters4 = filters;
-  else if((filters & 3) == 1)
-    filters4 = filters | 0x03030303u;
-  else
-    filters4 = filters | 0x0c0c0c0cu;
-
+  const gboolean is_xtrans = (filters4 == 9u);
   const int lsize = is_xtrans ? 6 : 16;
   const int colors = is_xtrans ? 3 : 4;
   const int prow = is_xtrans ? 6 : 8;
   const int pcol = is_xtrans ? 6 : 2;
-  const int devid = piece->pipe->devid;
-
   int *ips = NULL;
-
-  cl_mem dev_tmp = NULL;
-  cl_mem dev_lookup = NULL;
-  cl_mem dev_code = NULL;
-  cl_mem dev_ips = NULL;
-  cl_mem tmp_out = NULL;
-  cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+  *ips_out = NULL;
+  *ips_size_out = 0;
 
   const size_t lookup_size = (size_t)16 * 16 * 32 * sizeof(int32_t);
   int32_t(*lookup)[16][32] = malloc(lookup_size);
-  if(!lookup) goto finish;
+  if(!lookup) return NULL;
   // build interpolation lookup table for linear interpolation which for a given offset in the sensor
   // lists neighboring pixels from which to interpolate:
   for(int row = 0; row < lsize; row++)
@@ -411,9 +391,13 @@ static cl_int process_vng_cl(const dt_iop_module_t *self,
   {
     const size_t ips_size = (size_t)prow * pcol * 352 * sizeof(int);
     ips = malloc(ips_size);
+    if(!ips)
+    {
+      free(lookup);
+      return NULL;
+    }
 
     int *ip = ips;
-    int code[16][16];
 
     for(int row = 0; row < prow; row++)
     {
@@ -463,6 +447,57 @@ static cl_int process_vng_cl(const dt_iop_module_t *self,
       }
     }
 
+    *ips_out = ips;
+    *ips_size_out = ips_size;
+  }
+  return lookup;
+}
+#endif
+
+#ifdef HAVE_OPENCL
+static cl_int process_vng_cl(const dt_iop_module_t *self,
+                             const dt_dev_pixelpipe_iop_t *piece,
+                             cl_mem dev_in,
+                             cl_mem dev_out,
+                             cl_mem dev_xtrans,
+                             const uint8_t (*const xtrans)[6],
+                             const int width,
+                             const int height,
+                             const uint32_t filters,
+                             const int border,
+                             const gboolean only_vng_linear)
+{
+  const dt_iop_demosaic_global_data_t *gd = self->global_data;
+  const gboolean is_xtrans = (filters == 9u);
+
+  // separate out G1 and G2 in Bayer patterns
+  uint32_t filters4;
+  if(is_xtrans)
+    filters4 = filters;
+  else if((filters & 3) == 1)
+    filters4 = filters | 0x03030303u;
+  else
+    filters4 = filters | 0x0c0c0c0cu;
+
+  const int devid = piece->pipe->devid;
+
+  int *ips = NULL;
+
+  cl_mem dev_tmp = NULL;
+  cl_mem dev_lookup = NULL;
+  cl_mem dev_code = NULL;
+  cl_mem dev_ips = NULL;
+  cl_mem tmp_out = NULL;
+  cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+
+  const size_t lookup_size = (size_t)16 * 16 * 32 * sizeof(int32_t);
+  int code[16][16];
+  size_t ips_size = 0;
+  int32_t(*lookup)[16][32] = _vng_gpu_tables(filters4, xtrans, only_vng_linear, &ips, &ips_size, code);
+  if(!lookup) goto finish;
+
+  if(!only_vng_linear)
+  {
     dev_code = dt_opencl_copy_host_to_device_constant(devid, sizeof(code), code);
     dev_ips = dt_opencl_copy_host_to_device_constant(devid, ips_size, ips);
     if(!dev_ips || !dev_code) goto finish;
@@ -533,6 +568,56 @@ finish:
   return err;
 }
 
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// VNG as in process_vng_cl(), for Bayer and X-Trans data. Returns TRUE on
+// success
+static gboolean process_vng_slang(dt_slang_gpu_image_t *dev_in,
+                                  dt_slang_gpu_image_t *dev_out,
+                                  const uint8_t (*const xtrans)[6],
+                                  const int width,
+                                  const int height,
+                                  const uint32_t filters,
+                                  const int border,
+                                  const gboolean only_vng_linear)
+{
+  const gboolean is_xtrans = (filters == 9u);
+
+  // separate out G1 and G2 in Bayer patterns
+  uint32_t filters4;
+  if(is_xtrans)
+    filters4 = filters;
+  else if((filters & 3) == 1)
+    filters4 = filters | 0x03030303u;
+  else
+    filters4 = filters | 0x0c0c0c0cu;
+
+  int *ips = NULL;
+  size_t ips_size = 0;
+  int code[16][16];
+  int32_t(*lookup)[16][32] = _vng_gpu_tables(filters4, xtrans, only_vng_linear, &ips, &ips_size, code);
+  dt_slang_gpu_image_t *dev_tmp = only_vng_linear || !lookup ? NULL : dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *tmp_out = only_vng_linear ? dev_out : dev_tmp;
+  const int only_linear = only_vng_linear;
+  const size_t lookup_size = (size_t)16 * 16 * 32 * sizeof(int32_t);
+
+  gboolean ok = lookup && tmp_out
+    && !dt_slang_gpu_run_2d_args("demosaic_vng", "vng_lin_interpolate", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(tmp_out), SLARG(width), SLARG(height),
+                                 SLARG(border), SLARG(filters4), SLBUF(xtrans, 36), SLBUF(lookup, lookup_size),
+                                 SLARG(only_linear));
+  if(ok && !only_vng_linear)
+    ok = !dt_slang_gpu_run_2d_args("demosaic_vng", "vng_interpolate", width, height,
+                                   SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(filters4), SLBUF(xtrans, 36), SLBUF(ips, ips_size),
+                                   SLBUF(code, sizeof(code)));
+
+  dt_slang_gpu_image_free(dev_tmp);
+  free(lookup);
+  free(ips);
+  return ok;
+}
 #endif
 
 // clang-format off

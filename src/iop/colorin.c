@@ -25,6 +25,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/image_cache.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/utility.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -985,6 +986,67 @@ error:
   dt_opencl_release_mem_object(dev_corr);
   dt_opencl_release_mem_object(dev_hsm);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorin_data_t *d = piece->data;
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // a Lab input profile is a plain copy
+  if(d->type == DT_COLORSPACE_LAB)
+  {
+    const int zero = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+      SLARG(zero), SLARG(zero));
+  }
+
+  const dt_dev_wb_t *wb = &pipe->wb;
+  const gboolean corrected = wb->late_correction;
+  dt_aligned_pixel_t coeffs;
+  dt_dev_wb_get_rgb_correction(wb, corrected, coeffs);
+
+  float cmat[9], lmat[9];
+  pack_3xSSE_to_3x3(d->nrgb ? d->nmatrix : d->cmatrix, cmat);
+  pack_3xSSE_to_3x3(d->lmatrix, lmat);
+
+  const gboolean blue_mapping = d->blue_mapping
+                           && dt_image_is_matrix_correction_supported(&pipe->image);
+  const float scale = dt_iop_get_processed_maximum(piece);
+  const int use_hsm = d->hsm != NULL;
+  float dummy_hsm = 0.0f;
+  const size_t len = use_hsm ? (size_t)d->hue_div * d->sat_div * d->val_div * 3 : 1;
+
+  const int err = dt_slang_gpu_run_2d_args("basic", d->nrgb ? "colorin_clipping" : "colorin_unbound",
+    width, height, SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLBUF(cmat, sizeof(cmat)), SLBUF(lmat, sizeof(lmat)),
+    SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1), SLIMG_IN(d->lut[2], 256, 256, 1),
+    SLARG(blue_mapping), SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)),
+    SLBUF(coeffs, sizeof(float) * 4), SLARG(scale), SLARG(d->hue_div), SLARG(d->sat_div),
+    SLARG(d->val_div), SLBUF(use_hsm ? d->hsm : &dummy_hsm, sizeof(float) * len),
+    SLARG(d->hsm_encode), SLARG(use_hsm), SLARG(d->hdr_transfer));
+  if(err) return FALSE;
+
+  // only once the kernel ran: on failure the CPU path does this again
+  if(corrected)
+  {
+    for_four_channels(k)
+    {
+      pipe->dsc.temperature.coeffs[k] = wb->D65coeffs[k];
+      pipe->dsc.processed_maximum[k] *= coeffs[k];
+    }
+  }
+  return TRUE;
 }
 #endif
 

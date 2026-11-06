@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -213,6 +214,31 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 finish:
   dt_opencl_release_mem_object(dev_m);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_lowlight_data_t *d = piece->data;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  // scotopic white, blue saturated
+  dt_aligned_pixel_t Lab_sw = { 100.0f, 0.0f, -d->blueness };
+  dt_aligned_pixel_t XYZ_sw;
+
+  dt_Lab_to_XYZ(Lab_sw, XYZ_sw);
+
+  return !dt_slang_gpu_run_2d_args("basic", "lowlight", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(XYZ_sw), SLIMG_IN(d->lut, 256, 256, 1));
 }
 #endif
 

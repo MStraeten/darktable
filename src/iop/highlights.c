@@ -27,6 +27,7 @@
 #include "common/box_filters.h"
 #include "common/bspline.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/imagebuf.h"
 #include "common/fast_guided_filter.h"
 #include "common/distance_transform.h"
@@ -367,6 +368,23 @@ void distort_mask(dt_iop_module_t *self,
   else
     dt_iop_copy_image_roi(out, in, 1, roi_in, roi_out);
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  if(roi_out->scale != roi_in->scale)
+  {
+    const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+    return !dt_interpolation_resample_roi_mask_slang(itor, dev_out, roi_out, dev_in, roi_in);
+  }
+  return !dt_iop_copy_image_roi_slang(dev_out, dev_in, roi_in, roi_out);
+}
+#endif
 
 void modify_roi_out(dt_iop_module_t *self,
                     dt_dev_pixelpipe_iop_t *piece,
@@ -745,6 +763,178 @@ int process_cl(dt_iop_module_t *self,
   dt_opencl_release_mem_object(dev_xtrans);
   dt_opencl_release_mem_object(dev_tmp);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// the opposed, clip and LCh methods on raw data and clipping on demosaiced
+// data, the clipped false color view and the passthrough, as in process_cl()
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+  dt_iop_highlights_data_t *d = piece->data;
+  dt_iop_highlights_gui_data_t *g = self->gui_data;
+  const uint32_t filters = piece->filters;
+  const dt_iop_highlights_mode_t dmode = d->mode;
+  const int dx = roi_out->x - roi_in->x;
+  const int dy = roi_out->y - roi_in->y;
+
+  if(pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU)
+  {
+    // the demosaiced case needs dt_iop_clip_and_zoom_roi()
+    if(!filters) return FALSE;
+    const int width = roi_out->width;
+    const int height = roi_out->height;
+    const int iwidth = roi_in->width;
+    const int iheight = roi_in->height;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(dx), SLARG(dy));
+  }
+
+  if((filters && dmode != DT_IOP_HIGHLIGHTS_OPPOSED && dmode != DT_IOP_HIGHLIGHTS_CLIP
+      && dmode != DT_IOP_HIGHLIGHTS_LCH && dmode != DT_IOP_HIGHLIGHTS_LAPLACIAN)
+     || (!filters && dmode != DT_IOP_HIGHLIGHTS_CLIP && dmode != DT_IOP_HIGHLIGHTS_OPPOSED)
+     || (dmode == DT_IOP_HIGHLIGHTS_LAPLACIAN && filters == 9u)
+     // process_lch_bayer() reads its input with the output's size
+     || (dmode == DT_IOP_HIGHLIGHTS_LCH
+         && (roi_in->width != roi_out->width || roi_in->height != roi_out->height)))
+    return FALSE;
+
+  const float clipper = d->clip * highlights_clip_magics[dmode];
+
+  // set only on success, so that a fallback to process() is not a passthrough
+  gboolean passthru = FALSE;
+  if(self->dev->gui_attached && g && dt_pipe_is_full(pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    const dt_highlights_mask_t g_hlr_mask_mode = g->hlr_mask_mode;
+    dt_iop_gui_leave_critical_section(self);
+
+    if(g_hlr_mask_mode != DT_HIGHLIGHTS_MASK_OFF)
+    {
+      // commit_params() keeps demosaiced data off the GPU here
+      if(g_hlr_mask_mode == DT_HIGHLIGHTS_MASK_CLIPPED && !filters) return FALSE;
+
+      passthru = TRUE;
+      if(g_hlr_mask_mode == DT_HIGHLIGHTS_MASK_CLIPPED)
+      {
+        const float *c = pipe->dsc.temperature.coeffs;
+        const dt_aligned_pixel_t clips = { clipper * (c[RED]   <= 0.0f ? 1.0f : c[RED]),
+                                           clipper * (c[GREEN] <= 0.0f ? 1.0f : c[GREEN]),
+                                           clipper * (c[BLUE]  <= 0.0f ? 1.0f : c[BLUE]),
+                                           clipper * (c[GREEN] <= 0.0f ? 1.0f : c[GREEN]) };
+        const gboolean ok =
+          !dt_slang_gpu_run_2d_args("basic", "highlights_false_color", roi_out->width, roi_out->height,
+                                    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                    SLARG(roi_out->width), SLARG(roi_out->height),
+                                    SLARG(roi_in->width), SLARG(roi_in->height),
+                                    SLARG(dx), SLARG(dy),
+                                    SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)),
+                                    SLARG(clips));
+        if(!ok) return FALSE;
+        pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+        dt_iop_piece_clear_raster(piece, NULL);
+        return TRUE;
+      }
+    }
+  }
+
+  gboolean ok;
+  if(!filters && dmode == DT_IOP_HIGHLIGHTS_OPPOSED)
+  {
+    // linear raws, as process(): opposed on roi_in, then scaled to roi_out
+    dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(roi_in->width, roi_in->height, 4, NULL);
+    dt_iop_roi_t iroi = *roi_in, oroi = *roi_out;
+    iroi.x = iroi.y = oroi.x = oroi.y = 0;
+    const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+    ok = tmp
+      && _process_linear_opposed_slang(self, piece, dev_in, tmp, roi_in)
+      && !dt_interpolation_resample_slang(itor, dev_out, &oroi, tmp, &iroi);
+    dt_slang_gpu_image_free(tmp);
+  }
+  else if(!filters)
+  {
+    const int width = roi_out->width;
+    const int height = roi_out->height;
+    ok = !dt_slang_gpu_run_2d_args("basic", "highlights_4f_clip", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(clipper));
+    if(ok)
+    {
+      // process() takes the minimum here, process_cl() the maximum
+      const float m = dt_iop_get_processed_minimum(piece);
+      for_three_channels(k) pipe->dsc.processed_maximum[k] = m;
+    }
+  }
+  else if(dmode == DT_IOP_HIGHLIGHTS_OPPOSED)
+    ok = process_opposed_slang(self, piece, dev_in, dev_out, roi_in, roi_out);
+  else if(dmode == DT_IOP_HIGHLIGHTS_LAPLACIAN)
+  {
+    const dt_aligned_pixel_t clips = { clipper * pipe->dsc.processed_maximum[0],
+                                       clipper * pipe->dsc.processed_maximum[1],
+                                       clipper * pipe->dsc.processed_maximum[2], clipper };
+    ok = process_laplacian_bayer_slang(self, piece, dev_in, dev_out, roi_in, clips);
+  }
+  else if(dmode == DT_IOP_HIGHLIGHTS_LCH)
+  {
+    const int width = roi_out->width;
+    const int height = roi_out->height;
+    if(filters == 9u)
+      ok = !dt_slang_gpu_run_2d_args("basic", "highlights_1f_lch_xtrans", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(clipper), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+    else
+      ok = !dt_slang_gpu_run_2d_args("basic", "highlights_1f_lch_bayer", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                     SLARG(clipper), SLARG(filters));
+  }
+  else
+  {
+    dt_aligned_pixel_t clips = { clipper, clipper, clipper, clipper};
+    const dt_dev_wb_t *wb = &pipe->wb;
+    if(pipe->dsc.temperature.enabled && wb->late_correction)
+    {
+      clips[0] *= wb->coeffs[0] / wb->D65coeffs[0];
+      clips[1] *= wb->coeffs[1] / wb->D65coeffs[1];
+      clips[2] *= wb->coeffs[2] / wb->D65coeffs[2];
+    }
+
+    ok = !dt_slang_gpu_run_2d_args("basic", "highlights_1f_clip", roi_out->width, roi_out->height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                   SLARG(roi_in->width), SLARG(roi_in->height),
+                                   SLARG(roi_out->width), SLARG(roi_out->height),
+                                   SLARG(clips), SLARG(dx), SLARG(dy),
+                                   SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+  }
+  if(!ok) return FALSE;
+  if(passthru) pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+
+  // the raster mask is made on the host from the output, as process() does
+  float *mask = NULL;
+  if(dt_iop_is_raster_mask_used(self, BLEND_RASTER_ID))
+  {
+    const size_t ch = filters ? 1 : 4;
+    float *cpdata = dt_alloc_align_float(ch * roi_out->width * roi_out->height);
+    if(cpdata && !dt_slang_gpu_image_read(dev_out, cpdata))
+      mask = _provide_raster_mask(roi_in, roi_out, cpdata, clipper, piece);
+    dt_free_align(cpdata);
+  }
+  if(mask) dt_iop_piece_set_raster(piece, mask, roi_in, roi_out);
+  else     dt_iop_piece_clear_raster(piece, NULL);
+
+  // process() updates the raw maximum after making the raster mask
+  if(filters && (dmode == DT_IOP_HIGHLIGHTS_CLIP || dmode == DT_IOP_HIGHLIGHTS_LCH))
+  {
+    const float m = dt_iop_get_processed_maximum(piece);
+    for_three_channels(k) pipe->dsc.processed_maximum[k] = m;
+  }
+  return TRUE;
 }
 #endif
 

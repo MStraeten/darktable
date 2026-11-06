@@ -24,6 +24,8 @@
 #include "common/imagebuf.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/iop_profile.h"
+#include "common/slang_gpu.h"
 #include "common/rgb_norms.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -957,6 +959,215 @@ int process_cl(dt_iop_module_t *self,
     return process_cl_lut(self, piece, dev_in, dev_out, roi_in, roi_out);
 }
 
+#endif
+
+#ifdef HAVE_SLANG_GPU
+static gboolean _blur_slang(dt_slang_gpu_image_t *in,
+                            dt_slang_gpu_image_t *out,
+                            dt_slang_gpu_image_t *tmp,
+                            const int width,
+                            const int height)
+{
+  const int h[2] = { 1, 0 };
+  const int v[2] = { 0, 1 };
+  return !dt_slang_gpu_run_2d_args("basecurve", "basecurve_blur", width, height,
+                                   SLIMG_DEV(in), SLIMG_DEV(tmp), SLARG(width), SLARG(height), SLARG(h))
+    && !dt_slang_gpu_run_2d_args("basecurve", "basecurve_blur", width, height,
+                                 SLIMG_DEV(tmp), SLIMG_DEV(out), SLARG(width), SLARG(height), SLARG(v));
+}
+
+// coarse at width x height into out, blurred, as gauss_expand_cl()
+static gboolean _expand_slang(dt_slang_gpu_image_t *coarse,
+                              dt_slang_gpu_image_t *out,
+                              dt_slang_gpu_image_t *tmp,
+                              const int width,
+                              const int height)
+{
+  return !dt_slang_gpu_run_2d_args("basecurve", "basecurve_expand", width, height,
+                                   SLIMG_DEV(coarse), SLIMG_DEV(out), SLARG(width), SLARG(height))
+    && _blur_slang(out, out, tmp, width, height);
+}
+
+// as gauss_reduce_cl(): the blurred, subsampled input into coarse, and the
+// detail of input over it into detail if that isn't NULL
+static gboolean _reduce_slang(dt_slang_gpu_image_t *in,
+                              dt_slang_gpu_image_t *coarse,
+                              dt_slang_gpu_image_t *detail,
+                              dt_slang_gpu_image_t *tmp1,
+                              dt_slang_gpu_image_t *tmp2,
+                              const int width,
+                              const int height)
+{
+  const int cw = (width - 1) / 2 + 1;
+  const int ch = (height - 1) / 2 + 1;
+  if(!_blur_slang(in, tmp1, tmp2, width, height)
+     || dt_slang_gpu_run_2d_args("basecurve", "basecurve_reduce", cw, ch,
+                                 SLIMG_DEV(tmp1), SLIMG_DEV(coarse), SLARG(cw), SLARG(ch)))
+    return FALSE;
+
+  return !detail
+    || (_expand_slang(coarse, tmp1, tmp2, width, height)
+        && !dt_slang_gpu_run_2d_args("basecurve", "basecurve_detail", width, height,
+                                     SLIMG_DEV(in), SLIMG_DEV(tmp1), SLIMG_DEV(detail),
+                                     SLARG(width), SLARG(height)));
+}
+
+static gboolean _copy_slang(dt_slang_gpu_image_t *in,
+                            dt_slang_gpu_image_t *out,
+                            const int width,
+                            const int height)
+{
+  const int dx = 0;
+  return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                   SLIMG_DEV(in), SLIMG_DEV(out), SLARG(width), SLARG(height),
+                                   SLARG(width), SLARG(height), SLARG(dx), SLARG(dx));
+}
+
+// the curve at exposure multiplier mul, from in into out
+static gboolean _curve_slang(const dt_iop_basecurve_data_t *d,
+                             dt_slang_gpu_image_t *in,
+                             dt_slang_gpu_image_t *out,
+                             const int width,
+                             const int height,
+                             const float mul,
+                             const dt_colorspaces_iccprofile_info_slang_t *profile_info,
+                             const float *profile_lut,
+                             const int lut_width,
+                             const int lut_height,
+                             const int use_work_profile)
+{
+  const int preserve_colors = d->preserve_colors;
+  if(preserve_colors == DT_RGB_NORM_NONE)
+    return !dt_slang_gpu_run_2d_args("basecurve", "basecurve_legacy_lut", width, height,
+                                     SLIMG_DEV(in), SLIMG_DEV(out), SLARG(width), SLARG(height),
+                                     SLARG(mul), SLIMG_IN(d->table, 256, 256, 1),
+                                     SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)));
+  return !dt_slang_gpu_run_2d_args("basecurve", "basecurve_lut", width, height,
+                                   SLIMG_DEV(in), SLIMG_DEV(out), SLARG(width), SLARG(height),
+                                   SLARG(mul), SLIMG_IN(d->table, 256, 256, 1),
+                                   SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)),
+                                   SLARG(preserve_colors), SLBUF(profile_info, sizeof(*profile_info)),
+                                   SLIMG_IN(profile_lut, lut_width, lut_height, 1), SLARG(use_work_profile));
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_basecurve_data_t *d = piece->data;
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_iop_work_profile_info(piece->module, piece->module->dev->iop);
+  const int use_work_profile = (work_profile == NULL) ? 0 : 1;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  dt_colorspaces_iccprofile_info_slang_t profile_info;
+  int lut_width, lut_height;
+  float *profile_lut = dt_ioppr_build_iccprofile_params_slang(work_profile, &profile_info,
+                                                              &lut_width, &lut_height);
+  if(!profile_lut) return FALSE;
+
+  if(!d->exposure_fusion)
+  {
+    const gboolean ok = _curve_slang(d, dev_in, dev_out, width, height, 1.0f, &profile_info, profile_lut,
+                                     lut_width, lut_height, use_work_profile);
+    free(profile_lut);
+    return ok;
+  }
+
+  // the steps of process_cl_fusion(), with dev_out as a temporary until the end
+  enum { NUM_LEVELS_MAX = 8 };
+  dt_slang_gpu_image_t *col[NUM_LEVELS_MAX] = { NULL };
+  dt_slang_gpu_image_t *comb[NUM_LEVELS_MAX] = { NULL };
+  int lw[NUM_LEVELS_MAX], lh[NUM_LEVELS_MAX];
+  const int rad = MIN(width, (int)ceilf(256 * roi_in->scale / piece->iscale));
+
+  dt_slang_gpu_image_t *tmp1 = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *tmp2 = dt_slang_gpu_image_new(width, height, 4, NULL);
+  gboolean ok = tmp1 && tmp2;
+
+  int num_levels = NUM_LEVELS_MAX;
+  for(int k = 0, step = 1, w = width, h = height; k < num_levels && ok; k++)
+  {
+    lw[k] = w;
+    lh[k] = h;
+    col[k] = dt_slang_gpu_image_new(w, h, 4, NULL);
+    comb[k] = dt_slang_gpu_image_new(w, h, 4, NULL);
+    ok = col[k] && comb[k];
+
+    w = (w - 1) / 2 + 1;
+    h = (h - 1) / 2 + 1;
+    step *= 2;
+    if(step > rad || w < 4 || h < 4) num_levels = k + 1;
+  }
+
+  for(int e = 0; e < d->exposure_fusion + 1 && ok; e++)
+  {
+    // for every exposure fusion image: push by some ev, apply base curve and compute features
+    const float mul = exposure_increment(d->exposure_stops, e, d->exposure_fusion, d->exposure_bias);
+    ok = _curve_slang(d, dev_in, tmp1, width, height, mul, &profile_info, profile_lut,
+                      lut_width, lut_height, use_work_profile)
+      && !dt_slang_gpu_run_2d_args("basecurve", "basecurve_compute_features", width, height,
+                                   SLIMG_DEV(tmp1), SLIMG_DEV(col[0]), SLARG(width), SLARG(height))
+      // the gaussian pyramid of the color buffer, its first detail level in dev_out
+      && _reduce_slang(col[0], col[1], dev_out, tmp1, tmp2, width, height)
+      && !dt_slang_gpu_run_2d_args("basecurve", "basecurve_adjust_features", width, height,
+                                   SLIMG_DEV(col[0]), SLIMG_DEV(dev_out), SLIMG_DEV(tmp1),
+                                   SLARG(width), SLARG(height))
+      && _copy_slang(tmp1, col[0], width, height);
+
+    for(int k = 1; k < num_levels && ok; k++)
+      ok = _reduce_slang(col[k - 1], col[k], NULL, tmp1, tmp2, lw[k - 1], lh[k - 1]);
+
+    // update pyramid coarse to fine
+    for(int k = num_levels - 1; k >= 0 && ok; k--)
+    {
+      const int w = lw[k];
+      const int h = lh[k];
+      const int laplacian = k != num_levels - 1;
+      const int first = e == 0;
+      ok = (!laplacian || _expand_slang(col[k + 1], tmp2, tmp1, w, h))
+        && !dt_slang_gpu_run_2d_args("basecurve", "basecurve_blend", w, h,
+                                     SLIMG_DEV(comb[k]), SLIMG_DEV(col[k]), SLIMG_DEV(tmp2), SLIMG_DEV(tmp1),
+                                     SLARG(w), SLARG(h), SLARG(laplacian), SLARG(first))
+        && _copy_slang(tmp1, comb[k], w, h);
+    }
+  }
+
+  // normalize and reconstruct output pyramid buffer coarse to fine
+  for(int k = num_levels - 1; k >= 0 && ok; k--)
+  {
+    const int w = lw[k];
+    const int h = lh[k];
+    ok = !dt_slang_gpu_run_2d_args("basecurve", "basecurve_normalize", w, h,
+                                   SLIMG_DEV(comb[k]), SLIMG_DEV(tmp1), SLARG(w), SLARG(h))
+      && _copy_slang(tmp1, comb[k], w, h);
+
+    if(ok && k < num_levels - 1)
+      ok = _expand_slang(comb[k + 1], tmp1, tmp2, w, h)
+        && !dt_slang_gpu_run_2d_args("basecurve", "basecurve_reconstruct", w, h,
+                                     SLIMG_DEV(comb[k]), SLIMG_DEV(tmp1), SLIMG_DEV(tmp2), SLARG(w), SLARG(h))
+        && _copy_slang(tmp2, comb[k], w, h);
+  }
+
+  ok = ok
+    && !dt_slang_gpu_run_2d_args("basecurve", "basecurve_finalize", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(comb[0]), SLIMG_DEV(dev_out),
+                                 SLARG(width), SLARG(height));
+
+  for(int k = 0; k < NUM_LEVELS_MAX; k++)
+  {
+    dt_slang_gpu_image_free(col[k]);
+    dt_slang_gpu_image_free(comb[k]);
+  }
+  dt_slang_gpu_image_free(tmp1);
+  dt_slang_gpu_image_free(tmp2);
+  free(profile_lut);
+  return ok;
+}
 #endif
 
 void tiling_callback(dt_iop_module_t *self,

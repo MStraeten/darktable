@@ -20,6 +20,7 @@
 #include "common/debug.h"
 #include "common/gaussian.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/imagebuf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -412,6 +413,76 @@ void cleanup_global(dt_iop_module_so_t *self)
   self->data = NULL;
 }
 
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_censorize_data_t *data = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // the parameters of process()
+  const float sigma_1 = data->radius_1 * roi_in->scale / piece->iscale;
+  const float sigma_2 = data->radius_2 * roi_in->scale / piece->iscale;
+  const int pixel_radius = (size_t)(data->pixelate * roi_in->scale / piece->iscale);
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float noise = data->noise / scale;
+
+  const dt_aligned_pixel_t RGBmax = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  const dt_aligned_pixel_t RGBmin = { 0.f, 0.f, 0.f, 0.f };
+
+  // the steps run from src, through tmp1 and tmp2, to dev_out
+  dt_slang_gpu_image_t *tmp1 = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *tmp2 = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *src = dev_in;
+  int err = !tmp1 || !tmp2;
+
+  // first blurring step
+  if(!err && sigma_1 != 0.f)
+  {
+    err = dt_gaussian_blur_4c_slang(src, tmp1, width, height, sigma_1, DT_IOP_GAUSSIAN_ZERO, RGBmax, RGBmin);
+    src = tmp1;
+  }
+
+  // pixelate
+  if(!err && pixel_radius != 0)
+  {
+    err = dt_slang_gpu_run_2d_args("censorize", "censorize_pixelate", width, height,
+            SLIMG_DEV(src), SLIMG_DEV(tmp2), SLARG(width), SLARG(height), SLARG(pixel_radius));
+    src = tmp2;
+  }
+
+  // second blurring step, into dev_out unless the noise follows
+  dt_slang_gpu_image_t *dst = noise == 0.f ? dev_out : (src == tmp1 ? tmp2 : tmp1);
+  if(!err && sigma_2 != 0.f)
+  {
+    err = dt_gaussian_blur_4c_slang(src, dst, width, height, sigma_2, DT_IOP_GAUSSIAN_ZERO, RGBmax, RGBmin);
+    src = dst;
+  }
+
+  if(!err && noise != 0.f)
+    err = dt_slang_gpu_run_2d_args("censorize", "censorize_noise", width, height,
+            SLIMG_DEV(src), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(noise));
+  else if(!err && src != dev_out)
+  {
+    const int zero = 0;
+    err = dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+            SLIMG_DEV(src), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+            SLARG(zero), SLARG(zero));
+  }
+
+  dt_slang_gpu_image_free(tmp1);
+  dt_slang_gpu_image_free(tmp2);
+  return !err;
+}
 #endif
 
 void gui_init(dt_iop_module_t *self)

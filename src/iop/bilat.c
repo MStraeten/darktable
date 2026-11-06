@@ -23,6 +23,7 @@
 #include "common/imagebuf.h"
 #include "common/locallaplacian.h"
 #include "common/locallaplaciancl.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 #include "develop/imageop_gui.h"
@@ -240,6 +241,148 @@ error_ll:
     if(b) dt_local_laplacian_free_cl(b);
     return err;
   }
+}
+#endif
+
+
+#ifdef HAVE_SLANG_GPU
+// downsample width/height to given level
+static inline int _dl(int size, const int level)
+{
+  for(int l = 0; l < level; l++)
+    size = (size - 1) / 2 + 1;
+  return size;
+}
+
+#define LL_MAX_LEVELS 30
+#define LL_NUM_GAMMA 6
+
+// dt_local_laplacian_cl() on the Slang GPU path. The padded size is not
+// rounded up to an OpenCL work group, as in the CPU code.
+static int _local_laplacian_slang(dt_slang_gpu_image_t *input,
+                                  dt_slang_gpu_image_t *output,
+                                  const int width,
+                                  const int height,
+                                  const float sigma,
+                                  const float shadows,
+                                  const float highlights,
+                                  const float clarity)
+{
+  const int num_levels = MIN(LL_MAX_LEVELS, 31 - __builtin_clz(MIN(width, height)));
+  const int max_supp = 1 << (num_levels - 1);
+  const int bwidth = width + 2 * max_supp;
+  const int bheight = height + 2 * max_supp;
+
+  dt_slang_gpu_image_t *padded[LL_MAX_LEVELS] = { NULL };
+  dt_slang_gpu_image_t *out[LL_MAX_LEVELS] = { NULL };
+  dt_slang_gpu_image_t *processed[LL_NUM_GAMMA][LL_MAX_LEVELS] = { { NULL } };
+
+  int err = 0;
+  for(int l = 0; l < num_levels && !err; l++)
+  {
+    const int wd = _dl(bwidth, l), ht = _dl(bheight, l);
+    padded[l] = dt_slang_gpu_image_new(wd, ht, 1, NULL);
+    out[l] = dt_slang_gpu_image_new(wd, ht, 1, NULL);
+    err = !padded[l] || !out[l];
+    for(int k = 0; k < LL_NUM_GAMMA && !err; k++)
+    {
+      processed[k][l] = dt_slang_gpu_image_new(wd, ht, 1, NULL);
+      err = !processed[k][l];
+    }
+  }
+
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("locallaplacian", "pad_input", bwidth, bheight,
+            SLIMG_DEV(input), SLIMG_DEV(padded[0]), SLARG(width), SLARG(height), SLARG(max_supp),
+            SLARG(bwidth), SLARG(bheight));
+
+  // create gauss pyramid of padded input, write coarse directly to output
+  for(int l = 1; l < num_levels && !err; l++)
+  {
+    const int wd = _dl(bwidth, l), ht = _dl(bheight, l);
+    err = dt_slang_gpu_run_2d_args("locallaplacian", "gauss_reduce", wd, ht,
+            SLIMG_DEV(padded[l - 1]), SLIMG_DEV(l == num_levels - 1 ? out[l] : padded[l]), SLARG(wd), SLARG(ht));
+  }
+
+  for(int k = 0; k < LL_NUM_GAMMA && !err; k++)
+  {
+    // process images
+    const float g = (k + .5f) / (float)LL_NUM_GAMMA;
+    err = dt_slang_gpu_run_2d_args("locallaplacian", "process_curve", bwidth, bheight,
+            SLIMG_DEV(padded[0]), SLIMG_DEV(processed[k][0]), SLARG(g), SLARG(sigma), SLARG(shadows),
+            SLARG(highlights), SLARG(clarity), SLARG(bwidth), SLARG(bheight));
+
+    // create gaussian pyramids
+    for(int l = 1; l < num_levels && !err; l++)
+    {
+      const int wd = _dl(bwidth, l), ht = _dl(bheight, l);
+      err = dt_slang_gpu_run_2d_args("locallaplacian", "gauss_reduce", wd, ht,
+              SLIMG_DEV(processed[k][l - 1]), SLIMG_DEV(processed[k][l]), SLARG(wd), SLARG(ht));
+    }
+  }
+
+  // assemble output pyramid coarse to fine
+  for(int l = num_levels - 2; l >= 0 && !err; l--)
+  {
+    const int pw = _dl(bwidth, l), ph = _dl(bheight, l);
+    err = dt_slang_gpu_run_2d_args("locallaplacian", "laplacian_assemble", pw, ph,
+            SLIMG_DEV(padded[l]), SLIMG_DEV(out[l + 1]), SLIMG_DEV(out[l]),
+            SLIMG_DEV(processed[0][l]), SLIMG_DEV(processed[0][l + 1]),
+            SLIMG_DEV(processed[1][l]), SLIMG_DEV(processed[1][l + 1]),
+            SLIMG_DEV(processed[2][l]), SLIMG_DEV(processed[2][l + 1]),
+            SLIMG_DEV(processed[3][l]), SLIMG_DEV(processed[3][l + 1]),
+            SLIMG_DEV(processed[4][l]), SLIMG_DEV(processed[4][l + 1]),
+            SLIMG_DEV(processed[5][l]), SLIMG_DEV(processed[5][l + 1]), SLARG(pw), SLARG(ph));
+  }
+
+  // read back processed L channel and copy colors
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("locallaplacian", "write_back", width, height,
+            SLIMG_DEV(input), SLIMG_DEV(out[0]), SLIMG_DEV(output), SLARG(max_supp), SLARG(width),
+            SLARG(height));
+
+  for(int l = 0; l < LL_MAX_LEVELS; l++)
+  {
+    dt_slang_gpu_image_free(padded[l]);
+    dt_slang_gpu_image_free(out[l]);
+    for(int k = 0; k < LL_NUM_GAMMA; k++) dt_slang_gpu_image_free(processed[k][l]);
+  }
+  return err;
+}
+
+#undef LL_MAX_LEVELS
+#undef LL_NUM_GAMMA
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_bilat_data_t *d = piece->data;
+
+  if(d->mode == s_mode_bilateral)
+  {
+    // the total scale is composed of scale before input to the pipeline (iscale),
+    // and the scale of the roi.
+    const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+    const float sigma_r = d->sigma_r; // does not depend on scale
+    const float sigma_s = d->sigma_s / scale;
+
+    dt_bilateral_slang_t *b = dt_bilateral_init_slang(roi_in->width, roi_in->height, sigma_s, sigma_r);
+    const int err = !b
+      || dt_bilateral_splat_slang(b, dev_in)
+      || dt_bilateral_blur_slang(b)
+      || dt_bilateral_slice_slang(b, dev_in, dev_out, d->detail);
+    dt_bilateral_free_slang(b);
+    return !err;
+  }
+
+  if(roi_in->width < 2 || roi_in->height < 2) return FALSE;
+
+  return !_local_laplacian_slang(dev_in, dev_out, roi_in->width, roi_in->height,
+                                 d->midtone, d->sigma_s, d->sigma_r, d->detail);
 }
 #endif
 
