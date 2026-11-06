@@ -352,6 +352,7 @@ void amaze_demosaic(const float *const in,
 #include "iop/demosaicing/amaze_cl.c"
 #include "iop/demosaicing/lmmse_cl.c"
 #include "iop/demosaicing/amaze_slang.c"
+#include "iop/demosaicing/lmmse_slang.c"
 
 const char *name()
 {
@@ -1609,7 +1610,8 @@ gboolean process_slang(dt_iop_module_t *self,
   const gboolean supported =
     ((is_bayer
       && (method == DT_IOP_DEMOSAIC_RCD || method == DT_IOP_DEMOSAIC_VNG4
-          || method == DT_IOP_DEMOSAIC_PPG || method == DT_IOP_DEMOSAIC_AMAZE || passthru))
+          || method == DT_IOP_DEMOSAIC_PPG || method == DT_IOP_DEMOSAIC_AMAZE
+          || method == DT_IOP_DEMOSAIC_LMMSE || passthru))
      || (is_xtrans
          && (method == DT_IOP_DEMOSAIC_VNG || method == DT_IOP_DEMOSAIC_MARKESTEIJN
              || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3 || passthru)))
@@ -1699,6 +1701,9 @@ gboolean process_slang(dt_iop_module_t *self,
         break;
       case DT_IOP_DEMOSAIC_AMAZE:
         ok = process_amaze_slang(piece, in_image, high, iwidth, iheight, filters);
+        break;
+      case DT_IOP_DEMOSAIC_LMMSE:
+        ok = process_lmmse_slang(piece, in_image, high, iwidth, iheight, filters, d->lmmse_refine);
         break;
       case DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME:
         ok = !dt_slang_gpu_run_2d_args("demosaic_other", "passthrough_monochrome", iwidth, iheight,
