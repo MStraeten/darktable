@@ -16,11 +16,14 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// device error accounting shared by the Vulkan and Metal backends of slang_gpu.h
+// device error accounting and settings shared by the Vulkan and Metal
+// backends of slang_gpu.h
 
 #include "common/slang_gpu.h"
 #include "common/darktable.h"
+#include "control/conf.h"
 #include "control/control.h"
+#include "common/utility.h"
 
 static gint _errors = 0;
 static gint _failed_runs = 0;
@@ -55,4 +58,28 @@ void dt_slang_gpu_run_failed(void)
 gboolean dt_slang_gpu_stopped(void)
 {
   return g_atomic_int_get(&_stopped);
+}
+
+float dt_slang_gpu_unified_fraction(const float automatic)
+{
+  const float fraction = dt_conf_get_float("slang_gpu_unified_fraction");
+  return fraction > 0.0f ? CLAMP(fraction, 0.02f, 0.9f) : automatic;
+}
+
+gboolean dt_slang_gpu_avoid_module(const char *op)
+{
+  const char *avoid = dt_conf_get_string_const("slang_gpu_avoid");
+  return avoid && *avoid && dt_str_commasubstring(avoid, op);
+}
+
+static void _device_free(gpointer data)
+{
+  dt_slang_gpu_device_t *device = data;
+  g_free(device->name);
+  g_free(device);
+}
+
+void dt_slang_gpu_devices_free(GList *devices)
+{
+  g_list_free_full(devices, _device_free);
 }

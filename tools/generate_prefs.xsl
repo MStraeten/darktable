@@ -397,6 +397,13 @@ static void init_tab_generated(GtkWidget *dialog, GtkWidget *stack)
                                                  and (name != 'opencl' or $HAVE_OPENCL = 1)]">
       <xsl:apply-templates select="." mode="tab_block"/>
     </xsl:for-each>
+    <!-- the Slang devices are only known at runtime, preferences.c adds them -->
+    <xsl:if test="$section = 'slang'">
+      <xsl:text>
+#ifdef HAVE_SLANG_GPU
+    _preferences_slang_device(GTK_GRID(grid), &amp;line, widget_group);
+#endif</xsl:text>
+    </xsl:if>
     </xsl:otherwise>
     </xsl:choose>
   </xsl:for-each>

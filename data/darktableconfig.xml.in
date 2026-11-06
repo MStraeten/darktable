@@ -574,8 +574,8 @@
     <name>slang_gpu_device</name>
     <type>string</type>
     <default></default>
-    <shortdescription>Vulkan device for the Slang GPU kernels</shortdescription>
-    <longdescription>experimental: the index or part of the name of the Vulkan device to run the Slang kernels on. empty picks a discrete GPU, then an integrated one</longdescription>
+    <shortdescription>device for the Slang GPU kernels</shortdescription>
+    <longdescription>experimental: the index or part of the name of the Vulkan or Metal device to run the Slang kernels on, as listed by '-d slang'. empty picks a discrete GPU, then an integrated one; on Metal it picks the system default device. set from 'Slang device' in preferences > processing</longdescription>
   </dtconfig>
   <dtconfig>
     <name>slang_gpu_memory</name>
@@ -590,6 +590,20 @@
     <default>false</default>
     <shortdescription>keep Slang GPU images in private Metal memory</shortdescription>
     <longdescription>experimental: on Metal, keep the images of the Slang GPU path in memory only the GPU can access, as is always done on GPUs without unified memory</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_unified_fraction</name>
+    <type min="0.0" max="0.9">float</type>
+    <default>0.0</default>
+    <shortdescription>share of system memory for a Slang GPU without memory of its own</shortdescription>
+    <longdescription>experimental: the share of system memory the Slang GPU path may use on an integrated GPU or Apple silicon, like the unified fraction of an OpenCL device. 0 uses a quarter of it on Vulkan and what macOS recommends on Metal</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_avoid</name>
+    <type>string</type>
+    <default></default>
+    <shortdescription>modules kept off the Slang GPU path</shortdescription>
+    <longdescription>experimental: a comma separated list of module names, such as 'diffuse,lens', that run on OpenCL or the CPU instead of the Slang kernels, like the _nocl list of an OpenCL device</longdescription>
   </dtconfig>
   <dtconfig prefs="processing" section="opencl" capability="opencl">
     <name>opencl_scheduling_profile</name>

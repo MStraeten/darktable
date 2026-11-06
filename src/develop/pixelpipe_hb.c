@@ -2383,6 +2383,7 @@ static gboolean _slang_possible(dt_dev_pixelpipe_t *pipe,
   return module->process_slang
     && !host_crop
     && piece->process_cl_ready
+    && !dt_slang_gpu_avoid_module(module->op)
     && pipe->slang_enabled
     && dt_slang_gpu_enabled()
     && *output != input

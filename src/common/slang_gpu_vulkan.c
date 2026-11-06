@@ -171,34 +171,33 @@ static void _destroy_kernel(gpointer data)
   g_free(k);
 }
 
-static gboolean _init_device(void)
+static gboolean _create_instance(VkInstance *instance)
 {
   const VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                                   .pApplicationName = "darktable",
                                   .apiVersion = VK_API_VERSION_1_2 };
   const VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                      .pApplicationInfo = &app };
-  if(vkCreateInstance(&ici, NULL, &_vk.instance) != VK_SUCCESS)
-  {
-    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Vulkan instance");
-    return FALSE;
-  }
+  return vkCreateInstance(&ici, NULL, instance) == VK_SUCCESS;
+}
 
-  uint32_t ndev = 0;
-  vkEnumeratePhysicalDevices(_vk.instance, &ndev, NULL);
-  if(ndev == 0)
-  {
-    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Vulkan device");
-    return FALSE;
-  }
-  VkPhysicalDevice *devs = g_new(VkPhysicalDevice, ndev);
-  vkEnumeratePhysicalDevices(_vk.instance, &ndev, devs);
+static const char *_device_type(const VkPhysicalDeviceType type)
+{
+  return type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
+       : type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+       : type == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? "virtual"
+       : type == VK_PHYSICAL_DEVICE_TYPE_CPU ? "cpu" : "other";
+}
 
-  // slang_gpu_device picks a device by index or by part of its name. Without
-  // it a discrete GPU wins over an integrated one, which wins over the rest:
-  // on hybrid laptops the integrated GPU is usually enumerated first, and a
-  // CPU implementation such as lavapipe is only a last resort
-  const char *wanted = dt_conf_get_string_const("slang_gpu_device");
+// the device wanted asks for, by index or by part of its name. Without one,
+// or if none matches, a discrete GPU wins over an integrated one, which wins
+// over the rest: on hybrid laptops the integrated GPU is usually enumerated
+// first, and a CPU implementation such as lavapipe is only a last resort
+static int _pick_device(const VkPhysicalDevice *devs,
+                        const uint32_t ndev,
+                        const char *wanted,
+                        const gboolean log)
+{
   char *end = NULL;
   const long wanted_index = wanted && *wanted ? strtol(wanted, &end, 10) : -1;
   const gboolean by_index = wanted && *wanted && end && *end == '\0';
@@ -217,22 +216,39 @@ static gboolean _init_device(void)
       : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
       : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 1
       : 0;
-    dt_print(DT_DEBUG_SLANG, "[slang_gpu] Vulkan device %u: %s, %s, vendor 0x%04x%s", d, props.deviceName,
-             props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
-             : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
-             : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? "virtual"
-             : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? "cpu" : "other",
-             props.vendorID, match ? ", requested" : "");
+    if(log)
+      dt_print(DT_DEBUG_SLANG, "[slang_gpu] Vulkan device %u: %s, %s, vendor 0x%04x%s", d, props.deviceName,
+               _device_type(props.deviceType), props.vendorID, match ? ", requested" : "");
     if(rank > best_rank)
     {
       best = d;
       best_rank = rank;
     }
   }
-  if((wanted_name || by_index) && best_rank < 4)
+  if(log && (wanted_name || by_index) && best_rank < 4)
     dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Vulkan device matches slang_gpu_device '%s'", wanted);
   g_free(wanted_name);
-  _vk.pdev = devs[best];
+  return best;
+}
+
+static gboolean _init_device(void)
+{
+  if(!_create_instance(&_vk.instance))
+  {
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Vulkan instance");
+    return FALSE;
+  }
+
+  uint32_t ndev = 0;
+  vkEnumeratePhysicalDevices(_vk.instance, &ndev, NULL);
+  if(ndev == 0)
+  {
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Vulkan device");
+    return FALSE;
+  }
+  VkPhysicalDevice *devs = g_new(VkPhysicalDevice, ndev);
+  vkEnumeratePhysicalDevices(_vk.instance, &ndev, devs);
+  _vk.pdev = devs[_pick_device(devs, ndev, dt_conf_get_string_const("slang_gpu_device"), TRUE)];
   g_free(devs);
 
   VkPhysicalDeviceProperties props;
@@ -271,7 +287,7 @@ static gboolean _init_device(void)
       if(_vk.memprops.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local |= 1u << h;
     const uint32_t all = (1u << _vk.memprops.memoryHeapCount) - 1;
     _vk.host_heaps = local == all ? all : all & ~local;
-    _vk.host_cap = darktable.dtresources.total_memory / 4;
+    _vk.host_cap = darktable.dtresources.total_memory * dt_slang_gpu_unified_fraction(0.25f);
   }
   const int cap = dt_conf_get_int("slang_gpu_memory");
   if(cap > 0)
@@ -369,6 +385,38 @@ static gboolean _init_device(void)
   _vk.kernels = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, _destroy_kernel);
   dt_print(DT_DEBUG_SLANG, "[slang_gpu] using Vulkan device %s", props.deviceName);
   return TRUE;
+}
+
+GList *dt_slang_gpu_devices(int *automatic)
+{
+  *automatic = -1;
+  g_mutex_lock(&_vk_lock);
+  // with slang_gpu off there is no instance yet
+  VkInstance instance = _vk.instance;
+  if(!instance && !_create_instance(&instance))
+  {
+    g_mutex_unlock(&_vk_lock);
+    return NULL;
+  }
+  uint32_t ndev = 0;
+  vkEnumeratePhysicalDevices(instance, &ndev, NULL);
+  VkPhysicalDevice *devs = g_new(VkPhysicalDevice, MAX(ndev, 1));
+  vkEnumeratePhysicalDevices(instance, &ndev, devs);
+  GList *list = NULL;
+  for(uint32_t d = 0; d < ndev; d++)
+  {
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(devs[d], &props);
+    dt_slang_gpu_device_t *device = g_new0(dt_slang_gpu_device_t, 1);
+    device->name = g_strdup(props.deviceName);
+    device->unified_memory = props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    list = g_list_prepend(list, device);
+  }
+  if(ndev) *automatic = _pick_device(devs, ndev, NULL, FALSE);
+  g_free(devs);
+  if(instance != _vk.instance) vkDestroyInstance(instance, NULL);
+  g_mutex_unlock(&_vk_lock);
+  return g_list_reverse(list);
 }
 
 gboolean dt_slang_gpu_enabled(void)

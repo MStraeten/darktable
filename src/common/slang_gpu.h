@@ -101,6 +101,27 @@ int dt_slang_gpu_run_2d(const char *program,
 
 void dt_slang_gpu_cleanup(void);
 
+// a device the Slang kernels can run on, for the preferences
+typedef struct dt_slang_gpu_device_t
+{
+  char *name;
+  gboolean unified_memory;
+} dt_slang_gpu_device_t;
+
+// the backend's devices, in the order slang_gpu_device counts them, whether
+// or not slang_gpu is set. automatic is set to the one used when
+// slang_gpu_device is empty. Free the list with dt_slang_gpu_devices_free().
+GList *dt_slang_gpu_devices(int *automatic);
+void dt_slang_gpu_devices_free(GList *devices);
+
+// TRUE if slang_gpu_avoid lists the module, which then runs its CPU or
+// OpenCL code, like a module in an OpenCL device's _nocl list
+gboolean dt_slang_gpu_avoid_module(const char *op);
+
+// the share of system memory slang_gpu_unified_fraction gives a device
+// without memory of its own, or automatic if it is not set
+float dt_slang_gpu_unified_fraction(const float automatic);
+
 // sets up the device and loads every kernel in a background thread, so that
 // the first module doesn't wait for that. Does nothing unless slang_gpu is set.
 void dt_slang_gpu_prepare(void);
@@ -216,6 +237,7 @@ static inline gboolean dt_slang_gpu_enabled(void) { return FALSE; }
 static inline void dt_slang_gpu_cleanup(void) {}
 static inline void dt_slang_gpu_prepare(void) {}
 static inline void dt_slang_gpu_release_pools(void) {}
+static inline gboolean dt_slang_gpu_avoid_module(const char *op) { return FALSE; }
 
 #endif
 

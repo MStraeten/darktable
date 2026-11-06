@@ -89,9 +89,68 @@ static GThread *_prepare_thread = NULL;
 // --------------------------------------------------------------------------------------------
 // device
 
+// every Metal device, the system default first: it is what the kernels used
+// before slang_gpu_device applied to Metal, so index 0 keeps meaning that
+static NSArray<id<MTLDevice>> *_all_devices(void)
+{
+  id<MTLDevice> def = MTLCreateSystemDefaultDevice();
+  NSMutableArray<id<MTLDevice>> *all = [NSMutableArray array];
+  if(def) [all addObject:def];
+  for(id<MTLDevice> d in MTLCopyAllDevices())
+    if(!def || d.registryID != def.registryID) [all addObject:d];
+  return all;
+}
+
+// the device slang_gpu_device asks for, by index or by part of its name, or
+// the system default. Metal leaves the choice between an integrated and a
+// discrete GPU to macOS, which picks the discrete one on dual-GPU Macs
+static id<MTLDevice> _pick_device(NSArray<id<MTLDevice>> *all)
+{
+  const char *wanted = dt_conf_get_string_const("slang_gpu_device");
+  char *end = NULL;
+  const long wanted_index = wanted && *wanted ? strtol(wanted, &end, 10) : -1;
+  const gboolean by_index = wanted && *wanted && end && *end == '\0';
+  gchar *wanted_name = wanted && *wanted && !by_index ? g_utf8_casefold(wanted, -1) : NULL;
+
+  id<MTLDevice> found = nil;
+  for(NSUInteger d = 0; d < all.count; d++)
+  {
+    gchar *name = g_utf8_casefold(all[d].name.UTF8String, -1);
+    const gboolean match = by_index ? wanted_index == (long)d : wanted_name && strstr(name, wanted_name) != NULL;
+    g_free(name);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] Metal device %lu: %s%s%s%s", (unsigned long)d, all[d].name.UTF8String,
+             all[d].hasUnifiedMemory ? ", unified memory" : "", all[d].isLowPower ? ", low power" : "",
+             match ? ", requested" : "");
+    if(match && !found) found = all[d];
+  }
+  if((wanted_name || by_index) && !found)
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Metal device matches slang_gpu_device '%s'", wanted);
+  g_free(wanted_name);
+  return found ? found : all.firstObject;
+}
+
+GList *dt_slang_gpu_devices(int *automatic)
+{
+  *automatic = -1;
+  GList *list = NULL;
+  @autoreleasepool
+  {
+    NSArray<id<MTLDevice>> *all = _all_devices();
+    for(id<MTLDevice> d in all)
+    {
+      dt_slang_gpu_device_t *device = g_new0(dt_slang_gpu_device_t, 1);
+      device->name = g_strdup(d.name.UTF8String);
+      device->unified_memory = d.hasUnifiedMemory;
+      list = g_list_prepend(list, device);
+    }
+    if(all.count) *automatic = 0;
+  }
+  return g_list_reverse(list);
+}
+
 static gboolean _init_device(void)
 {
-  _mtl.dev = MTLCreateSystemDefaultDevice();
+  _mtl.dev = _pick_device(_all_devices());
   if(!_mtl.dev)
   {
     dt_print(DT_DEBUG_SLANG, "[slang_gpu] no Metal device");
@@ -942,7 +1001,11 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
   for(DtSlangImage *img in _mtl.images) pooled += _image_bytes(img);
   for(DtSlangBuffer *buf in _mtl.buffers) pooled += buf->buffer.length;
   pooled += _staging_bytes();
-  const size_t limit = _mtl.dev.recommendedMaxWorkingSetSize;
+  // macOS recommends most of the system memory to a unified-memory GPU,
+  // which slang_gpu_unified_fraction can lower as OpenCL's unified_fraction does
+  size_t limit = _mtl.dev.recommendedMaxWorkingSetSize;
+  if(_mtl.dev.hasUnifiedMemory)
+    limit = MIN(limit, (size_t)(darktable.dtresources.total_memory * dt_slang_gpu_unified_fraction(1.0f)));
   const size_t used = _mtl.dev.currentAllocatedSize > pooled ? _mtl.dev.currentAllocatedSize - pooled : 0;
   size_t best = limit > used ? limit - used : 0;
   const int cap = dt_conf_get_int("slang_gpu_memory");
