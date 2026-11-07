@@ -842,7 +842,7 @@ static inline void _apply_tone_curves(dt_aligned_pixel_t pixel,
   }
 }
 
-#ifdef HAVE_OPENCL
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
 // sample xform on a CLUT_LEVEL^3 grid over RGB input values 0..1, the first
 // channel varying fastest as in the lut3d module. The grid is linear: the
 // LittleCMS transforms that get here (LUT input profiles) take scene-linear
@@ -885,7 +885,9 @@ static float *_bake_clut(cmsHTRANSFORM xform)
   dt_free_align(out);
   return clut;
 }
+#endif
 
+#ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
                cl_mem dev_in,
@@ -1062,6 +1064,24 @@ error:
 #endif
 
 #ifdef HAVE_SLANG_GPU
+// the LittleCMS path as a 3D LUT, as process_cl(). Returns non-zero on failure.
+static int _process_slang_clut(dt_iop_colorin_data_t *d,
+                               dt_slang_gpu_image_t *dev_in,
+                               dt_slang_gpu_image_t *dev_out,
+                               const int width,
+                               const int height,
+                               const dt_aligned_pixel_t coeffs)
+{
+  if(!d->clut) d->clut = _bake_clut(d->xform_cam_out);
+  if(!d->clut) return 1;
+
+  const int level = CLUT_LEVEL;
+  return dt_slang_gpu_run_2d_args("basic", "colorin_clut", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLBUF(d->clut, sizeof(float) * 3 * level * level * level), SLARG(level),
+    SLBUF(coeffs, sizeof(float) * 4));
+}
+
 gboolean process_slang(dt_iop_module_t *self,
                        dt_dev_pixelpipe_iop_t *piece,
                        dt_slang_gpu_image_t *dev_in,
@@ -1069,7 +1089,7 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_in,
                        const dt_iop_roi_t *const roi_out)
 {
-  const dt_iop_colorin_data_t *d = piece->data;
+  dt_iop_colorin_data_t *d = piece->data;
   dt_dev_pixelpipe_t *pipe = piece->pipe;
   const int width = roi_in->width;
   const int height = roi_in->height;
@@ -1099,7 +1119,9 @@ gboolean process_slang(dt_iop_module_t *self,
   float dummy_hsm = 0.0f;
   const size_t len = use_hsm ? (size_t)d->hue_div * d->sat_div * d->val_div * 3 : 1;
 
-  const int err = dt_slang_gpu_run_2d_args("basic", d->nrgb ? "colorin_clipping" : "colorin_unbound",
+  const int err = !dt_is_valid_colormatrix(d->cmatrix[0][0])
+    ? _process_slang_clut(d, dev_in, dev_out, width, height, coeffs)
+    : dt_slang_gpu_run_2d_args("basic", d->nrgb ? "colorin_clipping" : "colorin_unbound",
     width, height, SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
     SLBUF(cmat, sizeof(cmat)), SLBUF(lmat, sizeof(lmat)),
     SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1), SLIMG_IN(d->lut[2], 256, 256, 1),

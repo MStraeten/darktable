@@ -579,6 +579,32 @@ static int make_tests(test_t *t)
        LUT("lutr", lut_curve, 256, 256), LUT("lutg", lut_curve, 256, 256), LUT("lutb", lut_curve, 256, 256),
        BUFFER("a", unbounded, sizeof(unbounded)), INT("hdr_transfer", 1));
 
+  // the LittleCMS path of color in and out as a 3D LUT: a smooth made-up
+  // table that dips below zero in a corner, and a gamut marker of 0 and 1
+  enum { CLUT_N = 17 };
+  static float clut[3 * CLUT_N * CLUT_N * CLUT_N], clut_gamut[3 * CLUT_N * CLUT_N * CLUT_N];
+  for(int k = 0; k < CLUT_N * CLUT_N * CLUT_N; k++)
+  {
+    const float r = (float)(k % CLUT_N) / (CLUT_N - 1);
+    const float g = (float)((k / CLUT_N) % CLUT_N) / (CLUT_N - 1);
+    const float b = (float)(k / (CLUT_N * CLUT_N)) / (CLUT_N - 1);
+    clut[3 * k + 0] = 0.9f * r + 0.2f * sinf(3.0f * g) - 0.1f * b;
+    clut[3 * k + 1] = r * g + 0.3f * b * b;
+    clut[3 * k + 2] = sqrtf(b) - 0.15f * (1.0f - r);
+    for(int c = 0; c < 3; c++) clut_gamut[3 * k + c] = (g + b > 1.2f) ? 1.0f : 0.0f;
+  }
+  TEST("colorout_clut", "basic", "colorout_clut",
+       IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+       BUFFER("clut", clut, sizeof(clut)), INT("level", CLUT_N), INT("gamutcheck", 0),
+       BUFFER("gamut", clut, sizeof(clut)), INT("hdr_transfer", 0));
+  TEST_TOL("colorout_clut gamutcheck pq", "basic", "colorout_clut", 5e-4,
+       IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+       BUFFER("clut", clut, sizeof(clut)), INT("level", CLUT_N), INT("gamutcheck", 1),
+       BUFFER("gamut", clut_gamut, sizeof(clut_gamut)), INT("hdr_transfer", 1));
+  TEST("colorin_clut", "basic", "colorin_clut",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+       BUFFER("clut", clut, sizeof(clut)), INT("level", CLUT_N), BUFFER("corr", corr, sizeof(corr)));
+
   // 4x4 matrices as the host passes them, of which the kernels read 3 rows
   static const float cm_rgb_to_xyz[12] = { 0.4361f, 0.3851f, 0.1431f, 0.0f, 0.2225f, 0.7169f, 0.0606f, 0.0f,
                                            0.0139f, 0.0971f, 0.7141f, 0.0f };

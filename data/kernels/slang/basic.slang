@@ -21,6 +21,7 @@
 
 import color_conversion;
 import rgb_norms;
+import lut3d_interp;
 
 // Metal drops buffers and images a kernel does not read, which would shift
 // every later binding (see src/common/slang_gpu_metal.m). A kernel that ignores
@@ -283,6 +284,57 @@ void colorout(uint3 gid : SV_DispatchThreadID,
   pixel.x = lerp_lookup_unbounded0(lutr, rgb[0], a, 0);
   pixel.y = lerp_lookup_unbounded0(lutg, rgb[1], a, 1);
   pixel.z = lerp_lookup_unbounded0(lutb, rgb[2], a, 2);
+  out.write(int2(x, y), pixel);
+}
+
+/* kernel for the plugin colorout: the LittleCMS transform baked into a 3D LUT
+   over the Lab range LittleCMS encodes floats in, see _bake_clut() */
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorout_clut(uint3 gid : SV_DispatchThreadID,
+                   uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                   uniform StructuredBuffer<float> clut, uniform int level, uniform int gamutcheck,
+                   uniform StructuredBuffer<float> gamut, uniform int hdr_transfer)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  const float4 Lab = in.readpixel(x, y);
+  const float4 coord = clip4(float4(Lab.x / 100.0f, (Lab.y + 128.0f) / 255.0f, (Lab.z + 128.0f) / 255.0f, 0.0f));
+  float4 pixel = dt_lut3d_tetrahedral(coord, clut, level);
+  pixel.w = Lab.w;
+
+  // as _transform_lcms(): out of gamut, or negative, shows as cyan
+  if(gamutcheck != 0
+     && (dt_lut3d_tetrahedral(coord, gamut, level).x > 0.5f
+         || pixel.x < 0.0f || pixel.y < 0.0f || pixel.z < 0.0f))
+    pixel = float4(0.0f, 1.0f, 1.0f, 0.0f);
+
+  float3 rgb = pixel.xyz;
+  dt_hdr_encode(rgb, hdr_transfer);
+  pixel.xyz = rgb;
+  out.write(int2(x, y), pixel);
+}
+
+/* kernel for the plugin colorin: the LittleCMS transform baked into a 3D LUT
+   over input values 0..1, see _bake_clut() */
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorin_clut(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                  uniform StructuredBuffer<float> clut, uniform int level, uniform StructuredBuffer<float> corr)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  const float4 corval = float4(corr[0], corr[1], corr[2], corr[3]);
+  const float4 raw = in.readpixel(x, y);
+  float4 pixel = dt_lut3d_tetrahedral(clip4(corval * raw), clut, level);
+  pixel.w = raw.w;
   out.write(int2(x, y), pixel);
 }
 

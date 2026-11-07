@@ -21,6 +21,7 @@
 // is 0 for tetrahedral, 1 trilinear and 2 pyramid, as dt_iop_lut3d_interpolation_t
 
 import common;
+import lut3d_interp;
 
 float4 _clut(StructuredBuffer<float> clut, const int i)
 {
@@ -61,26 +62,7 @@ void lut3d(uint3 gid : SV_DispatchThreadID,
 
   float4 output;
   if(interpolation == 0)
-  {
-    if(rgbd.x > rgbd.y)
-    {
-      if(rgbd.y > rgbd.z)
-        output = (1.0f - rgbd.x) * c000 + (rgbd.x - rgbd.y) * c100 + (rgbd.y - rgbd.z) * c110 + rgbd.z * c111;
-      else if(rgbd.x > rgbd.z)
-        output = (1.0f - rgbd.x) * c000 + (rgbd.x - rgbd.z) * c100 + (rgbd.z - rgbd.y) * c101 + rgbd.y * c111;
-      else
-        output = (1.0f - rgbd.z) * c000 + (rgbd.z - rgbd.x) * c001 + (rgbd.x - rgbd.y) * c101 + rgbd.y * c111;
-    }
-    else
-    {
-      if(rgbd.z > rgbd.y)
-        output = (1.0f - rgbd.z) * c000 + (rgbd.z - rgbd.y) * c001 + (rgbd.y - rgbd.x) * c011 + rgbd.x * c111;
-      else if(rgbd.z > rgbd.x)
-        output = (1.0f - rgbd.y) * c000 + (rgbd.y - rgbd.z) * c010 + (rgbd.z - rgbd.x) * c011 + rgbd.x * c111;
-      else
-        output = (1.0f - rgbd.y) * c000 + (rgbd.y - rgbd.x) * c010 + (rgbd.x - rgbd.z) * c110 + rgbd.z * c111;
-    }
-  }
+    output = dt_lut3d_tetrahedral(input, clut, level);
   else if(interpolation == 1)
   {
     const float4 t1 = c000 * (1.0f - rgbd.x) + c100 * rgbd.x;
