@@ -19,6 +19,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/interpolation.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "develop/tiling.h"
@@ -305,6 +306,32 @@ int process_cl(dt_iop_module_t *self,
                                           CLARG(roi_in->width), CLARG(roi_in->height),
                                           CLARG(scale), CLARG(shift), CLARG(offset),
                                           CLARG(itype), CLARG(iwidth));
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+
+  // as process_cl()
+  float scale[2], offset[2];
+  int shift[2];
+  _sampling_grid(piece, roi_in, roi_out, scale, shift, offset);
+  const int itype = interpolation->id;
+  const int iwidth = interpolation->width;
+
+  return !dt_slang_gpu_run_2d_args("basic", "scalepixels", roi_out->width, roi_out->height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                   SLARG(roi_out->width), SLARG(roi_out->height),
+                                   SLARG(roi_in->width), SLARG(roi_in->height),
+                                   SLARG(scale), SLARG(shift), SLARG(offset),
+                                   SLARG(itype), SLARG(iwidth));
 }
 #endif
 

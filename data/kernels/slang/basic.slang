@@ -1306,32 +1306,15 @@ float interpolation_compute_single(ImageIn in, const int itor_mode, const int it
   return s;
 }
 
-// rotatepixels in ../basic.cl, with the taps of compute_upsampling_taps()
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void rotatepixels(uint3 gid : SV_DispatchThreadID,
-                  uniform ImageIn in, uniform ImageOut out,
-                  uniform int width, uniform int height, uniform int in_width, uniform int in_height,
-                  uniform int2 roi_out, uniform int2 roi_in, uniform float4 m, uniform float2 center,
-                  uniform int itype, uniform int iwidth)
+// _interpolation_pixel4() in ../basic.cl, with the taps of compute_upsampling_taps()
+float4 interpolation_pixel4(ImageIn in, const float px, const float py, const int in_width,
+                            const int in_height, const int itype, const int iwidth)
 {
-  const int x = gid.x;
-  const int y = gid.y;
-  if(x >= width || y >= height) return;
-
-  const float pix = float(roi_out.x + x);
-  const float piy = float(roi_out.y + y);
-  const float px = pix * m.x + piy * m.y + center.x - float(roi_in.x);
-  const float py = pix * m.z + piy * m.w + center.y - float(roi_in.y);
-
   const int ix = int(floor(px));
   const int iy = int(floor(py));
 
   if(ix < -1 || iy < -1 || ix >= in_width || iy >= in_height)
-  {
-    out.write(int2(x, y), float4(0.0f));
-    return;
-  }
+    return float4(0.0f);
 
   float kh[MAX_KERNEL_REQ];
   float kv[MAX_KERNEL_REQ];
@@ -1350,7 +1333,47 @@ void rotatepixels(uint3 gid : SV_DispatchThreadID,
     pixel += kv[i] * h;
   }
 
-  out.write(int2(x, y), pixel * (1.0f / (normh * normv)));
+  return pixel * (1.0f / (normh * normv));
+}
+
+// rotatepixels in ../basic.cl
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void rotatepixels(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out,
+                  uniform int width, uniform int height, uniform int in_width, uniform int in_height,
+                  uniform int2 roi_out, uniform int2 roi_in, uniform float4 m, uniform float2 center,
+                  uniform int itype, uniform int iwidth)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float pix = float(roi_out.x + x);
+  const float piy = float(roi_out.y + y);
+  const float px = pix * m.x + piy * m.y + center.x - float(roi_in.x);
+  const float py = pix * m.z + piy * m.w + center.y - float(roi_in.y);
+
+  out.write(int2(x, y), interpolation_pixel4(in, px, py, in_width, in_height, itype, iwidth));
+}
+
+// scalepixels in ../basic.cl
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void scalepixels(uint3 gid : SV_DispatchThreadID,
+                 uniform ImageIn in, uniform ImageOut out,
+                 uniform int width, uniform int height, uniform int in_width, uniform int in_height,
+                 uniform float2 scale, uniform int2 shift, uniform float2 offset,
+                 uniform int itype, uniform int iwidth)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float px = float(x + shift.x) * scale.x - offset.x;
+  const float py = float(y + shift.y) * scale.y - offset.y;
+
+  out.write(int2(x, y), interpolation_pixel4(in, px, py, in_width, in_height, itype, iwidth));
 }
 
 // the OpenCL kernels check the coordinates of all three channels for NaN, and

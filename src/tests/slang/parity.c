@@ -723,6 +723,18 @@ static int make_tests(test_t *t)
          BUFFER("xoffs", gr_xoffs, sizeof(gr_xoffs)), BUFFER("yoffs", gr_yoffs, sizeof(gr_yoffs)),
          INT("samples", gr_samples[k]), FLOAT("strength", 0.8f),
          BUFFER("grain_lut", gr_lut, sizeof(gr_lut)));
+  // scale pixels, as a tile of a larger image: a horizontal squeeze and a
+  // vertical stretch, so that the bottom of the output falls outside the
+  // input. Dyadic scales and offsets keep every sample position exact on both
+  // sides, as for rotatepixels above
+  static const char *sp_labels[4] = { "scalepixels bilinear", "scalepixels bicubic",
+                                      "scalepixels lanczos2", "scalepixels lanczos3" };
+  for(int k = 0; k < 4; k++)
+    TEST_TOL(sp_labels[k], "basic", "scalepixels", 1e-5,
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         INT("in_width", W), INT("in_height", H), FLOAT2("scale", 0.75f, 1.25f),
+         INT2("shift", 12, 3), FLOAT2("offset", 7.5f, 2.25f),
+         INT("itype", k), INT("iwidth", rp_widths[k]));
   TEST("whitebalance_1f_xtrans", "basic", "whitebalance_1f_xtrans",
        RAW_IN("in", image_raw), RAW_OUT("out"), INT("width", W), INT("height", H),
        BUFFER("coeffs", wb_coeffs, sizeof(wb_coeffs)), INT("filters", 9),
