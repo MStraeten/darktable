@@ -989,6 +989,23 @@ void dt_slang_gpu_free_align(void *mem)
   if(!last) dt_free_align(mem);
 }
 
+static size_t _pooled_bytes(void)
+{
+  size_t pooled = 0;
+  for(DtSlangImage *img in _mtl.images) pooled += _image_bytes(img);
+  for(DtSlangBuffer *buf in _mtl.buffers) pooled += buf->buffer.length;
+  return pooled + _staging_bytes();
+}
+
+size_t dt_slang_gpu_pooled_memory(void)
+{
+  if(!dt_slang_gpu_enabled()) return 0;
+  g_mutex_lock(&_mtl_lock);
+  const size_t pooled = _pooled_bytes();
+  g_mutex_unlock(&_mtl_lock);
+  return pooled;
+}
+
 void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
 {
   *available = 0;
@@ -997,10 +1014,7 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
   g_mutex_lock(&_mtl_lock);
   // what the pools keep counts as allocated although it would be freed for
   // the module
-  size_t pooled = 0;
-  for(DtSlangImage *img in _mtl.images) pooled += _image_bytes(img);
-  for(DtSlangBuffer *buf in _mtl.buffers) pooled += buf->buffer.length;
-  pooled += _staging_bytes();
+  const size_t pooled = _pooled_bytes();
   // macOS recommends most of the system memory to a unified-memory GPU,
   // which slang_gpu_unified_fraction can lower as OpenCL's unified_fraction does
   size_t limit = _mtl.dev.recommendedMaxWorkingSetSize;

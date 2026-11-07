@@ -192,6 +192,9 @@ void dt_slang_gpu_release_pools(void);
 // width or height. The pixelpipe tiles a module that needs more. The
 // slang_gpu_memory config key (MB) lowers the memory, to test tiling.
 void dt_slang_gpu_memory_info(size_t *available, int *max_dim);
+// the part of that memory the pools hold: a module using it evicts images
+// and buffers that the next modules allocate again
+size_t dt_slang_gpu_pooled_memory(void);
 
 // a buffer of size bytes on the device, for the intermediate results of a
 // chain of kernels. It is filled from host if that is not NULL, and zeroed

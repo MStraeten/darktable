@@ -2426,6 +2426,36 @@ mismatch:
   return 1;
 }
 
+// what the pools hold, including what was evicted and waits for its
+// batches, and with staging the idle staging buffers
+static VkDeviceSize _pooled_bytes(const gboolean staging)
+{
+  VkDeviceSize pooled = 0;
+  for(GList *l = _vk.images; l; l = g_list_next(l))
+    pooled += _image_bytes(l->data);
+  for(GList *l = _vk.doomed_images; l; l = g_list_next(l))
+    pooled += _image_bytes(l->data);
+  for(GList *l = _vk.buffers; l; l = g_list_next(l))
+    pooled += ((const dt_slang_gpu_buffer_t *)l->data)->size;
+  for(GList *l = _vk.doomed_buffers; l; l = g_list_next(l))
+    pooled += ((const dt_slang_gpu_buffer_t *)l->data)->size;
+  if(staging)
+    for(GList *l = _vk.staging; l; l = g_list_next(l))
+      pooled += ((const dt_slang_staging_t *)l->data)->size;
+  return pooled;
+}
+
+size_t dt_slang_gpu_pooled_memory(void)
+{
+  if(!dt_slang_gpu_enabled()) return 0;
+  g_mutex_lock(&_vk_lock);
+  // dt_slang_gpu_memory_info() counts the idle staging buffers only on an
+  // integrated GPU, where they share the heaps with the images
+  const VkDeviceSize pooled = _pooled_bytes(!_vk.discrete);
+  g_mutex_unlock(&_vk_lock);
+  return pooled;
+}
+
 void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
 {
   *available = 0;
@@ -2446,15 +2476,7 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
     VkPhysicalDeviceMemoryProperties2 props2
         = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &budget };
     vkGetPhysicalDeviceMemoryProperties2(_vk.pdev, &props2);
-    VkDeviceSize pooled = 0;
-    for(GList *l = _vk.images; l; l = g_list_next(l))
-      pooled += _image_bytes(l->data);
-    for(GList *l = _vk.doomed_images; l; l = g_list_next(l))
-      pooled += _image_bytes(l->data);
-    for(GList *l = _vk.buffers; l; l = g_list_next(l))
-      pooled += ((const dt_slang_gpu_buffer_t *)l->data)->size;
-    for(GList *l = _vk.doomed_buffers; l; l = g_list_next(l))
-      pooled += ((const dt_slang_gpu_buffer_t *)l->data)->size;
+    VkDeviceSize pooled = _pooled_bytes(FALSE);
     if(_vk.discrete)
     {
       for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
@@ -2495,8 +2517,7 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
       }
       total += total_host;
       best += free_host;
-      for(GList *l = _vk.staging; l; l = g_list_next(l))
-        pooled += ((const dt_slang_staging_t *)l->data)->size;
+      pooled = _pooled_bytes(TRUE);
       best = MIN(total, best + pooled);
     }
   }
