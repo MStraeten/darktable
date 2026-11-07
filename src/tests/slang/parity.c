@@ -900,6 +900,24 @@ static int make_tests(test_t *t)
          BUFFER("luminance", cs_lum, sizeof(cs_lum)), BUFFER("tmp", cs_tmp, sizeof(cs_tmp)), INT("width", W),
          INT("height", H));
 
+    // the auto radius, on an area offset into the raw: each work group's
+    // largest green ratio, for one Bayer pattern and X-Trans
+    {
+      enum { CR_DX = 6, CR_DY = 6, CR_W = W - 2 * CR_DX, CR_H = H - 2 * CR_DY };
+      const int bx = (CR_W / 2 + 15) / 16, by = (CR_H + 15) / 16;
+      const int xx = (CR_W / 3 + 15) / 16, xy = (CR_H / 3 + 15) / 16;
+      TEST_GRID("capture_radius bayer", "capture", "capture_radius", 1e-6, 16 * bx, 16 * by,
+                RAW_IN("in", image_raw), BUFFER("xtrans", xtrans6, sizeof(xtrans6)), INT("filters", bayer[0]),
+                FLOAT4("coeff", 0.5f, 1.0f, 0.7f, 1.0f), INT("dx", CR_DX), INT("dy", CR_DY), INT("width", CR_W),
+                INT("height", CR_H), INT("startx", 0), INT("starty", 0), SLANG_INT("groups_x", bx),
+                BUFFER_OUT("partial", NULL, sizeof(float) * bx * by), LOCAL("buffer", sizeof(float) * 16 * 16));
+      TEST_GRID("capture_radius xtrans", "capture", "capture_radius", 1e-6, 16 * xx, 16 * xy,
+                RAW_IN("in", image_raw), BUFFER("xtrans", xtrans6, sizeof(xtrans6)), INT("filters", 9),
+                FLOAT4("coeff", 0.5f, 1.0f, 0.7f, 1.0f), INT("dx", CR_DX), INT("dy", CR_DY), INT("width", CR_W),
+                INT("height", CR_H), INT("startx", 7), INT("starty", 7), SLANG_INT("groups_x", xx),
+                BUFFER_OUT("partial", NULL, sizeof(float) * xx * xy), LOCAL("buffer", sizeof(float) * 16 * 16));
+    }
+
     // the mask of dual demosaic, which the detail mask shares, and its blend
     static float dual_low[4 * W * H];
     for(int k = 0; k < 4 * W * H; k++) dual_low[k] = image_in[(k + 4 * 97) % (4 * W * H)];

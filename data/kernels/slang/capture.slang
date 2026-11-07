@@ -209,3 +209,181 @@ void capture_result(uint3 gid : SV_DispatchThreadID,
   }
   out.write(int2(col, row), pix);
 }
+
+// auto radius, see capture_radius in ../capture.cl: the sensor value at
+// (row, col) of the tested area, white balance undone
+float _radius_val(ImageIn in, StructuredBuffer<uint> xtrans, uint filters, float4 coeff,
+                  int dx, int dy, int row, int col)
+{
+  const int c = fcol(row, col, filters, xtrans);
+  const float f = c == 0 ? coeff.x : (c == 1 ? coeff.y : (c == 2 ? coeff.z : coeff.w));
+  return f * in.readsingle(col + dx, row + dy);
+}
+
+static const float RAWEPS = 0.005f;
+static const float lowerLimit = 0.01f;
+static const float upperLimit = 0.9f;
+
+#define V(r, c) _radius_val(in, xtrans, filters, coeff, dx, dy, row + (r), col + (c))
+
+// largest ratio of neighbouring greens at one site, same tests as _calcRadiusBayer()
+float _radius_bayer(ImageIn in, StructuredBuffer<uint> xtrans, uint filters, float4 coeff,
+                    int dx, int dy, int row, int col)
+{
+  float maxRatio = 1.0f;
+  const float val00 = V(0, 0);
+  if(val00 <= RAWEPS) return maxRatio;
+
+  const float val1m1 = V(1, -1);
+  const float val1p1 = V(1, 1);
+  const float maxVal0 = max(val00, val1m1);
+  if(val1m1 > RAWEPS && maxVal0 > lowerLimit)
+  {
+    const float minVal = min(val00, val1m1);
+    if(maxVal0 > maxRatio * minVal)
+    {
+      const float clip = maxVal0 == val00
+                       ? max(max(V(-1, -1), V(-1, 1)), val1p1)
+                       : max(max(max(V(0, -2), val00), V(2, -2)), V(2, 0));
+      if(clip < upperLimit)
+        maxRatio = maxVal0 / minVal;
+    }
+  }
+
+  const float maxVal1 = max(val00, val1p1);
+  if(val1p1 > RAWEPS && maxVal1 > lowerLimit)
+  {
+    const float minVal = min(val00, val1p1);
+    if(maxVal1 > maxRatio * minVal)
+    {
+      const float clip = maxVal1 == val00
+                       ? max(max(V(-1, -1), V(-1, 1)), val1p1)
+                       : max(max(max(val00, V(0, 2)), V(2, 0)), V(2, 2));
+      if(clip < upperLimit)
+        maxRatio = maxVal1 / minVal;
+    }
+  }
+  return maxRatio;
+}
+
+float _radius_pair(float a, float b, float maxRatio)
+{
+  const float maxVal = max(a, b);
+  const float minVal = min(a, b);
+  return maxVal > lowerLimit && maxVal > maxRatio * minVal ? maxVal / minVal : maxRatio;
+}
+
+// same tests as _calcRadiusXtrans()
+float _radius_xtrans(ImageIn in, StructuredBuffer<uint> xtrans, uint filters, float4 coeff,
+                     int dx, int dy, int row, int col)
+{
+  float maxRatio = 1.0f;
+  const float valp1p1 = V(1, 1);
+  const bool squareClipped = max(max(max(valp1p1, V(1, 2)), V(2, 1)), V(2, 2)) >= upperLimit;
+  const float greenSolitary = V(0, 0);
+  if(greenSolitary > RAWEPS && max(V(-1, -1), V(-1, 1)) < upperLimit)
+  {
+    if(greenSolitary < upperLimit)
+    {
+      const float valp1m1 = V(1, -1);
+      if(valp1m1 > RAWEPS && max(max(max(V(1, -2), valp1m1), V(2, -2)), V(1, -1)) < upperLimit)
+        maxRatio = _radius_pair(greenSolitary, valp1m1, maxRatio);
+      if(valp1p1 > RAWEPS && !squareClipped)
+        maxRatio = _radius_pair(greenSolitary, valp1p1, maxRatio);
+    }
+  }
+
+  if(!squareClipped)
+  {
+    const float valp2p2 = V(2, 2);
+    if(valp2p2 > RAWEPS)
+    {
+      if(valp1p1 > RAWEPS)
+        maxRatio = _radius_pair(valp1p1, valp2p2, maxRatio);
+      const float greenSolitaryRight = V(3, 3);
+      if(max(max(greenSolitaryRight, V(4, 2)), V(4, 4)) < upperLimit && greenSolitaryRight > RAWEPS)
+        maxRatio = _radius_pair(greenSolitaryRight, valp2p2, maxRatio);
+    }
+    const float valp1p2 = V(1, 2);
+    const float valp2p1 = V(2, 1);
+    if(valp2p1 > RAWEPS)
+    {
+      if(valp1p2 > RAWEPS)
+        maxRatio = _radius_pair(valp1p2, valp2p1, maxRatio);
+      const float greenSolitaryLeft = V(3, 0);
+      if(max(max(greenSolitaryLeft, V(4, -1)), V(4, 1)) < upperLimit && greenSolitaryLeft > RAWEPS)
+        maxRatio = _radius_pair(greenSolitaryLeft, valp2p1, maxRatio);
+    }
+  }
+  return maxRatio;
+}
+
+#undef V
+
+groupshared float radius_max[256];
+
+// one work item per tested site, each 16x16 work group writes the largest
+// ratio it found to partial
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void capture_radius(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID,
+                    uniform ImageIn in, uniform StructuredBuffer<uint> xtrans, uniform uint filters,
+                    uniform float4 coeff, uniform int dx, uniform int dy, uniform int width, uniform int height,
+                    uniform int startx, uniform int starty, uniform int groups_x,
+                    uniform RWStructuredBuffer<float> partial)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  const int l = int(lid.y * 16 + lid.x);
+
+  float maxRatio = 1.0f;
+  if(filters == 9u)
+  {
+    const int row = starty + 2 + 3 * y;
+    const int col = startx + 2 + 3 * x;
+    if(row < height - 4 && col < width - 4)
+      maxRatio = _radius_xtrans(in, xtrans, filters, coeff, dx, dy, row, col);
+  }
+  else
+  {
+    const int row = 4 + y;
+    const int col = (filters != 0u ? 5 + (FC(row & 1, 0, filters) & 1) : 5) + 2 * x;
+    if(row < height - 4 && col < width - 4)
+      maxRatio = _radius_bayer(in, xtrans, filters, coeff, dx, dy, row, col);
+  }
+
+  radius_max[l] = maxRatio;
+  GroupMemoryBarrierWithGroupSync();
+
+  for(int offset = 128; offset > 0; offset >>= 1)
+  {
+    if(l < offset) radius_max[l] = max(radius_max[l], radius_max[l + offset]);
+    GroupMemoryBarrierWithGroupSync();
+  }
+
+  if(l == 0) partial[grp.y * groups_x + grp.x] = radius_max[0];
+}
+
+// the largest of the length partial maxima of capture_radius(), into
+// result[0], in a single 16x16 work group. OpenCL leaves this step to the host
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void capture_radius_reduce(uint3 lid : SV_GroupThreadID,
+                           uniform StructuredBuffer<float> partial, uniform RWStructuredBuffer<float> result,
+                           uniform int length)
+{
+  const int l = int(lid.y * 16 + lid.x);
+  float m = 1.0f;
+  for(int k = l; k < length; k += 256)
+    m = max(m, partial[k]);
+  radius_max[l] = m;
+  GroupMemoryBarrierWithGroupSync();
+
+  for(int offset = 128; offset > 0; offset >>= 1)
+  {
+    if(l < offset) radius_max[l] = max(radius_max[l], radius_max[l + offset]);
+    GroupMemoryBarrierWithGroupSync();
+  }
+
+  if(l == 0) result[0] = radius_max[0];
+}

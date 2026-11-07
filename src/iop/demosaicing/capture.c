@@ -1190,7 +1190,8 @@ static int _capture_sharpen_cl(dt_iop_module_t *self,
 
 #ifdef HAVE_SLANG_GPU
 
-// _capture_radius_cl() for the Slang kernels: the radius is estimated on the host
+// _capture_radius_cl() for the Slang kernels: the device finds the largest
+// green ratio, only that value is read back
 static float _capture_radius_slang(dt_iop_module_t *self,
                                    dt_dev_pixelpipe_iop_t *const piece,
                                    dt_slang_gpu_image_t *dev_in,
@@ -1198,14 +1199,53 @@ static float _capture_radius_slang(dt_iop_module_t *self,
                                    const uint8_t (*const xtrans)[6],
                                    const uint32_t filters)
 {
-  float *in = dt_iop_image_alloc(roi->width, roi->height, 1);
+  const dt_dev_pixelpipe_t *pipe = piece->pipe;
+  const dt_image_t *img = &self->dev->image_storage;
+
+  int dx, dy, owidth, oheight;
+  if(!_auto_radius_area(img, roi, &dx, &dy, &owidth, &oheight))
+    return 0.5f;
+
+  dt_aligned_pixel_t coeff;
+  _auto_radius_coeffs(&pipe->dsc, coeff);
+
+  const gboolean is_xtrans = filters == 9u;
+  int startx = 0;
+  int starty = 0;
+  if(is_xtrans) _xtrans_radius_start(xtrans, &startx, &starty);
+
+  const int sites_x = is_xtrans ? owidth / 3 : owidth / 2;
+  const int sites_y = is_xtrans ? oheight / 3 : oheight;
+  const int groups_x = (sites_x + 15) / 16;
+  const int groups = groups_x * ((sites_y + 15) / 16);
+
+  dt_slang_gpu_buffer_t *dev_partial = dt_slang_gpu_buffer_new_uninit(sizeof(float) * groups);
+  dt_slang_gpu_buffer_t *dev_result = dt_slang_gpu_buffer_new_uninit(sizeof(float));
+  float maxRatio = 1.0f;
+  int err = !dev_partial || !dev_result;
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("capture", "capture_radius", sites_x, sites_y,
+                                   SLIMG_DEV(dev_in), SLBUF(xtrans, 36), SLARG(filters), SLARG(coeff),
+                                   SLARG(dx), SLARG(dy), SLARG(owidth), SLARG(oheight),
+                                   SLARG(startx), SLARG(starty), SLARG(groups_x), SLBUF_DEV(dev_partial));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("capture", "capture_radius_reduce", 16, 16,
+                                   SLBUF_DEV(dev_partial), SLBUF_DEV(dev_result), SLARG(groups));
+  if(!err)
+    err = dt_slang_gpu_buffer_read(dev_result, &maxRatio, sizeof(float));
+  dt_slang_gpu_buffer_free(dev_partial);
+  dt_slang_gpu_buffer_free(dev_result);
+
   float radius = 0.5f;
-  if(in && !dt_slang_gpu_image_read(dev_in, in))
-    radius = _capture_radius(self, piece, in, roi, xtrans, filters);
+  if(!err)
+  {
+    radius = sqrtf(1.0f / logf(maxRatio));
+    if(is_xtrans) radius += 0.2f;
+    radius = CLAMP(radius, 0.0f, 1.5f);
+  }
   else
-    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, filters == 9u ? "xtrans autoradius" : "bayer autoradius",
-                  piece->pipe, self, DT_DEVICE_NONE, roi, NULL, "Slang calculation failed");
-  dt_free_align(in);
+    dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, is_xtrans ? "xtrans autoradius" : "bayer autoradius",
+                  pipe, self, DT_DEVICE_NONE, roi, NULL, "Slang calculation failed");
   return radius;
 }
 
