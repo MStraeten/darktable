@@ -575,7 +575,7 @@
     <type>string</type>
     <default></default>
     <shortdescription>device for the Slang GPU kernels</shortdescription>
-    <longdescription>experimental: the index or part of the name of the Vulkan or Metal device to run the Slang kernels on, as listed by '-d slang'. empty picks a discrete GPU, then an integrated one; on Metal it picks the system default device. set from 'Slang device' in preferences > processing</longdescription>
+    <longdescription>experimental: the index or part of the name of the Vulkan or Metal device to run the Slang kernels on, as listed by '-d slang'. empty picks a discrete GPU, then an integrated one, never a CPU driver such as llvmpipe; on Metal it picks the system default device. set from 'Slang device' in preferences > processing</longdescription>
   </dtconfig>
   <dtconfig>
     <name>slang_gpu_memory</name>

@@ -195,7 +195,9 @@ static const char *_device_type(const VkPhysicalDeviceType type)
 // the device wanted asks for, by index or by part of its name. Without one,
 // or if none matches, a discrete GPU wins over an integrated one, which wins
 // over the rest: on hybrid laptops the integrated GPU is usually enumerated
-// first, and a CPU implementation such as lavapipe is only a last resort
+// first. a CPU implementation such as llvmpipe is only taken when asked for:
+// it runs slower than darktable's own CPU path, like the CPU OpenCL devices
+// opencl.c discards. returns -1 when no device qualifies
 static int _pick_device(const VkPhysicalDevice *devs,
                         const uint32_t ndev,
                         const char *wanted,
@@ -218,6 +220,7 @@ static int _pick_device(const VkPhysicalDevice *devs,
       : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3
       : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2
       : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 1
+      : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? -1
       : 0;
     if(log)
       dt_print(DT_DEBUG_SLANG, "[slang_gpu] Vulkan device %u: %s, %s, vendor 0x%04x%s", d, props.deviceName,
@@ -251,7 +254,14 @@ static gboolean _init_device(void)
   }
   VkPhysicalDevice *devs = g_new(VkPhysicalDevice, ndev);
   vkEnumeratePhysicalDevices(_vk.instance, &ndev, devs);
-  _vk.pdev = devs[_pick_device(devs, ndev, dt_conf_get_string_const("slang_gpu_device"), TRUE)];
+  const int picked = _pick_device(devs, ndev, dt_conf_get_string_const("slang_gpu_device"), TRUE);
+  if(picked < 0)
+  {
+    g_free(devs);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] only CPU Vulkan devices, name one in slang_gpu_device to use it");
+    return FALSE;
+  }
+  _vk.pdev = devs[picked];
   g_free(devs);
 
   VkPhysicalDeviceProperties props;

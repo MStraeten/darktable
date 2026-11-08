@@ -270,7 +270,8 @@ jobs:
                  slang.png \
                  --width 1000 --height 1000 --apply-custom-presets false \
                  --core --disable-opencl --library :memory: \
-                 --conf slang_gpu=TRUE -d pipe > slang.log 2>&1
+                 --conf slang_gpu=TRUE --conf slang_gpu_device=llvmpipe \
+                 -d pipe > slang.log 2>&1
           echo "$(grep -c 'process slang' slang.log) module runs on Slang"
           grep -q 'process slang' slang.log
           ! grep 'slang fallback' slang.log

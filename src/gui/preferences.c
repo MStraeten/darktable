@@ -1730,7 +1730,7 @@ static void _preferences_slang_device(GtkGrid *grid,
   GtkWidget *widget = dt_bauhaus_combobox_new_action(NULL);
   dt_bauhaus_combobox_set_selected_text_align(widget, DT_BAUHAUS_COMBOBOX_ALIGN_LEFT);
   const dt_slang_gpu_device_t *def = g_list_nth_data(devices, automatic);
-  gchar *text = def ? g_strdup_printf(_("automatic (%s)"), def->name) : g_strdup(_("automatic"));
+  gchar *text = def ? g_strdup_printf(_("automatic (%s)"), def->name) : g_strdup(_("automatic (no GPU)"));
   dt_bauhaus_combobox_add(widget, text);
   g_free(text);
   for(GList *l = devices; l; l = g_list_next(l))
@@ -1746,7 +1746,8 @@ static void _preferences_slang_device(GtkGrid *grid,
   gtk_widget_set_halign(widget, GTK_ALIGN_START);
   gtk_size_group_add_widget(widget_group, widget);
   gtk_widget_set_tooltip_text(widget, _("the GPU the Slang kernels run on, takes effect after a restart.\n"
-                                        "automatic prefers a GPU with memory of its own"));
+                                        "automatic prefers a GPU with memory of its own and never picks\n"
+                                        "a software driver such as llvmpipe"));
   g_signal_connect(widget, "value-changed", G_CALLBACK(_slang_device_changed), NULL);
   gtk_grid_attach(grid, label, 0, *line, 1, 1);
   gtk_grid_attach(grid, widget, 2, (*line)++, 1, 1);
