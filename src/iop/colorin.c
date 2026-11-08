@@ -1094,8 +1094,8 @@ gboolean process_slang(dt_iop_module_t *self,
   const int width = roi_in->width;
   const int height = roi_in->height;
 
-  // a Lab input profile is a plain copy
-  if(d->type == DT_COLORSPACE_LAB)
+  // a Lab input profile is a plain copy, unless working RGB is wanted
+  if(d->type == DT_COLORSPACE_LAB && !d->output_rgb)
   {
     const int zero = 0;
     return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
@@ -1104,13 +1104,26 @@ gboolean process_slang(dt_iop_module_t *self,
   }
 
   const dt_dev_wb_t *wb = &pipe->wb;
-  const gboolean corrected = wb->late_correction;
+  const gboolean corrected = wb->late_correction && d->type != DT_COLORSPACE_LAB;
   dt_aligned_pixel_t coeffs;
   dt_dev_wb_get_rgb_correction(wb, corrected, coeffs);
 
   float cmat[9], lmat[9];
-  pack_3xSSE_to_3x3(d->nrgb ? d->nmatrix : d->cmatrix, cmat);
-  pack_3xSSE_to_3x3(d->lmatrix, lmat);
+  if(d->output_rgb && d->type == DT_COLORSPACE_LAB)
+  {
+    memset(cmat, 0, sizeof(cmat));
+    memset(lmat, 0, sizeof(lmat));
+  }
+  else if(d->output_rgb)
+  {
+    pack_3xSSE_to_3x3(d->nrgb ? d->nmatrix : d->rgb_matrix, cmat);
+    pack_3xSSE_to_3x3(d->rgb_lmatrix, lmat);
+  }
+  else
+  {
+    pack_3xSSE_to_3x3(d->nrgb ? d->nmatrix : d->cmatrix, cmat);
+    pack_3xSSE_to_3x3(d->lmatrix, lmat);
+  }
 
   const gboolean blue_mapping = d->blue_mapping
                            && dt_image_is_matrix_correction_supported(&pipe->image);
@@ -1119,16 +1132,38 @@ gboolean process_slang(dt_iop_module_t *self,
   float dummy_hsm = 0.0f;
   const size_t len = use_hsm ? (size_t)d->hue_div * d->sat_div * d->val_div * 3 : 1;
 
-  const int err = !dt_is_valid_colormatrix(d->cmatrix[0][0])
-    ? _process_slang_clut(d, dev_in, dev_out, width, height, coeffs)
-    : dt_slang_gpu_run_2d_args("basic", d->nrgb ? "colorin_clipping" : "colorin_unbound",
-    width, height, SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
-    SLBUF(cmat, sizeof(cmat)), SLBUF(lmat, sizeof(lmat)),
-    SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1), SLIMG_IN(d->lut[2], 256, 256, 1),
-    SLARG(blue_mapping), SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)),
-    SLBUF(coeffs, sizeof(float) * 4), SLARG(scale), SLARG(d->hue_div), SLARG(d->sat_div),
-    SLARG(d->val_div), SLBUF(use_hsm ? d->hsm : &dummy_hsm, sizeof(float) * len),
-    SLARG(d->hsm_encode), SLARG(use_hsm), SLARG(d->hdr_transfer));
+  int err = 0;
+  // Lab input has no matrix either, but no transform: colorin_rgb handles it
+  if(!dt_is_valid_colormatrix(d->cmatrix[0][0]) && d->type != DT_COLORSPACE_LAB)
+    err = _process_slang_clut(d, dev_in, dev_out, width, height, coeffs);
+  else if(d->output_rgb)
+  {
+    dt_colorspaces_iccprofile_info_slang_t work_info;
+    int lut_w = 0, lut_h = 0;
+    float *work_lut = dt_ioppr_build_iccprofile_params_slang(d->work_profile, &work_info, &lut_w, &lut_h);
+    const int clipping = d->nrgb != NULL;
+    const int lab_input = d->type == DT_COLORSPACE_LAB;
+    err = !work_lut
+      || dt_slang_gpu_run_2d_args("basic", "colorin_rgb",
+        width, height, SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+        SLBUF(cmat, sizeof(cmat)), SLBUF(lmat, sizeof(lmat)),
+        SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1), SLIMG_IN(d->lut[2], 256, 256, 1),
+        SLARG(blue_mapping), SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)),
+        SLBUF(coeffs, sizeof(float) * 4), SLARG(scale), SLARG(d->hue_div), SLARG(d->sat_div),
+        SLARG(d->val_div), SLBUF(use_hsm ? d->hsm : &dummy_hsm, sizeof(float) * len),
+        SLARG(d->hsm_encode), SLARG(use_hsm), SLARG(d->hdr_transfer), SLARG(clipping),
+        SLBUF(&work_info, sizeof(work_info)), SLIMG_IN(work_lut, lut_w, lut_h, 1), SLARG(lab_input));
+    free(work_lut);
+  }
+  else
+    err = dt_slang_gpu_run_2d_args("basic", d->nrgb ? "colorin_clipping" : "colorin_unbound",
+      width, height, SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+      SLBUF(cmat, sizeof(cmat)), SLBUF(lmat, sizeof(lmat)),
+      SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1), SLIMG_IN(d->lut[2], 256, 256, 1),
+      SLARG(blue_mapping), SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)),
+      SLBUF(coeffs, sizeof(float) * 4), SLARG(scale), SLARG(d->hue_div), SLARG(d->sat_div),
+      SLARG(d->val_div), SLBUF(use_hsm ? d->hsm : &dummy_hsm, sizeof(float) * len),
+      SLARG(d->hsm_encode), SLARG(use_hsm), SLARG(d->hdr_transfer));
   if(err) return FALSE;
 
   // only once the kernel ran: on failure the CPU path does this again

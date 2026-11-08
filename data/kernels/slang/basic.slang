@@ -257,6 +257,117 @@ void colorin_clipping(uint3 gid : SV_DispatchThreadID,
                                  hue_div, sat_div, val_div, dev_hsm, encoding, use_hsm, hdr_transfer, true));
 }
 
+/* kernel for the plugin colorin: working RGB output, for settings from
+   version 8 on (see colorin_rgb in basic.cl) */
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void colorin_rgb(uint3 gid : SV_DispatchThreadID,
+                 uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                 uniform StructuredBuffer<float> cmat, uniform StructuredBuffer<float> lmat,
+                 uniform ImageIn lutr, uniform ImageIn lutg, uniform ImageIn lutb,
+                 uniform int blue_mapping, uniform StructuredBuffer<float> a,
+                 uniform StructuredBuffer<float> corr, uniform float scale,
+                 uniform int hue_div, uniform int sat_div, uniform int val_div,
+                 uniform StructuredBuffer<float> dev_hsm, uniform int encoding, uniform int use_hsm,
+                 uniform int hdr_transfer, uniform int clipping,
+                 uniform StructuredBuffer<ProfileInfo> work, uniform ImageIn work_lut,
+                 uniform int lab_input)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  const ProfileInfo wp = work[0];
+  const float4 corval = float4(corr[0], corr[1], corr[2], corr[3]);
+  const float4 input = in.readpixel(x, y);
+  float4 pixel = corval * input;
+  const float alpha = input.w;
+
+  if(lab_input != 0)
+  {
+    pixel = matrix_product(Lab_to_XYZ(input), wp.matrix_out);
+    if(wp.nonlinearlut != 0 || wp.hdr_transfer != 0)
+      pixel = apply_trc_out(pixel, wp, work_lut);
+    pixel.w = alpha;
+    out.write(int2(x, y), pixel);
+    return;
+  }
+
+  float3 cam;
+  if(hdr_transfer != 0)
+  {
+    cam = pixel.xyz;
+    dt_hdr_decode(cam, hdr_transfer);
+  }
+  else
+  {
+    cam[0] = lerp_lookup_unbounded0(lutr, pixel.x, a, 0);
+    cam[1] = lerp_lookup_unbounded0(lutg, pixel.y, a, 1);
+    cam[2] = lerp_lookup_unbounded0(lutb, pixel.z, a, 2);
+  }
+
+  if(blue_mapping != 0)
+  {
+    const float YY = cam[0] + cam[1] + cam[2];
+    if(YY > 0.0f)
+    {
+      // manual gamut mapping, as _apply_blue_mapping() in colorin.c
+      const float zz = cam[2] / YY;
+      const float bound_z = 0.5f, bound_Y = 0.5f;
+      const float amount = 0.11f;
+      if(zz > bound_z)
+      {
+        const float t = (zz - bound_z) / (1.0f - bound_z) * min(1.0f, YY / bound_Y);
+        cam[1] += t * amount;
+        cam[2] -= t * amount;
+      }
+    }
+  }
+
+  // the first matrix maps directly to working RGB, or to the clipping gamut
+  float4 linear = float4(0.0f);
+  for(int j = 0; j < 3; j++)
+    for(int i = 0; i < 3; i++) linear[j] += cmat[3*j+i] * cam[i];
+  if(clipping != 0)
+  {
+    const float4 clipped = clamp(linear, 0.0f, 1.0f);
+    linear = float4(0.0f);
+    for(int j = 0; j < 3; j++)
+      for(int i = 0; i < 3; i++) linear[j] += lmat[3*j+i] * clipped[i];
+  }
+  pixel = linear;
+  if(use_hsm != 0)
+  {
+    float4 prophoto_rgb = XYZ_to_prophotorgb(matrix_product(pixel, wp.matrix_in)) / scale;
+    float4 hsv = RGB_2_HSV(prophoto_rgb);
+    // encode value for table lookup if needed
+    float v_encoded = hsv.z;
+    if(encoding == 1) // sRGB
+      v_encoded = _linear_to_srgb(clipf(v_encoded));
+
+    // use the encoded value for table lookup
+    float4 hsv_for_lookup = hsv;
+    hsv_for_lookup.z = v_encoded;
+    float4 correction = _lookup_hsm(hsv_for_lookup, hue_div, sat_div, val_div, dev_hsm);
+
+    hsv.x += correction.x / 360.0f;
+    hsv.x -= floor(hsv.x); // stay within the 360° hue circle
+    hsv.y = clipf(hsv.y * correction.y);
+
+    float v_corrected = v_encoded * correction.z;
+    if(encoding == 1) // sRGB
+      v_corrected = _srgb_to_linear(v_corrected);
+    hsv.z = clipf(v_corrected);
+    prophoto_rgb = HSV_2_RGB(hsv) * scale;
+    pixel = matrix_product(prophotorgb_to_XYZ(prophoto_rgb), wp.matrix_out);
+  }
+  if(wp.nonlinearlut != 0 || wp.hdr_transfer != 0)
+    pixel = apply_trc_out(pixel, wp, work_lut);
+  pixel.w = alpha;
+  out.write(int2(x, y), pixel);
+}
+
 /* kernel for the plugin colorout, fast matrix + shaper path only */
 [shader("compute")]
 [numthreads(16, 16, 1)]

@@ -567,6 +567,32 @@ static int make_tests(test_t *t)
            INT("hdr_transfer", mode == 2 ? 1 : 0));
     }
 
+  // working RGB output (colorin version 8): camera to working RGB directly,
+  // to the clipping gamut and back, with and without the hue/saturation map,
+  // PQ input, and Lab input, into a linear and a nonlinear working profile
+  static const char *colorin_rgb_labels[2][4] = {
+    { "colorin_rgb", "colorin_rgb hsm", "colorin_rgb pq", "colorin_rgb lab" },
+    { "colorin_rgb clipping", "colorin_rgb clipping hsm nonlinear", "colorin_rgb clipping pq", "colorin_rgb lab nonlinear" } };
+  for(int clipping = 0; clipping < 2; clipping++)
+    for(int mode = 0; mode < 4; mode++)
+    {
+      const profile_info_t *work = clipping ? &profile_nonlinear : &profile_linear;
+      // the same tolerances as colorin unbound and clipping above
+      TEST_TOL(colorin_rgb_labels[clipping][mode], "basic", "colorin_rgb",
+           mode == 0 || mode == 3 ? 5e-4 : mode == 1 ? 5e-3 : 0.05,
+           IMG_IN("in", mode == 3 ? image_lab : image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+           BUFFER("cmat", mode == 2 ? rgb_to_xyz : cam_to_rgb, sizeof(cam_to_rgb)),
+           BUFFER("lmat", xyz_to_rgb, sizeof(xyz_to_rgb)),
+           LUT("lutr", lut_curve, 256, 256), LUT("lutg", lut_curve, 256, 256), LUT("lutb", lut_curve, 256, 256),
+           INT("blue_mapping", mode != 2), BUFFER("a", unbounded, sizeof(unbounded)),
+           BUFFER("corr", corr, sizeof(corr)), FLOAT("scale", 1.2f),
+           INT("hue_div", HUE_DIV), INT("sat_div", SAT_DIV), INT("val_div", VAL_DIV),
+           BUFFER("dev_hsm", hsm, sizeof(hsm)), INT("encoding", 1), INT("use_hsm", mode == 1),
+           INT("hdr_transfer", mode == 2 ? 1 : 0), INT("clipping", clipping),
+           BUFFER("work", work, sizeof(profile_info_t)), LUT("work_lut", lut_profile, 256, 256 * 6),
+           INT("lab_input", mode == 3));
+    }
+
   TEST("colorout", "basic", "colorout",
        IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
        BUFFER("mat", xyz_to_rgb, sizeof(xyz_to_rgb)),
