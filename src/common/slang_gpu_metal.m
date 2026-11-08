@@ -85,8 +85,8 @@ static GMutex _mtl_lock;
 // guards _mtl.staging only, which command buffer completion handlers refill
 static GMutex _staging_lock;
 static GThread *_prepare_thread = NULL;
-// guards _mtl.kernels and _building: off Apple GPUs the preload builds
-// kernels while pipes run
+// guards _mtl.kernels and _building: the preload builds kernels while
+// pipes run
 static GMutex _kernels_lock;
 static GCond _kernels_built;
 // keys of the kernels whose pipeline a thread is building
@@ -395,9 +395,9 @@ static gboolean _pipe_busy(void)
 
 // loads every <program>.<entry>.metallib in kernels/slang and builds its
 // pipeline, which takes longer than running the kernel the first time.
-// With yield set it builds one at a time and only while no pipe is
-// dispatching, so that a pipe's own builds do not queue behind it
-static void _preload_kernels(const gboolean yield)
+// It builds one at a time and only while no pipe is dispatching, so that
+// a pipe's own builds do not queue behind it
+static void _preload_kernels(void)
 {
   char datadir[PATH_MAX] = { 0 };
   dt_loc_get_datadir(datadir, sizeof(datadir));
@@ -407,7 +407,7 @@ static void _preload_kernels(const gboolean yield)
   while(dir && (file = g_dir_read_name(dir)) && !g_atomic_int_get(&_preload_stop))
   {
     if(!g_str_has_suffix(file, ".metallib")) continue;
-    while(yield && !g_atomic_int_get(&_preload_stop) && _pipe_busy()) g_usleep(10000);
+    while(!g_atomic_int_get(&_preload_stop) && _pipe_busy()) g_usleep(10000);
     gchar **parts = g_strsplit(file, ".", 3);
     // drains the library each _get_kernel() call leaves behind, so that its
     // file is closed before the next one is opened
@@ -423,7 +423,6 @@ static gpointer _prepare(gpointer data)
 {
   const double start = dt_get_debug_wtime();
   g_mutex_lock(&_mtl_lock);
-  gboolean background = FALSE;
   @autoreleasepool
   {
     if(!_mtl.initialized)
@@ -431,22 +430,18 @@ static gpointer _prepare(gpointer data)
       _mtl.initialized = TRUE;
       _mtl.usable = _init_device();
     }
-    // Apple GPUs build the pipelines quickly, so they are all built before
-    // the first module runs, overlapping with loading the image. Other
-    // drivers take about 90 ms a kernel without a warm shader cache, 35 s
-    // for all of them on an AMD Radeon, so there they are built in the
-    // background and a module builds what it needs itself
-    if(_mtl.usable && [_mtl.dev supportsFamily:MTLGPUFamilyApple1])
-      _preload_kernels(FALSE);
-    else
-      background = _mtl.usable;
   }
+  const gboolean usable = _mtl.usable;
   g_mutex_unlock(&_mtl_lock);
-  dt_print(DT_DEBUG_PERF, "[slang_gpu] preparing the Metal device and kernels took %.3f secs",
+  dt_print(DT_DEBUG_PERF, "[slang_gpu] preparing the Metal device took %.3f secs",
            dt_get_debug_wtime() - start);
-  if(background)
+  // without a warm shader cache the driver compiles each kernel for the
+  // GPU, 7.5 s for all of them on an Apple M2 and 35 s on an AMD Radeon,
+  // so a module builds what it needs itself and the rest are built in the
+  // background
+  if(usable)
   {
-    @autoreleasepool { _preload_kernels(TRUE); }
+    @autoreleasepool { _preload_kernels(); }
     dt_print(DT_DEBUG_PERF, "[slang_gpu] building the Metal kernels in the background took %.3f secs",
              dt_get_debug_wtime() - start);
   }
