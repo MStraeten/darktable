@@ -28,6 +28,7 @@
 #include "common/gaussian.h"
 #include "common/fast_guided_filter.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "develop/tiling.h"
 
 #include <gtk/gtk.h>
@@ -849,6 +850,107 @@ error:
   dt_opencl_release_mem_object(high);
   dt_opencl_release_mem_object(low);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_cacorrectrgb_params_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  // as process_cl()
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float sigma = fmaxf(d->radius / scale, 1.0f);
+  const float sigma2 = fmaxf(d->radius * d->radius / scale, 1.0f);
+  const float safety = powf(20.0f, 1.0f - d->strength);
+  const int guide = d->guide_channel;
+  const int mode = d->mode;
+
+  const float downsize = fminf(3.0f, sigma);
+  const int ds_width = width / downsize;
+  const int ds_height = height / downsize;
+  if(ds_width < 1 || ds_height < 1) return FALSE;
+
+  const float ds_sigma = sigma / downsize;
+  const float ds_sigma2 = sigma2 / downsize;
+  const dt_aligned_pixel_t max = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  const dt_aligned_pixel_t min = { -FLT_MAX, -FLT_MAX, -FLT_MAX, 0.0f };
+  const dt_aligned_pixel_t min_artifacts = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+  dt_slang_gpu_image_t *ds_in = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_blurred = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_high = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_low = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_high2 = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_low2 = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *corrected = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *high = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *low = dt_slang_gpu_image_new(width, height, 4, NULL);
+
+  int err = !ds_in || !ds_blurred || !ds_high || !ds_low || !ds_high2 || !ds_low2
+    || !corrected || !high || !low
+    || dt_interpolate_bilinear_image_slang(dev_in, width, height, ds_in, ds_width, ds_height)
+    || dt_gaussian_blur_4c_slang(ds_in, ds_blurred, ds_width, ds_height,
+                                 d->refine_manifolds ? ds_sigma2 : ds_sigma, DT_IOP_GAUSSIAN_ZERO, max, min)
+    || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_manifolds", ds_width, ds_height,
+         SLIMG_DEV(ds_in), SLIMG_DEV(ds_blurred), SLIMG_DEV(ds_high), SLIMG_DEV(ds_low),
+         SLARG(ds_width), SLARG(ds_height), SLARG(guide))
+    || dt_gaussian_blur_4c_slang(ds_high, ds_high, ds_width, ds_height,
+                                 d->refine_manifolds ? ds_sigma2 : ds_sigma, DT_IOP_GAUSSIAN_ZERO, max, min)
+    || dt_gaussian_blur_4c_slang(ds_low, ds_low, ds_width, ds_height,
+                                 d->refine_manifolds ? ds_sigma2 : ds_sigma, DT_IOP_GAUSSIAN_ZERO, max, min)
+    || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_normalize", ds_width, ds_height,
+         SLIMG_DEV(ds_blurred), SLIMG_DEV(ds_high), SLIMG_DEV(ds_low), SLIMG_DEV(ds_high2),
+         SLIMG_DEV(ds_low2), SLARG(ds_width), SLARG(ds_height), SLARG(guide));
+
+  if(!err && d->refine_manifolds)
+    err = dt_gaussian_blur_4c_slang(ds_in, ds_blurred, ds_width, ds_height, ds_sigma,
+                                    DT_IOP_GAUSSIAN_ZERO, max, min)
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_refine", ds_width, ds_height,
+           SLIMG_DEV(ds_in), SLIMG_DEV(ds_high2), SLIMG_DEV(ds_low2), SLIMG_DEV(ds_blurred),
+           SLIMG_DEV(ds_high), SLIMG_DEV(ds_low), SLARG(ds_width), SLARG(ds_height), SLARG(guide))
+      || dt_gaussian_blur_4c_slang(ds_high, ds_high, ds_width, ds_height, ds_sigma,
+                                   DT_IOP_GAUSSIAN_ZERO, max, min)
+      || dt_gaussian_blur_4c_slang(ds_low, ds_low, ds_width, ds_height, ds_sigma,
+                                   DT_IOP_GAUSSIAN_ZERO, max, min)
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_normalize", ds_width, ds_height,
+           SLIMG_DEV(ds_blurred), SLIMG_DEV(ds_high), SLIMG_DEV(ds_low), SLIMG_DEV(ds_high2),
+           SLIMG_DEV(ds_low2), SLARG(ds_width), SLARG(ds_height), SLARG(guide));
+
+  if(!err)
+    err = dt_interpolate_bilinear_image_slang(ds_high2, ds_width, ds_height, high, width, height)
+      || dt_interpolate_bilinear_image_slang(ds_low2, ds_width, ds_height, low, width, height)
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_apply", width, height,
+           SLIMG_DEV(dev_in), SLIMG_DEV(high), SLIMG_DEV(low), SLIMG_DEV(corrected),
+           SLARG(width), SLARG(height), SLARG(guide), SLARG(mode))
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_artifacts_prepare", width, height,
+           SLIMG_DEV(dev_in), SLIMG_DEV(corrected), SLIMG_DEV(high),
+           SLARG(width), SLARG(height), SLARG(guide))
+      || dt_gaussian_blur_4c_slang(high, high, width, height, sigma, DT_IOP_GAUSSIAN_ZERO,
+                                   max, min_artifacts)
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_artifacts", width, height,
+           SLIMG_DEV(dev_in), SLIMG_DEV(corrected), SLIMG_DEV(high), SLIMG_DEV(dev_out),
+           SLARG(width), SLARG(height), SLARG(guide), SLARG(safety));
+
+  dt_slang_gpu_image_free(ds_in);
+  dt_slang_gpu_image_free(ds_blurred);
+  dt_slang_gpu_image_free(ds_high);
+  dt_slang_gpu_image_free(ds_low);
+  dt_slang_gpu_image_free(ds_high2);
+  dt_slang_gpu_image_free(ds_low2);
+  dt_slang_gpu_image_free(corrected);
+  dt_slang_gpu_image_free(high);
+  dt_slang_gpu_image_free(low);
+  return !err;
 }
 #endif
 

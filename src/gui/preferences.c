@@ -37,6 +37,15 @@
 #endif
 #include "gui/presets.h"
 #include "libs/lib.h"
+#ifdef HAVE_OPENCL
+#include "common/opencl.h"
+// the generated processing tab in preferences_gen.h calls it
+static void _preferences_opencl_devices(GtkGrid *grid, int *line, const char *title);
+#endif
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+static void _preferences_slang_device(GtkGrid *grid, int *line, GtkSizeGroup *widget_group);
+#endif
 #include "preferences_gen.h"
 #ifdef USE_LUA
 #include "lua/preferences.h"
@@ -1516,6 +1525,207 @@ void dt_gui_preferences_bool_update(GtkWidget *widget)
   const gboolean val = dt_conf_get_bool(key);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), val);
 }
+
+#ifdef HAVE_OPENCL
+static void _opencl_device_toggled(GtkToggleButton *button,
+                                   gpointer user_data)
+{
+  const gboolean enabled = gtk_toggle_button_get_active(button);
+  dt_opencl_device_conf_set_enabled((const char *)user_data, enabled);
+  // with every device disabled dt_opencl_init() switched OpenCL off, and
+  // with OpenCL off it does not look at devices, so this list would be gone
+  if(enabled) dt_conf_set_bool("opencl", TRUE);
+  restart_required = TRUE;
+}
+
+static void _opencl_headroom_changed(GtkSpinButton *spin,
+                                     gpointer user_data)
+{
+  dt_opencl_set_device_headroom(GPOINTER_TO_INT(user_data),
+                                gtk_spin_button_get_value_as_int(spin));
+}
+
+static void _preferences_opencl_devices(GtkGrid *grid,
+                                        int *line,
+                                        const char *title)
+{
+  dt_opencl_t *cl = darktable.opencl;
+  // nothing to configure if dt_opencl_init() did not look at any device
+  if(!cl || !cl->found) return;
+
+  GtkWidget *seclabel = gtk_label_new(title);
+  GtkWidget *lbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_box_pack_start(GTK_BOX(lbox), seclabel, FALSE, FALSE, 0);
+  gtk_widget_set_name(lbox, "pref_section");
+  gtk_grid_attach(grid, lbox, 0, (*line)++, 2, 1);
+
+  for(GList *l = cl->found; l; l = g_list_next(l))
+  {
+    const dt_opencl_found_t *found = l->data;
+    const gboolean enabled = dt_opencl_device_conf_enabled(found->cname);
+
+    // identical cards share one darktablerc entry, so they get one switch
+    gboolean same_as_before = FALSE;
+    for(GList *p = cl->found; p != l; p = g_list_next(p))
+      same_as_before |= !g_strcmp0(((dt_opencl_found_t *)p->data)->cname, found->cname);
+
+    gchar *text;
+    GtkWidget *label, *widget;
+    if(!same_as_before)
+    {
+      text = g_strdup_printf("%s (%s)", found->name,
+                             found->unified_memory ? _("shared memory")
+                                                   : _("dedicated memory"));
+      label = gtk_label_new(text);
+      g_free(text);
+      gtk_label_set_xalign(GTK_LABEL(label), .0);
+      gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_MIDDLE);
+      widget = gtk_check_button_new();
+      gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), enabled);
+      gtk_widget_set_tooltip_text(widget,
+                                  found->devid < 0 && enabled
+                                  ? _("darktable could not use this device, start darktable"
+                                      " with '-d opencl' to see why")
+                                  : _("use this OpenCL device, takes effect after a restart"));
+      gtk_widget_set_tooltip_text(label, found->cname);
+      g_signal_connect_data(widget, "toggled", G_CALLBACK(_opencl_device_toggled),
+                            g_strdup(found->cname), (GClosureNotify)g_free, 0);
+      gtk_grid_attach(grid, label, 0, *line, 1, 1);
+      gtk_grid_attach(grid, widget, 2, (*line)++, 1, 1);
+    }
+
+    // headroom is only used with 'tuned GPU memory', which needs two devices
+    if(found->devid < 0 || cl->num_devs < 2) continue;
+
+    text = g_strdup_printf(_("device %d headroom in MB"), found->devid);
+    label = gtk_label_new(text);
+    g_free(text);
+    gtk_label_set_xalign(GTK_LABEL(label), .0);
+    gtk_widget_set_margin_start(label, DT_PIXEL_APPLY_DPI(16));
+    const int maxmem = cl->dev[found->devid].max_global_mem / DT_MEGA;
+    widget = gtk_spin_button_new_with_range(0, maxmem, 50);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(widget), 0);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(widget),
+                              dt_opencl_get_device_headroom(found->devid));
+    gtk_widget_set_tooltip_text(widget,
+                                _("memory darktable leaves free on this device,"
+                                  " only used with 'tuned GPU memory'"));
+    g_signal_connect(widget, "value-changed", G_CALLBACK(_opencl_headroom_changed),
+                     GINT_TO_POINTER(found->devid));
+    gtk_grid_attach(grid, label, 0, *line, 1, 1);
+    gtk_grid_attach(grid, widget, 2, (*line)++, 1, 1);
+  }
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// the value slang_gpu_device gets for the n-th device: its name, unless the
+// name also matches another device, which the index then tells apart
+static gchar *_slang_device_key(GList *devices,
+                                const int n)
+{
+  const dt_slang_gpu_device_t *device = g_list_nth_data(devices, n);
+  gchar *name = g_utf8_casefold(device->name, -1);
+  gboolean unique = TRUE;
+  for(GList *l = devices; l; l = g_list_next(l))
+  {
+    if(l->data == device) continue;
+    gchar *other = g_utf8_casefold(((dt_slang_gpu_device_t *)l->data)->name, -1);
+    unique &= strstr(other, name) == NULL;
+    g_free(other);
+  }
+  g_free(name);
+  return unique ? g_strdup(device->name) : g_strdup_printf("%d", n);
+}
+
+// the entry slang_gpu_device selects, as the backends match it: 0 is automatic
+static int _slang_device_entry(GList *devices)
+{
+  const char *wanted = dt_conf_get_string_const("slang_gpu_device");
+  if(!wanted || !*wanted) return 0;
+  char *end = NULL;
+  const long index = strtol(wanted, &end, 10);
+  if(end && *end == '\0')
+    return index >= 0 && index < (long)g_list_length(devices) ? index + 1 : 0;
+  gchar *wanted_name = g_utf8_casefold(wanted, -1);
+  int entry = 0, n = 1;
+  for(GList *l = devices; l && !entry; l = g_list_next(l), n++)
+  {
+    gchar *name = g_utf8_casefold(((dt_slang_gpu_device_t *)l->data)->name, -1);
+    if(strstr(name, wanted_name)) entry = n;
+    g_free(name);
+  }
+  g_free(wanted_name);
+  return entry;
+}
+
+static void _slang_device_changed(GtkWidget *widget,
+                                  gpointer user_data)
+{
+  GList *devices = g_object_get_data(G_OBJECT(widget), "devices");
+  const int entry = dt_bauhaus_combobox_get(widget);
+  gchar *key = entry > 0 ? _slang_device_key(devices, entry - 1) : g_strdup("");
+  dt_conf_set_string("slang_gpu_device", key);
+  g_free(key);
+  // the device is set up once, see dt_slang_gpu_enabled()
+  restart_required = TRUE;
+}
+
+static void _slang_memory_changed(GtkSpinButton *spin,
+                                  gpointer user_data)
+{
+  dt_conf_set_int("slang_gpu_memory", gtk_spin_button_get_value_as_int(spin));
+}
+
+static void _preferences_slang_device(GtkGrid *grid,
+                                      int *line,
+                                      GtkSizeGroup *widget_group)
+{
+  int automatic = -1;
+  GList *devices = dt_slang_gpu_devices(&automatic);
+  if(!devices) return;
+
+  GtkWidget *label = gtk_label_new(_("Slang device"));
+  gtk_label_set_xalign(GTK_LABEL(label), .0);
+  GtkWidget *widget = dt_bauhaus_combobox_new_action(NULL);
+  dt_bauhaus_combobox_set_selected_text_align(widget, DT_BAUHAUS_COMBOBOX_ALIGN_LEFT);
+  const dt_slang_gpu_device_t *def = g_list_nth_data(devices, automatic);
+  gchar *text = def ? g_strdup_printf(_("automatic (%s)"), def->name) : g_strdup(_("automatic"));
+  dt_bauhaus_combobox_add(widget, text);
+  g_free(text);
+  for(GList *l = devices; l; l = g_list_next(l))
+  {
+    const dt_slang_gpu_device_t *device = l->data;
+    text = g_strdup_printf("%s (%s)", device->name,
+                           device->unified_memory ? _("shared memory") : _("dedicated memory"));
+    dt_bauhaus_combobox_add(widget, text);
+    g_free(text);
+  }
+  dt_bauhaus_combobox_set(widget, _slang_device_entry(devices));
+  g_object_set_data_full(G_OBJECT(widget), "devices", devices, (GDestroyNotify)dt_slang_gpu_devices_free);
+  gtk_widget_set_halign(widget, GTK_ALIGN_START);
+  gtk_size_group_add_widget(widget_group, widget);
+  gtk_widget_set_tooltip_text(widget, _("the GPU the Slang kernels run on, takes effect after a restart.\n"
+                                        "automatic prefers a GPU with memory of its own"));
+  g_signal_connect(widget, "value-changed", G_CALLBACK(_slang_device_changed), NULL);
+  gtk_grid_attach(grid, label, 0, *line, 1, 1);
+  gtk_grid_attach(grid, widget, 2, (*line)++, 1, 1);
+
+  label = gtk_label_new(_("Slang device memory in MB"));
+  gtk_label_set_xalign(GTK_LABEL(label), .0);
+  widget = gtk_spin_button_new_with_range(0, 1 << 20, 256);
+  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(widget), 0);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(widget), dt_conf_get_int("slang_gpu_memory"));
+  gtk_widget_set_halign(widget, GTK_ALIGN_START);
+  gtk_size_group_add_widget(widget_group, widget);
+  gtk_widget_set_tooltip_text(widget, _("the most device memory a module may use on the Slang GPU path"
+                                        " before it is processed in tiles.\n"
+                                        "0 uses what the device reports as free"));
+  g_signal_connect(widget, "value-changed", G_CALLBACK(_slang_memory_changed), NULL);
+  gtk_grid_attach(grid, label, 0, *line, 1, 1);
+  gtk_grid_attach(grid, widget, 2, (*line)++, 1, 1);
+}
+#endif
 
 GtkWidget *dt_gui_preferences_bool(GtkGrid *grid,
                                    const char *key,

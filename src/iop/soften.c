@@ -28,6 +28,7 @@
 #include "common/imagebuf.h"
 #include "common/math.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -281,6 +282,48 @@ error:
   dt_opencl_release_mem_object(dev_tmp);
   free(mat);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_soften_data_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // the box mean of process(), not the gaussian of process_cl()
+  const float brightness = 1.0f / exp2f(-d->brightness);
+  const float saturation = d->saturation / 100.0f;
+  const float amount = d->amount / 100.0f;
+  const float w = piece->iwidth * piece->iscale;
+  const float h = piece->iheight * piece->iscale;
+  const int mrad = dt_fast_hypotf(w, h) * 0.01f;
+  const int rad = mrad * (fmin(100.0f, d->size + 1.0f) / 100.0f);
+  const int radius = MIN(mrad, ceilf(rad * roi_in->scale / piece->iscale));
+
+  // brighten and saturate into tmp, blur it, then mix with the input
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *scratch = dt_slang_gpu_image_new(width, height, 4, NULL);
+  const int err = !tmp || !scratch
+    || dt_slang_gpu_run_2d_args("soften", "soften_overexposed", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(tmp), SLARG(width), SLARG(height), SLARG(saturation),
+         SLARG(brightness))
+    || dt_box_mean_slang(tmp, scratch, width, height, 4, radius, BOX_ITERATIONS)
+    || dt_slang_gpu_run_2d_args("soften", "soften_mix", width, height,
+         SLIMG_DEV(dev_in), SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+         SLARG(amount));
+
+  dt_slang_gpu_image_free(tmp);
+  dt_slang_gpu_image_free(scratch);
+  return !err;
 }
 #endif
 

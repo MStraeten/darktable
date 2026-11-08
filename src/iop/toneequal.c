@@ -1782,6 +1782,354 @@ error:
 
 #endif // HAVE_OPENCL
 
+#ifdef HAVE_SLANG_GPU
+// the Slang counterparts of the OpenCL helpers above, on device buffers.
+// They return 0 on success.
+static int _box_mean_slang(dt_slang_gpu_buffer_t *buf,
+                           dt_slang_gpu_buffer_t *tmp,
+                           const int width,
+                           const int height,
+                           const int ch,
+                           const int radius)
+{
+  // the moving average reads samples that a parallel in-place pass would
+  // already have overwritten, so bounce through tmp and land back in buf
+  const char *kernel_x = (ch == 4) ? "toneequal_box_mean_x_4c" : "toneequal_box_mean_x_2c";
+  const char *kernel_y = (ch == 4) ? "toneequal_box_mean_y_4c" : "toneequal_box_mean_y_2c";
+
+  return dt_slang_gpu_run_1d_args("toneequal", kernel_x, height,
+           SLBUF_DEV(buf), SLBUF_DEV(tmp), SLARG(width), SLARG(height), SLARG(radius))
+      || dt_slang_gpu_run_1d_args("toneequal", kernel_y, width,
+           SLBUF_DEV(tmp), SLBUF_DEV(buf), SLARG(width), SLARG(height), SLARG(radius));
+}
+
+static int _quantize_slang(dt_slang_gpu_buffer_t *in,
+                           dt_slang_gpu_buffer_t *out,
+                           const int width,
+                           const int height,
+                           const float sampling,
+                           const float clip_min,
+                           const float clip_max)
+{
+  return dt_slang_gpu_run_2d_args("toneequal", "toneequal_quantize", width, height,
+           SLBUF_DEV(in), SLBUF_DEV(out), SLARG(width), SLARG(height),
+           SLARG(sampling), SLARG(clip_min), SLARG(clip_max));
+}
+
+static int _fast_surface_blur_slang(dt_slang_gpu_buffer_t *image,
+                                    const int width,
+                                    const int height,
+                                    const int radius,
+                                    const float feathering,
+                                    const int iterations,
+                                    const dt_iop_guided_filter_blending_t filter,
+                                    const float quantization,
+                                    const float quantize_min,
+                                    const float quantize_max)
+{
+  // same downscaling as _fast_surface_blur_cl()
+  const float scaling = 4.0f;
+  const int ds_radius = (radius < 4) ? 1 : (int)((float)radius / scaling);
+  const int ds_width = MAX(1, (int)((float)width / scaling));
+  const int ds_height = MAX(1, (int)((float)height / scaling));
+  const size_t ds_bsize = (size_t)ds_width * ds_height * sizeof(float);
+  const gboolean use_mask = (quantization != 0.0f);
+
+  dt_slang_gpu_buffer_t *ds_image = dt_slang_gpu_buffer_new(ds_bsize, NULL);
+  dt_slang_gpu_buffer_t *ds_mask = use_mask ? dt_slang_gpu_buffer_new(ds_bsize, NULL) : NULL;
+  dt_slang_gpu_buffer_t *ds_ab = dt_slang_gpu_buffer_new(2 * ds_bsize, NULL);
+  dt_slang_gpu_buffer_t *packed = dt_slang_gpu_buffer_new(4 * ds_bsize, NULL);
+  dt_slang_gpu_buffer_t *tmp = dt_slang_gpu_buffer_new(4 * ds_bsize, NULL);
+  dt_slang_gpu_buffer_t *guide = use_mask ? ds_mask : ds_image;
+
+  int err = !ds_image || !ds_ab || !packed || !tmp || (use_mask && !ds_mask)
+    || dt_interpolate_bilinear_slang(image, width, height, ds_image, ds_width, ds_height, 1);
+
+  for(int i = 0; i < iterations && !err; ++i)
+  {
+    err = (use_mask
+           && _quantize_slang(ds_image, ds_mask, ds_width, ds_height,
+                              quantization, quantize_min, quantize_max))
+      || dt_slang_gpu_run_2d_args("toneequal", "toneequal_gf_pack", ds_width, ds_height,
+           SLBUF_DEV(guide), SLBUF_DEV(ds_image), SLBUF_DEV(packed),
+           SLARG(ds_width), SLARG(ds_height))
+      || _box_mean_slang(packed, tmp, ds_width, ds_height, 4, ds_radius)
+      || dt_slang_gpu_run_2d_args("toneequal", "toneequal_gf_ab", ds_width, ds_height,
+           SLBUF_DEV(packed), SLBUF_DEV(ds_ab), SLARG(ds_width), SLARG(ds_height),
+           SLARG(feathering))
+      || _box_mean_slang(ds_ab, tmp, ds_width, ds_height, 2, ds_radius);
+
+    if(!err && i != iterations - 1)
+    {
+      const int blending = DT_GF_BLENDING_LINEAR;
+      err = dt_slang_gpu_run_2d_args("toneequal", "toneequal_gf_blend", ds_width, ds_height,
+              SLBUF_DEV(ds_image), SLBUF_DEV(ds_ab), SLARG(ds_width), SLARG(ds_height),
+              SLARG(blending));
+    }
+  }
+
+  if(!err)
+  {
+    const int blending = filter;
+    err = dt_slang_gpu_run_2d_args("toneequal", "toneequal_gf_blend_upsample", width, height,
+            SLBUF_DEV(image), SLARG(width), SLARG(height),
+            SLBUF_DEV(ds_ab), SLARG(ds_width), SLARG(ds_height), SLARG(blending));
+  }
+
+  dt_slang_gpu_buffer_free(tmp);
+  dt_slang_gpu_buffer_free(packed);
+  dt_slang_gpu_buffer_free(ds_ab);
+  dt_slang_gpu_buffer_free(ds_mask);
+  dt_slang_gpu_buffer_free(ds_image);
+  return err;
+}
+
+static int _fast_eigf_surface_blur_slang(dt_slang_gpu_buffer_t *image,
+                                         const int width,
+                                         const int height,
+                                         const float sigma,
+                                         const float feathering,
+                                         const int iterations,
+                                         const dt_iop_guided_filter_blending_t filter,
+                                         const float quantization,
+                                         const float quantize_min,
+                                         const float quantize_max)
+{
+  // same downscaling as _fast_eigf_surface_blur_cl()
+  const float scaling = fmaxf(fminf(sigma, 4.0f), 1.0f);
+  const float ds_sigma = fmaxf(sigma / scaling, 1.0f);
+  const int ds_width = MAX(1, (int)((float)width / scaling));
+  const int ds_height = MAX(1, (int)((float)height / scaling));
+  const size_t bsize = (size_t)width * height * sizeof(float);
+  const size_t ds_bsize = (size_t)ds_width * ds_height * sizeof(float);
+  const gboolean use_mask = (quantization != 0.0f);
+  const int ch = use_mask ? 4 : 2;
+
+  dt_slang_gpu_buffer_t *mask = use_mask ? dt_slang_gpu_buffer_new(bsize, NULL) : NULL;
+  dt_slang_gpu_buffer_t *ds_mask = use_mask ? dt_slang_gpu_buffer_new(ds_bsize, NULL) : NULL;
+  dt_slang_gpu_buffer_t *ds_image = dt_slang_gpu_buffer_new(ds_bsize, NULL);
+  dt_slang_gpu_buffer_t *ds_av = dt_slang_gpu_buffer_new(ch * ds_bsize, NULL);
+
+  int err = !ds_image || !ds_av || (use_mask && (!mask || !ds_mask));
+
+  for(int i = 0; i < iterations && !err; i++)
+  {
+    // blend linear for all intermediate images, use filter for last iteration
+    const int blending = (i == iterations - 1) ? (int)filter : DT_GF_BLENDING_LINEAR;
+
+    err = dt_interpolate_bilinear_slang(image, width, height, ds_image, ds_width, ds_height, 1);
+    if(err) break;
+
+    if(use_mask)
+      err = _quantize_slang(image, mask, width, height, quantization, quantize_min, quantize_max)
+        || dt_interpolate_bilinear_slang(mask, width, height, ds_mask, ds_width, ds_height, 1)
+        || dt_slang_gpu_run_2d_args("toneequal", "toneequal_eigf_pack_4c", ds_width, ds_height,
+             SLBUF_DEV(ds_mask), SLBUF_DEV(ds_image), SLBUF_DEV(ds_av),
+             SLARG(ds_width), SLARG(ds_height))
+        || dt_gaussian_mean_blur_slang(ds_av, ds_width, ds_height, 4, ds_sigma)
+        || dt_slang_gpu_run_2d_args("toneequal", "toneequal_eigf_finish_4c", ds_width, ds_height,
+             SLBUF_DEV(ds_av), SLARG(ds_width), SLARG(ds_height))
+        || dt_slang_gpu_run_2d_args("toneequal", "toneequal_eigf_blend", width, height,
+             SLBUF_DEV(image), SLBUF_DEV(mask), SLARG(width), SLARG(height),
+             SLBUF_DEV(ds_av), SLARG(ds_width), SLARG(ds_height),
+             SLARG(blending), SLARG(feathering));
+    else
+      err = dt_slang_gpu_run_2d_args("toneequal", "toneequal_eigf_pack_2c", ds_width, ds_height,
+              SLBUF_DEV(ds_image), SLBUF_DEV(ds_av), SLARG(ds_width), SLARG(ds_height))
+        || dt_gaussian_mean_blur_slang(ds_av, ds_width, ds_height, 2, ds_sigma)
+        || dt_slang_gpu_run_2d_args("toneequal", "toneequal_eigf_finish_2c", ds_width, ds_height,
+             SLBUF_DEV(ds_av), SLARG(ds_width), SLARG(ds_height))
+        || dt_slang_gpu_run_2d_args("toneequal", "toneequal_eigf_blend_no_mask", width, height,
+             SLBUF_DEV(image), SLARG(width), SLARG(height),
+             SLBUF_DEV(ds_av), SLARG(ds_width), SLARG(ds_height),
+             SLARG(blending), SLARG(feathering));
+  }
+
+  dt_slang_gpu_buffer_free(ds_av);
+  dt_slang_gpu_buffer_free(ds_image);
+  dt_slang_gpu_buffer_free(ds_mask);
+  dt_slang_gpu_buffer_free(mask);
+  return err;
+}
+
+static int _compute_luminance_mask_slang(dt_slang_gpu_image_t *dev_in,
+                                         dt_slang_gpu_buffer_t *luminance,
+                                         const int width,
+                                         const int height,
+                                         const dt_iop_toneequalizer_data_t *const d)
+{
+  // see _compute_luminance_mask_cl()
+  const gboolean boost_contrast = (d->details == DT_TONEEQ_GUIDED)
+                               || (d->details == DT_TONEEQ_EIGF);
+  const int method = d->method;
+  const float exposure_boost = d->exposure_boost;
+  const float fulcrum = boost_contrast ? CONTRAST_FULCRUM : 0.0f;
+  const float contrast_boost = boost_contrast ? d->contrast_boost : 1.0f;
+
+  if(dt_slang_gpu_run_2d_args("toneequal", "toneequal_luminance_mask", width, height,
+       SLIMG_DEV(dev_in), SLBUF_DEV(luminance), SLARG(width), SLARG(height),
+       SLARG(method), SLARG(exposure_boost), SLARG(fulcrum), SLARG(contrast_boost)))
+    return 1;
+
+  switch(d->details)
+  {
+    case DT_TONEEQ_AVG_GUIDED:
+    case DT_TONEEQ_GUIDED:
+      return _fast_surface_blur_slang(luminance, width, height, d->radius, d->feathering,
+                                      d->iterations,
+                                      d->details == DT_TONEEQ_AVG_GUIDED
+                                        ? DT_GF_BLENDING_GEOMEAN : DT_GF_BLENDING_LINEAR,
+                                      d->quantization, exp2f(-14.0f), 4.0f);
+
+    case DT_TONEEQ_AVG_EIGF:
+    case DT_TONEEQ_EIGF:
+      return _fast_eigf_surface_blur_slang(luminance, width, height, d->radius, d->feathering,
+                                           d->iterations,
+                                           d->details == DT_TONEEQ_AVG_EIGF
+                                             ? DT_GF_BLENDING_GEOMEAN : DT_GF_BLENDING_LINEAR,
+                                           d->quantization, exp2f(-14.0f), 4.0f);
+
+    case DT_TONEEQ_NONE:
+    default:
+      return 0;
+  }
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_toneequalizer_data_t *const d = piece->data;
+  dt_iop_toneequalizer_gui_data_t *const g = self->gui_data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const size_t bsize = (size_t)width * height * sizeof(float);
+
+  if(width < 1 || height < 1) return FALSE;
+  if(roi_in->width < roi_out->width || roi_in->height < roi_out->height) return FALSE;
+  if(piece->colors != 4) return FALSE;
+
+  const dt_hash_t hash = _luminance_mask_hash(piece, roi_out);
+
+  // the host copies of the mask, shared with toneeq_process() and
+  // process_cl(): see there
+  gboolean cached = FALSE;
+  gboolean fresh = FALSE;
+  float *luminance = NULL;
+
+  gboolean mask_display = FALSE;
+  if(self->dev->gui_attached && g)
+  {
+    dt_iop_gui_enter_critical_section(self);
+    mask_display = g->mask_display;
+    if(g->pipe_order != piece->module->iop_order)
+    {
+      g->ui_preview_hash = DT_INVALID_HASH;
+      g->pipe_order = piece->module->iop_order;
+      g->luminance_valid = FALSE;
+      g->histogram_valid = FALSE;
+      dt_preview_data_invalidate(&g->pd);
+    }
+
+    if(dt_pipe_is_full(piece->pipe))
+    {
+      luminance = _full_preview_buffer(self, width, height);
+      cached = TRUE;
+      fresh = luminance && hash == g->ui_preview_hash && g->luminance_valid;
+    }
+    else if(dt_pipe_is_preview(piece->pipe))
+    {
+      luminance = dt_preview_data_resize(&g->pd, width, height,
+                                         _toneeq_preview_resized, self);
+      cached = TRUE;
+      fresh = luminance && hash == dt_preview_data_get_hash(&g->pd)
+              && g->luminance_valid;
+    }
+    dt_iop_gui_leave_critical_section(self);
+
+    if(cached && !luminance) return FALSE;
+  }
+
+  // a fresh host copy is uploaded rather than the mask rebuilt
+  dt_slang_gpu_buffer_t *dev_luminance = dt_slang_gpu_buffer_new(bsize, fresh ? luminance : NULL);
+  int err = !dev_luminance;
+
+  if(!err && !fresh)
+  {
+    err = _compute_luminance_mask_slang(dev_in, dev_luminance, width, height, d);
+
+    if(!err && cached)
+    {
+      // copy the mask back for the GUI and the next run, invalidating first
+      // and committing the key once the data is complete, as process_cl()
+      // does
+      const gboolean preview = dt_pipe_is_preview(piece->pipe);
+
+      dt_iop_gui_enter_critical_section(self);
+      if(preview)
+      {
+        g->histogram_valid = FALSE;
+        g->luminance_valid = FALSE;
+      }
+      else
+        g->ui_preview_hash = DT_INVALID_HASH;
+      dt_iop_gui_leave_critical_section(self);
+
+      err = dt_slang_gpu_buffer_read(dev_luminance, luminance, bsize);
+
+      if(!err)
+      {
+        dt_iop_gui_enter_critical_section(self);
+        if(preview)
+        {
+          dt_preview_data_set_hash_value(&g->pd, hash);
+          g->luminance_valid = TRUE;
+        }
+        else
+          g->ui_preview_hash = hash;
+        dt_iop_gui_leave_critical_section(self);
+      }
+    }
+  }
+
+  const int out_width = MIN(width, roi_out->width);
+  const int out_height = MIN(height, roi_out->height);
+  const int offset_x = (roi_in->x < roi_out->x) ? roi_out->x - roi_in->x : 0;
+  const int offset_y = (roi_in->y < roi_out->y) ? roi_out->y - roi_in->y : 0;
+
+  if(!err && self->dev->gui_attached && g && dt_pipe_is_full(piece->pipe) && mask_display)
+  {
+    err = dt_slang_gpu_run_2d_args("toneequal", "toneequal_display_mask", out_width, out_height,
+            SLIMG_DEV(dev_in), SLBUF_DEV(dev_luminance), SLIMG_DEV(dev_out),
+            SLARG(out_width), SLARG(out_height), SLARG(width),
+            SLARG(offset_x), SLARG(offset_y));
+    if(!err) piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+  }
+  else if(!err)
+  {
+    const float gauss_denom = gaussian_denom(d->smoothing);
+    dt_aligned_pixel_t factors_low, factors_high;
+    for_four_channels(c)
+    {
+      factors_low[c] = d->factors[c];
+      factors_high[c] = d->factors[c + PIXEL_CHAN / 2];
+    }
+    err = dt_slang_gpu_run_2d_args("toneequal", "toneequal_apply", out_width, out_height,
+            SLIMG_DEV(dev_in), SLBUF_DEV(dev_luminance), SLIMG_DEV(dev_out),
+            SLARG(out_width), SLARG(out_height), SLARG(width),
+            SLARG(offset_x), SLARG(offset_y),
+            SLARG(factors_low), SLARG(factors_high), SLARG(gauss_denom));
+  }
+
+  dt_slang_gpu_buffer_free(dev_luminance);
+  return !err;
+}
+#endif // HAVE_SLANG_GPU
+
 
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,

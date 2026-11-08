@@ -78,6 +78,17 @@ int guided_filter_cl(int devid, cl_mem guide, cl_mem in, cl_mem out, int width, 
                       float sqrt_eps, float guide_weight, float min, float max);
 
 #endif
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+
+// like guided_filter_cl(), for a 4 channel guide and single channel images of
+// the Slang kernels. There is no tiling: it returns non-zero, and leaves out
+// undefined, if the device lacks the memory. Returns 0 on success.
+int guided_filter_slang(dt_slang_gpu_image_t *guide, dt_slang_gpu_image_t *in, dt_slang_gpu_image_t *out,
+                        int width, int height, int w, float sqrt_eps, float guide_weight, float min,
+                        float max);
+#endif
+
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py
 // vim: shiftwidth=2 expandtab tabstop=2 cindent

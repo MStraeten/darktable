@@ -19,6 +19,7 @@
 #include "common/debug.h"
 #include "common/imagebuf.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "develop/develop.h"
@@ -427,6 +428,25 @@ void distort_mask(dt_iop_module_t *self,
   }
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_borders_data_t *d = piece->data;
+  dt_iop_border_positions_t binfo;
+  dt_iop_setup_binfo(piece, roi_in, roi_out, d->pos_v, d->pos_h,
+                     d->color, d->frame_color, d->frame_size, d->frame_offset, &binfo);
+  // the image inside the border, zero on the border itself
+  return !dt_iop_image_blit_slang(dev_out, dev_in, roi_in->width, roi_in->height,
+                                  roi_out->width, roi_out->height,
+                                  -binfo.border_in_x, -binfo.border_in_y);
+}
+#endif
+
 void modify_roi_out(dt_iop_module_t *self,
                     dt_dev_pixelpipe_iop_t *piece,
                     dt_iop_roi_t *roi_out,
@@ -647,6 +667,42 @@ int process_cl(dt_iop_module_t *self,
 
 error:
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_borders_data_t *d = piece->data;
+
+  dt_iop_border_positions_t binfo;
+
+  dt_iop_setup_binfo(piece, roi_in, roi_out, d->pos_v, d->pos_h,
+                     d->color, d->frame_color, d->frame_size, d->frame_offset, &binfo);
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  const int frame = binfo.frame_size != 0;
+  const int frame_out[4] = { binfo.frame_tl_out_x, binfo.frame_tl_out_y,
+                             binfo.frame_br_out_x, binfo.frame_br_out_y };
+  const int frame_in[4] = { binfo.frame_tl_in_x, binfo.frame_tl_in_y,
+                            binfo.frame_br_in_x, binfo.frame_br_in_y };
+  const float col[4] = { d->color[0], d->color[1], d->color[2], 1.0f };
+  const float col_frame[4] = { d->frame_color[0], d->frame_color[1], d->frame_color[2], 1.0f };
+  const int in_x = binfo.border_in_x;
+  const int in_y = binfo.border_in_y;
+
+  return !dt_slang_gpu_run_2d_args("basic", "borders", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(in_x), SLARG(in_y), SLARG(roi_in->width), SLARG(roi_in->height),
+                                   SLARG(frame), SLARG(frame_out), SLARG(frame_in),
+                                   SLARG(col), SLARG(col_frame));
 }
 #endif
 

@@ -18,6 +18,8 @@
     <section name="cpugpu" title="CPU / memory"/>
     <section name="opencl" title="OpenCL GPU acceleration"/>
     <section name="platform" title="OpenCL drivers"/>
+    <section name="cldevices" title="OpenCL devices"/>
+    <section name="slang" title="Slang GPU acceleration"/>
   </dttab>
   <dttab name="security" title="security">
     <section title="general"/>
@@ -561,6 +563,48 @@
     <shortdescription>OpenCL fast mode</shortdescription>
     <longdescription>if set the OpenCL compiler uses aggressive optimizing for better performance with reduced precision so more differences between CPU and OpenCL are expected.</longdescription>
   </dtconfig>
+  <dtconfig prefs="processing" section="slang" capability="slang">
+    <name>slang_gpu</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>activate Slang support</shortdescription>
+    <longdescription>experimental: run the modules ported to Slang on your graphics card through Vulkan or Metal.\nwith OpenCL also active, OpenCL runs the other modules.\ncan be switched on and off at any time.</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_device</name>
+    <type>string</type>
+    <default></default>
+    <shortdescription>device for the Slang GPU kernels</shortdescription>
+    <longdescription>experimental: the index or part of the name of the Vulkan or Metal device to run the Slang kernels on, as listed by '-d slang'. empty picks a discrete GPU, then an integrated one; on Metal it picks the system default device. set from 'Slang device' in preferences > processing</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_memory</name>
+    <type min="0">int</type>
+    <default>0</default>
+    <shortdescription>device memory for the Slang GPU kernels (MB)</shortdescription>
+    <longdescription>experimental: the most device memory, in MB, a module may use on the Slang GPU path before it is processed in tiles. 0 uses what the device reports as free</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_private_memory</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>keep Slang GPU images in private Metal memory</shortdescription>
+    <longdescription>experimental: on Metal, keep the images of the Slang GPU path in memory only the GPU can access, as is always done on GPUs without unified memory</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_unified_fraction</name>
+    <type min="0.0" max="0.9">float</type>
+    <default>0.0</default>
+    <shortdescription>share of system memory for a Slang GPU without memory of its own</shortdescription>
+    <longdescription>experimental: the share of system memory the Slang GPU path may use on an integrated GPU or Apple silicon, like the unified fraction of an OpenCL device. 0 uses a quarter of it on Vulkan and what macOS recommends on Metal</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>slang_gpu_avoid</name>
+    <type>string</type>
+    <default></default>
+    <shortdescription>modules kept off the Slang GPU path</shortdescription>
+    <longdescription>experimental: a comma separated list of module names, such as 'diffuse,lens', that run on OpenCL or the CPU instead of the Slang kernels, like the _nocl list of an OpenCL device</longdescription>
+  </dtconfig>
   <dtconfig prefs="processing" section="opencl" capability="opencl">
     <name>opencl_scheduling_profile</name>
     <type>
@@ -615,6 +659,13 @@
     <default>${DEFCONFIG_APPLE}</default>
     <shortdescription>Apple</shortdescription>
     <longdescription>Apple OpenCL (vendor provided)</longdescription>
+  </dtconfig>
+  <dtconfig prefs="processing" section="platform" restart="true">
+    <name>clplatform_portablecomputinglanguage</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>PoCL</shortdescription>
+    <longdescription>portable computing language, runs OpenCL on the CPU. usually slower than darktable's own CPU code, mostly useful for testing. the only platform allowed to use CPU devices</longdescription>
   </dtconfig>
   <dtconfig prefs="processing" section="platform" capability="windows" restart="true">
     <name>clplatform_openclon12</name>

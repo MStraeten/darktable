@@ -26,6 +26,7 @@
 #include "bauhaus/bauhaus.h"
 #include "common/colorspaces.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
@@ -465,6 +466,31 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
 error:
   dt_opencl_release_mem_object(dev_lut);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_levels_data_t *d = piece->data;
+
+  if(d->mode == LEVELS_MODE_AUTOMATIC)
+  {
+    commit_params_late(self, piece);
+  }
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  return !dt_slang_gpu_run_2d_args("basic", "levels", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLIMG_IN(d->lut, 256, 256, 1), SLARG(d->levels[0]),
+                                   SLARG(d->levels[2]), SLARG(d->in_inv_gamma));
 }
 #endif
 

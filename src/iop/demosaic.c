@@ -21,6 +21,7 @@
 #include "common/darktable.h"
 #include "common/interpolation.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/image_cache.h"
 #include "common/math.h"
 #include "common/imagebuf.h"
@@ -346,6 +347,8 @@ void amaze_demosaic(const float *const in,
 #include "iop/demosaicing/dual.c"
 #include "iop/demosaicing/amaze_cl.c"
 #include "iop/demosaicing/lmmse_cl.c"
+#include "iop/demosaicing/amaze_slang.c"
+#include "iop/demosaicing/lmmse_slang.c"
 
 const char *name()
 {
@@ -568,6 +571,23 @@ void distort_mask(dt_iop_module_t *self,
   else
     dt_iop_copy_image_roi(out, in, 1, roi_in, roi_out);
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  if(roi_out->scale != roi_in->scale)
+  {
+    const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
+    return !dt_interpolation_resample_roi_mask_slang(itor, dev_out, roi_out, dev_in, roi_in);
+  }
+  return !dt_iop_copy_image_roi_slang(dev_out, dev_in, roi_in, roi_out);
+}
+#endif
 
 void modify_roi_out(dt_iop_module_t *self,
                     dt_dev_pixelpipe_iop_t *piece,
@@ -1368,6 +1388,218 @@ finish:
     dt_opencl_release_mem_object(t_low);
   }
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// RCD, PPG, VNG4 and the passthroughs on Bayer data and VNG, Markesteijn and
+// the passthroughs on X-Trans, with green equilibration, color smoothing,
+// capture sharpening, dual demosaic, their mask views, the highlights mask
+// views, downscaled output and the low quality thumbnails
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_image_t *img = &self->dev->image_storage;
+  dt_dev_pixelpipe_t *const pipe = piece->pipe;
+  const dt_iop_demosaic_data_t *d = piece->data;
+  const uint32_t filters = piece->filters;
+  const int method = d->demosaicing_method & ~DT_DEMOSAIC_DUAL;
+  const int iwidth = roi_in->width;
+  const int iheight = roi_in->height;
+  const gboolean run_fast = dt_pipe_is_fast(pipe) || dt_pipe_is_preview(pipe);
+  const gboolean direct = roi_out->width == iwidth && roi_out->height == iheight
+                          && feqf(roi_in->scale, roi_out->scale, 1e-8f);
+
+  const gboolean is_xtrans = filters == 9u;
+  const gboolean is_bayer = filters != 0 && !is_xtrans && !(img->flags & DT_IMAGE_4BAYER)
+                            && !dt_image_is_mono_sraw(img);
+  const gboolean passthru = method == DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME
+                            || method == DT_IOP_DEMOSAIC_PASSTHROUGH_COLOR;
+
+  // low quality thumbnails are demosaiced while downscaling, as in process_cl()
+  if(!_demosaic_full(pipe, img))
+  {
+    if(!is_bayer && !is_xtrans) return FALSE;
+    dt_dev_clear_scharr_mask(pipe);
+    const int owidth = roi_out->width;
+    const int oheight = roi_out->height;
+    const float scale = roi_out->scale;
+    int err;
+    if(is_xtrans)
+      err = dt_slang_gpu_run_2d_args("demosaic_vng", "clip_and_zoom_demosaic_third_size_xtrans", owidth, oheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(scale),
+                                     SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+    else if(method == DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME)
+      err = dt_slang_gpu_run_2d_args("demosaic_other", "clip_and_zoom_demosaic_passthrough_monochrome",
+                                     owidth, oheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(scale));
+    else
+      err = dt_slang_gpu_run_2d_args("demosaic_ppg", "clip_and_zoom_demosaic_half_size", owidth, oheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(scale), SLARG(filters));
+    return !err;
+  }
+
+  const gboolean supported =
+    ((is_bayer
+      && (method == DT_IOP_DEMOSAIC_RCD || method == DT_IOP_DEMOSAIC_VNG4
+          || method == DT_IOP_DEMOSAIC_PPG || method == DT_IOP_DEMOSAIC_AMAZE
+          || method == DT_IOP_DEMOSAIC_LMMSE || passthru))
+     || (is_xtrans
+         && (method == DT_IOP_DEMOSAIC_VNG || method == DT_IOP_DEMOSAIC_MARKESTEIJN
+             || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3 || passthru)))
+    && iwidth >= 16 && iheight >= 16;
+  if(!supported) return FALSE;
+
+  // the mask views of this module, as in process_cl()
+  dt_iop_demosaic_gui_data_t *g = self->gui_data;
+  gboolean show_dual = FALSE;
+  gboolean show_capture = FALSE;
+  gboolean show_sigma = FALSE;
+  if(g && self->dev->gui_attached && dt_pipe_is_full(pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    show_dual = g->dual_mask;
+    show_capture = g->cs_mask && d->cs_enabled;
+    show_sigma = g->cs_boost_mask && d->cs_enabled;
+    dt_iop_gui_leave_critical_section(self);
+  }
+  const gboolean show_mask = show_dual || show_capture || show_sigma;
+
+  dt_dev_clear_scharr_mask(pipe);
+
+  const gboolean no_masking = dt_pipe_no_mask_display(pipe) && !show_mask;
+  // the highlights mask views pass the raw data on
+  // and showing a mask here replaces that, as in process()
+  const gboolean demosaic_mask = !show_mask && pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+  const gboolean dual = (d->demosaicing_method & DT_DEMOSAIC_DUAL) && !run_fast
+                        && !show_sigma && !show_capture && !demosaic_mask;
+
+  // the autotuning of capture sharpening, as in process_cl()
+  const gboolean do_capture = !run_fast && !passthru && !show_dual && d->cs_enabled;
+  if(do_capture)
+  {
+    dt_iop_demosaic_data_t *dw = piece->data;
+    const gboolean fullpipe = dt_pipe_is_full(pipe);
+    gboolean autotune = d->cs_radius == 0.0f && !dt_image_altered(img->id);
+    if(g)
+    {
+      dt_iop_gui_enter_critical_section(self);
+      if(autotune && fullpipe)
+        g->autotune_request = TRUE;
+      autotune = fullpipe && g->autotune_request;
+      dt_iop_gui_leave_critical_section(self);
+    }
+
+    if(autotune)
+    {
+      const float cs_thrs = _capture_noise(self, piece);
+      const float cs_radius = _capture_radius_slang(self, piece, dev_in, roi_in, piece->xtrans, filters);
+      dw->cs_radius = cs_radius;
+      dw->cs_thrs = cs_thrs;
+
+      if(g)
+      {
+        dt_iop_gui_enter_critical_section(self);
+        g->autotune_result = TRUE;
+        g->new_radius = cs_radius;
+        g->new_thrs = cs_thrs;
+        dt_iop_gui_leave_critical_section(self);
+      }
+
+      dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "autotuned capture",
+        pipe, self, DT_DEVICE_NONE, roi_in, NULL, "threshold=%.2f radius=%.2f", cs_thrs, cs_radius);
+    }
+  }
+
+  const gboolean greens = is_bayer && d->green_eq != DT_IOP_GREEN_EQ_NO && no_masking && !run_fast;
+  dt_slang_gpu_image_t *in_image = greens ? dt_slang_gpu_image_new(iwidth, iheight, 1, NULL) : dev_in;
+  // dual demosaic blends the demosaic in high with a VNG one in low
+  // a downscaled output is demosaiced at full size into full, then resampled
+  dt_slang_gpu_image_t *full = direct ? dev_out : dt_slang_gpu_image_new(iwidth, iheight, 4, NULL);
+  dt_slang_gpu_image_t *high = dual ? dt_slang_gpu_image_new(iwidth, iheight, 4, NULL) : full;
+  dt_slang_gpu_image_t *low = dual ? dt_slang_gpu_image_new(iwidth, iheight, 4, NULL) : NULL;
+  gboolean ok = in_image && full && high && (!dual || low)
+    && (!greens || green_equilibration_slang(self, piece, dev_in, in_image, iwidth, iheight, filters));
+
+  if(ok && demosaic_mask)
+    ok = !dt_slang_gpu_run_2d_args("demosaic_rcd", "demosaic_box3", iwidth, iheight,
+                                   SLIMG_DEV(in_image), SLIMG_DEV(high), SLARG(iwidth), SLARG(iheight),
+                                   SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+  else if(ok)
+    switch(method)
+    {
+      case DT_IOP_DEMOSAIC_RCD:
+        ok = process_rcd_slang(piece, in_image, high, iwidth, iheight, filters);
+        break;
+      case DT_IOP_DEMOSAIC_AMAZE:
+        ok = process_amaze_slang(piece, in_image, high, iwidth, iheight, filters);
+        break;
+      case DT_IOP_DEMOSAIC_LMMSE:
+        ok = process_lmmse_slang(piece, in_image, high, iwidth, iheight, filters, d->lmmse_refine);
+        break;
+      case DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME:
+        ok = !dt_slang_gpu_run_2d_args("demosaic_other", "passthrough_monochrome", iwidth, iheight,
+                                       SLIMG_DEV(in_image), SLIMG_DEV(high), SLARG(iwidth), SLARG(iheight));
+        break;
+      case DT_IOP_DEMOSAIC_PASSTHROUGH_COLOR:
+        ok = !dt_slang_gpu_run_2d_args("demosaic_other", "passthrough_color", iwidth, iheight,
+                                       SLIMG_DEV(in_image), SLIMG_DEV(high), SLARG(iwidth), SLARG(iheight),
+                                       SLARG(filters), SLBUF(piece->xtrans, sizeof(piece->xtrans)));
+        break;
+      case DT_IOP_DEMOSAIC_PPG:
+        ok = process_ppg_slang(in_image, high, iwidth, iheight, filters, d->median_thrs);
+        break;
+      case DT_IOP_DEMOSAIC_VNG4:
+      case DT_IOP_DEMOSAIC_VNG:
+        ok = process_vng_slang(in_image, high, piece->xtrans, iwidth, iheight, filters, 0, FALSE);
+        break;
+      default:
+        ok = process_markesteijn_slang(piece, in_image, high, piece->xtrans, iwidth, iheight);
+    }
+
+  if(ok && do_capture)
+    ok = _capture_sharpen_slang(self, piece, in_image, high, iwidth, iheight, roi_in->x, roi_in->y,
+                                show_capture, show_sigma, piece->xtrans, filters);
+
+  if(ok && dual)
+    ok = process_vng_slang(in_image, low, piece->xtrans, iwidth, iheight, filters, 0, TRUE)
+      && color_smoothing_slang(low, iwidth, iheight, DT_DEMOSAIC_SMOOTH_2)
+      && dual_demosaic_slang(piece, high, low, full, iwidth, iheight, show_dual);
+
+  if(greens) dt_slang_gpu_image_free(in_image);
+  if(dual)
+  {
+    dt_slang_gpu_image_free(high);
+    dt_slang_gpu_image_free(low);
+  }
+
+  if(ok && pipe->want_detail_mask)
+    ok = !dt_dev_write_scharr_mask_slang(piece, full, roi_in, TRUE);
+
+  if(ok && d->color_smoothing != DT_DEMOSAIC_SMOOTH_OFF && no_masking && !run_fast)
+    ok = color_smoothing_slang(full, iwidth, iheight, d->color_smoothing);
+
+  // as dt_iop_clip_and_zoom_roi_cl() in process_cl()
+  if(!direct)
+  {
+    dt_iop_roi_t oroi = *roi_out;
+    oroi.x = oroi.y = 0;
+    dt_iop_roi_t iroi = *roi_in;
+    iroi.x = iroi.y = 0;
+    const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+    if(ok) ok = !dt_interpolation_resample_slang(itor, dev_out, &oroi, full, &iroi);
+    dt_slang_gpu_image_free(full);
+  }
+  // the alpha channel holds the mask to show
+  if(ok && show_mask) pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_MASK;
+  return ok;
 }
 #endif
 #undef MIN_TILE_ROWS

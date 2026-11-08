@@ -15,6 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include "common/slang_gpu.h"
 #include "common/gdk_event_utils.h"
 
 #include "bauhaus/bauhaus.h"
@@ -4040,6 +4041,21 @@ void distort_mask(dt_iop_module_t *self,
   rt_copy_in_to_out(in, roi_in, out, roi_out, 1, 0, 0, 0.0f, 0.0f, 0.0f);
 }
 
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  // the unrotated copy of rt_copy_in_to_out(), which distort_mask() uses
+  return !dt_iop_image_blit_slang(dev_out, dev_in, roi_in->width, roi_in->height,
+                                  roi_out->width, roi_out->height,
+                                  roi_out->x - roi_in->x, roi_out->y - roi_in->y);
+}
+#endif
+
 #ifdef HAVE_OPENCL
 
 cl_int rt_process_stats_cl(dt_iop_module_t *self,
@@ -4873,6 +4889,558 @@ cleanup:
   dt_opencl_release_mem_object(in_retouch);
 
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+// rt_copy_in_to_out() on the device; out is roi_out sized
+static int _rt_copy_in_to_out_slang(dt_slang_gpu_image_t *in,
+                                    const dt_iop_roi_t *const roi_in,
+                                    dt_slang_gpu_image_t *out,
+                                    const dt_iop_roi_t *const roi_out,
+                                    const int dx,
+                                    const int dy,
+                                    const float angle,
+                                    const float cx,
+                                    const float cy)
+{
+  const int xoffs = roi_out->x - roi_in->x - dx;
+  const int yoffs = roi_out->y - roi_in->y - dy;
+  const int width = MIN(roi_out->width, roi_in->width);
+  const int height = MIN(roi_out->height, roi_in->height);
+  const int rotate = !feqf(angle, 0.0f, 0.01f);
+  return dt_slang_gpu_run_2d_args("retouch", "retouch_copy_in_to_out", width, height,
+                                  SLIMG_DEV(in), SLIMG_DEV(out), SLARG(width), SLARG(height),
+                                  SLARG(roi_in->width), SLARG(roi_in->height),
+                                  SLARG(xoffs), SLARG(yoffs), SLARG(rotate),
+                                  SLARG(angle), SLARG(cx), SLARG(cy));
+}
+
+// rt_copy_image_masked() on the device: blends src into the layer under the
+// mask, going through tmp, a roi_mask_scaled sized image
+static int _rt_copy_image_masked_slang(dt_slang_gpu_image_t *src,
+                                       dt_slang_gpu_image_t *layer,
+                                       const dt_iop_roi_t *const roi_layer,
+                                       dt_slang_gpu_image_t *mask,
+                                       const dt_iop_roi_t *const roi_mask_scaled,
+                                       dt_slang_gpu_image_t *tmp,
+                                       const float opacity)
+{
+  const int width = roi_mask_scaled->width;
+  const int height = roi_mask_scaled->height;
+  const int ox = roi_mask_scaled->x - roi_layer->x;
+  const int oy = roi_mask_scaled->y - roi_layer->y;
+  return dt_slang_gpu_run_2d_args("retouch", "retouch_blend_masked", width, height,
+                                  SLIMG_DEV(layer), SLIMG_DEV(src), SLIMG_DEV(mask), SLIMG_DEV(tmp),
+                                  SLARG(width), SLARG(height), SLARG(ox), SLARG(oy), SLARG(opacity))
+      || dt_slang_gpu_run_2d_args("retouch", "retouch_rect_to_layer", width, height,
+                                  SLIMG_DEV(tmp), SLIMG_DEV(layer),
+                                  SLARG(width), SLARG(height), SLARG(ox), SLARG(oy));
+}
+
+static int _retouch_fill_slang(dt_slang_gpu_image_t *layer,
+                               const dt_iop_roi_t *const roi_layer,
+                               dt_slang_gpu_image_t *mask,
+                               const dt_iop_roi_t *const roi_mask_scaled,
+                               const float opacity,
+                               const dt_aligned_pixel_t fill_color)
+{
+  const int width = roi_mask_scaled->width;
+  const int height = roi_mask_scaled->height;
+  const int ox = roi_mask_scaled->x - roi_layer->x;
+  const int oy = roi_mask_scaled->y - roi_layer->y;
+  // a local copy, as SLARG() takes the size of its argument
+  const dt_aligned_pixel_t color = { fill_color[0], fill_color[1], fill_color[2], 0.0f };
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  const int err = !tmp
+    || dt_slang_gpu_run_2d_args("retouch", "retouch_fill_masked", width, height,
+                                SLIMG_DEV(layer), SLIMG_DEV(mask), SLIMG_DEV(tmp),
+                                SLARG(width), SLARG(height), SLARG(ox), SLARG(oy),
+                                SLARG(opacity), SLARG(color))
+    || dt_slang_gpu_run_2d_args("retouch", "retouch_rect_to_layer", width, height,
+                                SLIMG_DEV(tmp), SLIMG_DEV(layer),
+                                SLARG(width), SLARG(height), SLARG(ox), SLARG(oy));
+  dt_slang_gpu_image_free(tmp);
+  return err;
+}
+
+static int _retouch_clone_slang(dt_slang_gpu_image_t *layer,
+                                const dt_iop_roi_t *const roi_layer,
+                                dt_slang_gpu_image_t *mask,
+                                const dt_iop_roi_t *const roi_mask_scaled,
+                                const int dx,
+                                const int dy,
+                                const float angle,
+                                const float cx,
+                                const float cy,
+                                const float opacity)
+{
+  // the source goes through its own image, for areas that self-intersect
+  dt_slang_gpu_image_t *src = dt_slang_gpu_image_new(roi_mask_scaled->width, roi_mask_scaled->height, 4, NULL);
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(roi_mask_scaled->width, roi_mask_scaled->height, 4, NULL);
+  const int err = !src || !tmp
+    || _rt_copy_in_to_out_slang(layer, roi_layer, src, roi_mask_scaled, dx, dy, angle, cx, cy)
+    || _rt_copy_image_masked_slang(src, layer, roi_layer, mask, roi_mask_scaled, tmp, opacity);
+  dt_slang_gpu_image_free(src);
+  dt_slang_gpu_image_free(tmp);
+  return err;
+}
+
+static int _retouch_blur_slang(dt_iop_module_t *self,
+                               dt_slang_gpu_image_t *layer,
+                               const dt_iop_roi_t *const roi_layer,
+                               dt_slang_gpu_image_t *mask,
+                               const dt_iop_roi_t *const roi_mask_scaled,
+                               const float opacity,
+                               const int blur_type,
+                               const float blur_radius,
+                               dt_dev_pixelpipe_iop_t *piece)
+{
+  if(fabsf(blur_radius) <= 0.1f) return 0;
+
+  const float sigma = blur_radius * roi_layer->scale / piece->iscale;
+  const int width = roi_mask_scaled->width;
+  const int height = roi_mask_scaled->height;
+
+  // the blur works on a copy of the smallest rectangle covering the mask
+  dt_slang_gpu_image_t *img = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  int err = !img || !tmp
+    || _rt_copy_in_to_out_slang(layer, roi_layer, img, roi_mask_scaled, 0, 0, 0.0f, 0.0f, 0.0f);
+
+  if(!err && blur_type == DT_IOP_RETOUCH_BLUR_GAUSSIAN)
+  {
+    static const float Labmax[] = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+    static const float Labmin[] = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    err = dt_gaussian_blur_4c_slang(img, tmp, width, height, sigma, DT_IOP_GAUSSIAN_ZERO, Labmax, Labmin);
+    dt_slang_gpu_image_t *t = img;
+    img = tmp;
+    tmp = t;
+  }
+  else if(!err && blur_type == DT_IOP_RETOUCH_BLUR_BILATERAL)
+  {
+    const float sigma_r = 100.0f; // does not depend on scale
+    const float detail = -1.0f; // we want the bilateral base layer
+
+    // the device converts with a matrix work profile only; the caller falls
+    // back to the CPU, which handles every profile
+    const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+    dt_bilateral_slang_t *b = dt_bilateral_init_slang(width, height, sigma, sigma_r);
+    err = !b
+      || !dt_ioppr_transform_image_colorspace_slang(self, img, tmp, width, height,
+                                                    IOP_CS_RGB, IOP_CS_LAB, work_profile)
+      || dt_bilateral_splat_slang(b, tmp)
+      || dt_bilateral_blur_slang(b)
+      || dt_bilateral_slice_slang(b, tmp, img, detail)
+      || !dt_ioppr_transform_image_colorspace_slang(self, img, tmp, width, height,
+                                                    IOP_CS_LAB, IOP_CS_RGB, work_profile);
+    dt_bilateral_free_slang(b);
+    dt_slang_gpu_image_t *t = img;
+    img = tmp;
+    tmp = t;
+  }
+
+  // blend the blurred copy back into the layer
+  err = err || _rt_copy_image_masked_slang(img, layer, roi_layer, mask, roi_mask_scaled, tmp, opacity);
+
+  dt_slang_gpu_image_free(img);
+  dt_slang_gpu_image_free(tmp);
+  return err;
+}
+
+static int _retouch_heal_slang(dt_slang_gpu_image_t *layer,
+                               const dt_iop_roi_t *const roi_layer,
+                               dt_slang_gpu_image_t *mask,
+                               float *const mask_scaled,
+                               const dt_iop_roi_t *const roi_mask_scaled,
+                               const int dx,
+                               const int dy,
+                               const float angle,
+                               const float cx,
+                               const float cy,
+                               const float opacity,
+                               const int max_iter)
+{
+  const int width = roi_mask_scaled->width;
+  const int height = roi_mask_scaled->height;
+  const int subwidth = (width + 1) / 2;
+  const int red = 1;
+  const int black = 0;
+
+  // the relaxation factor and exit threshold of _heal_laplace_loop()
+  size_t nmask = 0;
+  for(size_t k = 0; k < (size_t)width * height; k++)
+    nmask += mask_scaled[k] != 0.0f;
+  const float w = ((2.0f - 1.0f / (0.1575f * sqrtf(nmask) + 0.8f)) * .25f);
+  const float epsilon = (0.1 / 255);
+  const float err_exit = epsilon * epsilon * w * w;
+
+  const int groups = ((subwidth + 15) / 16) * ((height + 15) / 16);
+  const size_t splitsize = sizeof(float) * 4 * subwidth * (height + 2);
+  const int zero = 0;
+
+  dt_slang_gpu_image_t *src = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *dest = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_buffer_t *split_red = dt_slang_gpu_buffer_new_uninit(splitsize);
+  dt_slang_gpu_buffer_t *split_black = dt_slang_gpu_buffer_new_uninit(splitsize);
+  dt_slang_gpu_buffer_t *partial_red = dt_slang_gpu_buffer_new_uninit(sizeof(float) * groups);
+  dt_slang_gpu_buffer_t *partial_black = dt_slang_gpu_buffer_new_uninit(sizeof(float) * groups);
+  dt_slang_gpu_buffer_t *converged = dt_slang_gpu_buffer_new(sizeof(int), &zero);
+
+  // the solver of dt_heal_cl(): the convergence test runs on the device after
+  // each iteration, and the flag is read back every few iterations
+  int err = !src || !dest || !split_red || !split_black || !partial_red || !partial_black || !converged
+    || _rt_copy_in_to_out_slang(layer, roi_layer, src, roi_mask_scaled, dx, dy, angle, cx, cy)
+    || _rt_copy_in_to_out_slang(layer, roi_layer, dest, roi_mask_scaled, 0, 0, 0.0f, 0.0f, 0.0f)
+    || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_sub", subwidth, height + 2,
+                                SLIMG_DEV(dest), SLIMG_DEV(src), SLBUF_DEV(split_red),
+                                SLARG(width), SLARG(height), SLARG(subwidth), SLARG(red))
+    || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_sub", subwidth, height + 2,
+                                SLIMG_DEV(dest), SLIMG_DEV(src), SLBUF_DEV(split_black),
+                                SLARG(width), SLARG(height), SLARG(subwidth), SLARG(black));
+
+  for(int iter = 0; iter < max_iter && !err; iter++)
+  {
+    err = dt_slang_gpu_run_2d_args("retouch", "retouch_heal_iterate", subwidth, height,
+                                   SLBUF_DEV(split_black), SLBUF_DEV(split_red), SLIMG_DEV(mask),
+                                   SLARG(width), SLARG(height), SLARG(subwidth), SLARG(black), SLARG(w),
+                                   SLBUF_DEV(converged), SLBUF_DEV(partial_black))
+      || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_iterate", subwidth, height,
+                                  SLBUF_DEV(split_red), SLBUF_DEV(split_black), SLIMG_DEV(mask),
+                                  SLARG(width), SLARG(height), SLARG(subwidth), SLARG(red), SLARG(w),
+                                  SLBUF_DEV(converged), SLBUF_DEV(partial_red))
+      || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_converged", 16, 16,
+                                  SLBUF_DEV(partial_black), SLBUF_DEV(partial_red),
+                                  SLARG(groups), SLARG(err_exit), SLBUF_DEV(converged));
+    if(!err && (iter + 1) % 32 == 0)
+    {
+      int done = 0;
+      err = dt_slang_gpu_buffer_read(converged, &done, sizeof(int));
+      if(done) break;
+    }
+  }
+
+  // src is free again once the solution is added, and serves as the
+  // scratch image of the blend
+  dt_slang_gpu_image_t *healed = dt_slang_gpu_image_new(width, height, 4, NULL);
+  err = err || !healed
+    || dt_slang_gpu_run_2d_args("retouch", "retouch_heal_add", width, height,
+                                SLBUF_DEV(split_red), SLBUF_DEV(split_black), SLIMG_DEV(src), SLIMG_DEV(healed),
+                                SLARG(width), SLARG(height), SLARG(subwidth))
+    || _rt_copy_image_masked_slang(healed, layer, roi_layer, mask, roi_mask_scaled, dest, opacity);
+
+  dt_slang_gpu_image_free(healed);
+  dt_slang_gpu_buffer_free(split_red);
+  dt_slang_gpu_buffer_free(split_black);
+  dt_slang_gpu_buffer_free(partial_red);
+  dt_slang_gpu_buffer_free(partial_black);
+  dt_slang_gpu_buffer_free(converged);
+  dt_slang_gpu_image_free(src);
+  dt_slang_gpu_image_free(dest);
+  return err;
+}
+
+// rt_process_forms() on the device
+static int rt_process_forms_slang(dt_slang_gpu_image_t *layer,
+                                  dwt_params_slang_t *const wt_p,
+                                  const int scale1)
+{
+  int err = 0;
+  int scale = scale1;
+  retouch_user_data_t *usr_d = wt_p->user_data;
+  dt_iop_module_t *self = usr_d->self;
+  dt_dev_pixelpipe_iop_t *piece = usr_d->piece;
+
+  // if preview a single scale, just process that scale and original image
+  // unless merge is activated
+  if(wt_p->merge_from_scale == 0
+     && wt_p->return_layer > 0
+     && scale != wt_p->return_layer
+     && scale != 0)
+    return err;
+  // do not process the reconstructed image
+  if(scale > wt_p->scales + 1) return err;
+
+  dt_develop_blend_params_t *bp = piece->blendop_data;
+  dt_iop_retouch_params_t *p = piece->data;
+  dt_iop_roi_t *roi_layer = &usr_d->roi;
+  const gboolean mask_display = usr_d->mask_display && (scale == usr_d->display_scale);
+
+  // when the requested scales is grather than max scales the residual
+  // image index will be different from the one defined by the user,
+  // so we need to adjust it here, otherwise we will be using the
+  // shapes from a scale on the residual image
+  if(wt_p->scales < p->num_scales
+     && wt_p->return_layer == 0
+     && scale == wt_p->scales + 1)
+  {
+    scale = p->num_scales + 1;
+  }
+
+  if(usr_d->suppress_mask) return err;
+
+  // iterate through all forms
+  const dt_masks_form_t *grp = dt_masks_get_from_id_ext(piece->pipe->forms, bp->mask_id);
+  if(!grp || !(grp->type & DT_MASKS_GROUP)) return err;
+
+  for(const GList *forms = grp->points; forms && !err; forms = g_list_next(forms))
+  {
+    const dt_masks_point_group_t *grpt = forms->data;
+    if(grpt == NULL)
+    {
+      dt_print(DT_DEBUG_ALWAYS, "rt_process_forms: invalid form");
+      continue;
+    }
+    const dt_mask_id_t formid = grpt->formid;
+    const float form_opacity = grpt->opacity;
+    if(!dt_is_valid_maskid(formid))
+    {
+      dt_print(DT_DEBUG_ALWAYS, "rt_process_forms: form is null");
+      continue;
+    }
+    const int index = rt_get_index_from_formid(p, formid);
+    if(index == -1)
+    {
+      dt_print(DT_DEBUG_ALWAYS, "rt_process_forms: missing form=%i from array", formid);
+      continue;
+    }
+
+    // only process current scale
+    if(p->rt_forms[index].scale != scale) continue;
+
+    // get the spot
+    dt_masks_form_t *form = dt_masks_get_from_id_ext(piece->pipe->forms, formid);
+    if(form == NULL)
+    {
+      dt_print(DT_DEBUG_ALWAYS, "rt_process_forms: missing form=%i from masks", formid);
+      continue;
+    }
+
+    // if the form is outside the roi, we just skip it
+    if(!rt_masks_form_is_in_roi(self, piece, form, roi_layer, roi_layer)) continue;
+
+    // get the mask
+    float *mask = NULL;
+    dt_iop_roi_t roi_mask = { 0 };
+    dt_masks_get_mask(self, piece, form, &mask, &roi_mask.width, &roi_mask.height, &roi_mask.x, &roi_mask.y);
+    if(mask == NULL)
+    {
+      dt_print(DT_DEBUG_ALWAYS, "rt_process_forms: error retrieving mask");
+      continue;
+    }
+
+    // search the delta with the source
+    const dt_iop_retouch_algo_type_t algo = p->rt_forms[index].algorithm;
+    float dx = 0.f, dy = 0.f, angle = 0.f;
+    if(algo != DT_IOP_RETOUCH_BLUR && algo != DT_IOP_RETOUCH_FILL
+       && !rt_masks_get_transform_to_destination(self, piece, roi_layer, form, &dx, &dy, &angle,
+                                                 p->rt_forms[index].distort_mode))
+    {
+      dt_free_align(mask);
+      continue;
+    }
+
+    // scale the mask
+    float *mask_scaled = NULL;
+    dt_iop_roi_t roi_mask_scaled = { 0 };
+    err = rt_build_scaled_mask(mask, &roi_mask, &mask_scaled, &roi_mask_scaled, roi_layer, dx, dy, algo);
+    dt_free_align(mask);
+    if(mask_scaled == NULL) continue;
+
+    // rotation pivot: mask centroid in roi_mask_scaled-local coords
+    float cx = 0.f, cy = 0.f;
+    if(!feqf(angle, 0.0f, 0.01f))
+      rt_mask_centroid(mask_scaled, &roi_mask_scaled, &cx, &cy);
+
+    if(!err
+       && (dx != 0 || dy != 0 || algo == DT_IOP_RETOUCH_BLUR || algo == DT_IOP_RETOUCH_FILL)
+       && roi_mask_scaled.width > 2 && roi_mask_scaled.height > 2)
+    {
+      dt_slang_gpu_image_t *dev_mask = dt_slang_gpu_image_new(roi_mask_scaled.width, roi_mask_scaled.height,
+                                                               1, mask_scaled);
+      if(!dev_mask)
+        err = 1;
+      else if(algo == DT_IOP_RETOUCH_CLONE)
+        err = _retouch_clone_slang(layer, roi_layer, dev_mask, &roi_mask_scaled, dx, dy, angle, cx, cy,
+                                   form_opacity);
+      else if(algo == DT_IOP_RETOUCH_HEAL)
+        err = _retouch_heal_slang(layer, roi_layer, dev_mask, mask_scaled, &roi_mask_scaled, dx, dy,
+                                  angle, cx, cy, form_opacity, p->max_heal_iter);
+      else if(algo == DT_IOP_RETOUCH_BLUR)
+        err = _retouch_blur_slang(self, layer, roi_layer, dev_mask, &roi_mask_scaled, form_opacity,
+                                  p->rt_forms[index].blur_type, p->rt_forms[index].blur_radius, piece);
+      else if(algo == DT_IOP_RETOUCH_FILL)
+      {
+        // add a brightness to the color so it can be fine-adjusted by the user
+        dt_aligned_pixel_t fill_color;
+        if(p->rt_forms[index].fill_mode == DT_IOP_RETOUCH_FILL_ERASE)
+          fill_color[0] = fill_color[1] = fill_color[2] = p->rt_forms[index].fill_brightness;
+        else
+          for_three_channels(c)
+            fill_color[c] = p->rt_forms[index].fill_color[c] + p->rt_forms[index].fill_brightness;
+        fill_color[3] = 0.0f;
+        err = _retouch_fill_slang(layer, roi_layer, dev_mask, &roi_mask_scaled, form_opacity, fill_color);
+      }
+      else
+        dt_print(DT_DEBUG_ALWAYS, "rt_process_forms: unknown algorithm %i", algo);
+
+      if(!err && mask_display)
+      {
+        const int mwidth = roi_mask_scaled.width;
+        const int mheight = roi_mask_scaled.height;
+        const int ox = roi_mask_scaled.x - roi_layer->x;
+        const int oy = roi_mask_scaled.y - roi_layer->y;
+        dt_slang_gpu_image_t *tmp = dt_slang_gpu_image_new(mwidth, mheight, 4, NULL);
+        err = !tmp
+          || dt_slang_gpu_run_2d_args("retouch", "retouch_mask_to_alpha", mwidth, mheight,
+                                      SLIMG_DEV(layer), SLIMG_DEV(dev_mask), SLIMG_DEV(tmp),
+                                      SLARG(mwidth), SLARG(mheight), SLARG(ox), SLARG(oy),
+                                      SLARG(form_opacity))
+          || dt_slang_gpu_run_2d_args("retouch", "retouch_rect_to_layer", mwidth, mheight,
+                                      SLIMG_DEV(tmp), SLIMG_DEV(layer),
+                                      SLARG(mwidth), SLARG(mheight), SLARG(ox), SLARG(oy));
+        dt_slang_gpu_image_free(tmp);
+      }
+      dt_slang_gpu_image_free(dev_mask);
+    }
+
+    dt_free_align(mask_scaled);
+  }
+
+  return err;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_retouch_params_t *p = piece->data;
+  dt_iop_retouch_gui_data_t *g = self->gui_data;
+  dt_dev_pixelpipe_t *pipe = piece->pipe;
+
+  const gboolean display_wavelet_scale = g && dt_iop_has_focus(self) ? g->display_wavelet_scale : FALSE;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  retouch_user_data_t usr_data = { 0 };
+  usr_data.self = self;
+  usr_data.piece = piece;
+  usr_data.roi = *roi_in;
+  usr_data.mask_display = FALSE;
+  usr_data.suppress_mask = (g
+                            && g->suppress_mask
+                            && dt_iop_has_focus(self)
+                            && (pipe == self->dev->full.pipe));
+  usr_data.display_scale = p->curr_scale;
+
+  // the mask view and the wavelet scale view show the shapes in the alpha
+  // channel, as in process(); process_cl() does that for the mask view only
+  const gboolean expose_mask = dt_pipe_is_full(pipe) && g
+                               && (g->mask_display || display_wavelet_scale)
+                               && dt_iop_has_focus(self) && (pipe == self->dev->full.pipe);
+
+  // all the clone, heal, etc work on a copy of the input, so that the
+  // source of one algorithm can be the destination of a previous one
+  dt_slang_gpu_image_t *in_retouch = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dwt_params_slang_t *dwt_p = dt_dwt_init_slang(in_retouch, width, height, p->num_scales,
+                                                (!display_wavelet_scale || !dt_pipe_is_full(pipe))
+                                                ? 0 : p->curr_scale,
+                                                p->merge_from_scale, &usr_data, roi_in->scale / piece->iscale);
+  const int zero = 0;
+  const int clear = 1;
+  gboolean ok = in_retouch && dwt_p
+    && (expose_mask
+        ? !dt_slang_gpu_run_2d_args("retouch", "retouch_set_alpha", width, height,
+                                    SLIMG_DEV(dev_in), SLIMG_DEV(dev_in), SLIMG_DEV(in_retouch),
+                                    SLARG(width), SLARG(height), SLARG(clear))
+        : !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                    SLIMG_DEV(dev_in), SLIMG_DEV(in_retouch), SLARG(width), SLARG(height),
+                                    SLARG(width), SLARG(height), SLARG(zero), SLARG(zero)));
+
+  if(ok && expose_mask)
+  {
+    pipe->mask_display = g->mask_display ? DT_DEV_PIXELPIPE_DISPLAY_MASK : DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+    pipe->bypass_blendif = TRUE;
+    usr_data.mask_display = TRUE;
+  }
+
+  if(ok && dt_pipe_is_full(pipe))
+  {
+    // check if the image support this number of scales
+    if(dt_iop_has_focus(self))
+    {
+      const int max_scales = dwt_get_max_scale_slang(dwt_p);
+      if(dwt_p->scales > max_scales)
+        dt_control_log(_("max scale is %i for this image size"), max_scales);
+    }
+    // get first scale visible at this zoom level
+    if(g) g->first_scale_visible = dt_dwt_first_scale_visible_slang(dwt_p);
+  }
+
+  ok = ok && !dwt_decompose_slang(dwt_p, rt_process_forms_slang);
+
+  dt_aligned_pixel_t levels = { p->preview_levels[0],
+                                p->preview_levels[1],
+                                p->preview_levels[2] };
+
+  // the auto levels and the levels of a wavelet scale view run on the host,
+  // as in process_cl()
+  const gboolean scale_levels = ok && dwt_p->return_layer > 0 && dwt_p->return_layer < dwt_p->scales + 1;
+  gboolean auto_levels = FALSE;
+  if(ok && g && dt_pipe_is_full(pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    auto_levels = g->preview_auto_levels == 1 && !DT_IN_GUI_UPDATE();
+    if(auto_levels) g->preview_auto_levels = -1;
+    dt_iop_gui_leave_critical_section(self);
+  }
+  if(auto_levels || scale_levels)
+  {
+    float *host = dt_alloc_align_float((size_t)4 * width * height);
+    ok = host && !dt_slang_gpu_image_read(in_retouch, host);
+    if(ok && auto_levels)
+    {
+      levels[0] = levels[1] = levels[2] = 0;
+      rt_process_stats(self, piece, host, width, height, 4, levels);
+      rt_clamp_minmax(levels, levels);
+      for(int i = 0; i < 3; i++) g->preview_levels[i] = levels[i];
+    }
+    if(ok && scale_levels)
+    {
+      rt_adjust_levels(self, piece, host, width, height, 4, levels);
+      ok = !dt_slang_gpu_image_write(in_retouch, host);
+    }
+    dt_free_align(host);
+  }
+  if(auto_levels)
+  {
+    // a failure leaves the request for process()
+    dt_iop_gui_enter_critical_section(self);
+    g->preview_auto_levels = ok ? 2 : 1;
+    dt_iop_gui_leave_critical_section(self);
+  }
+
+  // pass on the alpha channel of a mask shown by another module
+  dt_slang_gpu_image_t *result = in_retouch;
+  if(ok && (pipe->mask_display & DT_DEV_PIXELPIPE_DISPLAY_MASK) && g && !g->mask_display)
+  {
+    const int keep = 0;
+    result = dt_slang_gpu_image_new(width, height, 4, NULL);
+    ok = result
+      && !dt_slang_gpu_run_2d_args("retouch", "retouch_set_alpha", width, height,
+                                   SLIMG_DEV(in_retouch), SLIMG_DEV(dev_in), SLIMG_DEV(result),
+                                   SLARG(width), SLARG(height), SLARG(keep));
+  }
+
+  ok = ok && !_rt_copy_in_to_out_slang(result, roi_in, dev_out, roi_out, 0, 0, 0.0f, 0.0f, 0.0f);
+
+  if(result != in_retouch) dt_slang_gpu_image_free(result);
+  dt_dwt_free_slang(dwt_p);
+  dt_slang_gpu_image_free(in_retouch);
+  return ok;
 }
 #endif
 

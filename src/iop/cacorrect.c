@@ -22,6 +22,7 @@
 #endif
 
 #include "bauhaus/bauhaus.h"
+#include "common/slang_gpu.h"
 #include "common/darktable.h"
 #include "common/imagebuf.h"
 #include "common/gaussian.h"
@@ -1226,9 +1227,9 @@ DT_OMP_PRAGMA(barrier)
   dt_free_align(oldraw);
 }
 
-#ifdef HAVE_OPENCL
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
 // the state that process() keeps across iterations, for the host part of
-// process_cl()
+// process_cl() and process_slang()
 typedef struct _cacorrect_fit_t
 {
   int vert_tiles, horiz_tiles;
@@ -1431,6 +1432,9 @@ static void _cacorrect_tile_shifts(const _cacorrect_fit_t *f,
     }
 }
 
+#endif
+
+#ifdef HAVE_OPENCL
 // the colorshift avoidance of process(): the blurred ratios of the red and
 // blue values before and after the correction scale the corrected ones
 static cl_int _cacorrect_avoid_shift_cl(const dt_iop_cacorrect_global_data_t *gd,
@@ -1692,6 +1696,186 @@ void cleanup_global(dt_iop_module_so_t *self)
   self->data = NULL;
 }
 
+#ifdef HAVE_SLANG_GPU
+// the colorshift avoidance of process(): the blurred ratios of the red and
+// blue values before and after the correction scale the corrected ones
+static gboolean _cacorrect_avoid_shift(dt_slang_gpu_buffer_t *before,
+                                       dt_slang_gpu_buffer_t *buf,
+                                       const int width,
+                                       const int height,
+                                       const uint32_t filters)
+{
+  const int h_width = (width + 1) / 2;
+  const int h_height = (height + 1) / 2;
+
+  // the row and column parity of the red and the blue sensels, and the plane
+  // that process() completes with the column before its last
+  int prow[3] = { 0 }, pcol[3] = { 0 };
+  for(int row = 0; row < 2; row++)
+  {
+    const int firstCol = FC(row, 0, filters) & 1;
+    const int color = FC(row, firstCol, filters);
+    prow[color] = row;
+    pcol[color] = firstCol;
+  }
+  const int ngRow = 1 - (FC(0, 0, filters) & 1);
+  const int ngCol = FC(ngRow, 0, filters) & 1;
+  const int wcolor = FC(ngRow, ngCol, filters);
+  const int fixrow = height % 2;
+
+  dt_slang_gpu_image_t *red = dt_slang_gpu_image_new(h_width, h_height, 1, NULL);
+  dt_slang_gpu_image_t *blue = dt_slang_gpu_image_new(h_width, h_height, 1, NULL);
+  gboolean ok = red && blue;
+  for(int color = 0; color < 3 && ok; color += 2)
+  {
+    dt_slang_gpu_image_t *factors = color == 0 ? red : blue;
+    const int fixcol = width % 2 && color == wcolor;
+    ok = !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_factors", h_width, h_height,
+                                   SLBUF_DEV(before), SLBUF_DEV(buf), SLIMG_DEV(factors),
+                                   SLARG(width), SLARG(height), SLARG(h_width), SLARG(h_height),
+                                   SLARG(prow[color]), SLARG(pcol[color]), SLARG(fixrow), SLARG(fixcol))
+      && !dt_gaussian_blur_slang(factors, factors, h_width, h_height, 30.0f, 10.0f, 0.1f);
+  }
+  ok = ok && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_apply_factors", width, height,
+                                       SLBUF_DEV(buf), SLIMG_DEV(red), SLIMG_DEV(blue),
+                                       SLARG(width), SLARG(height), SLARG(filters));
+  dt_slang_gpu_image_free(red);
+  dt_slang_gpu_image_free(blue);
+  return ok;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_cacorrect_data_t *d = piece->data;
+  const gboolean run_fast = dt_pipe_is_fast(piece->pipe);
+  const gboolean avoidshift = d->avoidshift && !dt_pipe_is_preview(piece->pipe);
+
+  const uint32_t filters = piece->filters;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const float scaler = dt_iop_get_processed_maximum(piece);
+  const float inv_scaler = 1.0f / scaler;
+  const int dx = roi_out->x;
+  const int dy = roi_out->y;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+
+  const int ewidth = width + 2 * border;
+  const int eheight = height + 2 * border;
+  const int hwidth = (ewidth + 1) / 2;
+  const int step = ts - border2;
+  const int vtiles = (height + border - 1) / step + 1;
+  const int htiles = (width + border - 1) / step + 1;
+
+  const size_t isize = sizeof(float) * width * height;
+  const size_t esize = sizeof(float) * ewidth * eheight;
+  const size_t fsize = sizeof(float) * 6 * eheight * hwidth;
+  size_t available = 0;
+  int max_dim = 0;
+  dt_slang_gpu_memory_info(&available, &max_dim);
+  if(!run_fast && (avoidshift ? 3 : 2) * isize + 3 * esize + fsize > available) return FALSE;
+
+  dt_slang_gpu_buffer_t *cur = dt_slang_gpu_buffer_new_uninit(isize);
+  gboolean ok = cur
+    && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_load", width, height,
+                                 SLIMG_DEV(dev_in), SLBUF_DEV(cur),
+                                 SLARG(width), SLARG(height), SLARG(inv_scaler));
+
+  const int iterations = d->iterations;
+  if(ok && !run_fast && iterations > 0)
+  {
+    dt_slang_gpu_buffer_t *next = dt_slang_gpu_buffer_new_uninit(isize);
+    dt_slang_gpu_buffer_t *raw = dt_slang_gpu_buffer_new_uninit(esize);
+    dt_slang_gpu_buffer_t *green = dt_slang_gpu_buffer_new_uninit(esize);
+    dt_slang_gpu_buffer_t *green2 = dt_slang_gpu_buffer_new_uninit(esize);
+    dt_slang_gpu_buffer_t *filt = dt_slang_gpu_buffer_new_uninit(fsize);
+    dt_slang_gpu_buffer_t *tsums = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 12 * vtiles * htiles);
+
+    _cacorrect_fit_t fit = { 0 };
+    const int vz1 = (height + border2) % (ts - border2) == 0 ? 1 : 0;
+    const int hz1 = (width + border2) % (ts - border2) == 0 ? 1 : 0;
+    fit.vert_tiles = ceilf((float)(height + border2) / (ts - border2) + 2 + vz1);
+    fit.horiz_tiles = ceilf((float)(width + border2) / (ts - border2) + 2 + hz1);
+    fit.blockwt = dt_calloc_align_float(5 * fit.vert_tiles * fit.horiz_tiles);
+    fit.blockshifts = fit.blockwt ? (float(*)[2][2])(fit.blockwt + fit.vert_tiles * fit.horiz_tiles) : NULL;
+    fit.polyord = 4;
+    fit.numpar = 16;
+    float *sums = dt_alloc_align_float(12 * vtiles * htiles);
+    float *shifts = dt_alloc_align_float(4 * vtiles * htiles);
+
+    // the values before the correction, for the colorshift avoidance
+    dt_slang_gpu_buffer_t *before = avoidshift ? dt_slang_gpu_buffer_new_uninit(isize) : NULL;
+    ok = next && raw && green && green2 && filt && tsums && fit.blockwt && sums && shifts
+      && (!avoidshift
+          || (before
+              && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_copy", width, height,
+                                           SLBUF_DEV(cur), SLBUF_DEV(before), SLARG(width), SLARG(height))));
+
+    const int origin = border * ewidth + border;
+    const int zero = 0;
+    gboolean processpasstwo = TRUE;
+    for(int it = 0; it < iterations && ok && processpasstwo; it++)
+    {
+      ok = !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_extend", ewidth, eheight,
+                                     SLBUF_DEV(cur), SLBUF_DEV(raw),
+                                     SLARG(width), SLARG(height), SLARG(zero), SLARG(width))
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_green", ewidth, eheight,
+                                     SLBUF_DEV(raw), SLBUF_DEV(green),
+                                     SLARG(ewidth), SLARG(eheight), SLARG(filters))
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_filters", hwidth, eheight,
+                                     SLBUF_DEV(raw), SLBUF_DEV(green), SLBUF_DEV(filt),
+                                     SLARG(ewidth), SLARG(eheight), SLARG(hwidth), SLARG(filters))
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_tile_sums", 16 * htiles, 16 * vtiles,
+                                     SLBUF_DEV(raw), SLBUF_DEV(green), SLBUF_DEV(filt), SLBUF_DEV(tsums),
+                                     SLARG(width), SLARG(height), SLARG(hwidth), SLARG(htiles),
+                                     SLARG(filters))
+        && !dt_slang_gpu_buffer_read(tsums, sums, sizeof(float) * 12 * vtiles * htiles);
+      if(!ok) break;
+
+      processpasstwo = _cacorrect_fit(&fit, sums, vtiles, htiles);
+      if(!processpasstwo) break;
+
+      _cacorrect_tile_shifts(&fit, shifts, vtiles, htiles);
+      ok = !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_extend", ewidth, eheight,
+                                     SLBUF_DEV(green), SLBUF_DEV(green2),
+                                     SLARG(width), SLARG(height), SLARG(origin), SLARG(ewidth))
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_correct", width, height,
+                                     SLBUF_DEV(raw), SLBUF_DEV(green2),
+                                     SLBUF(shifts, sizeof(float) * 4 * vtiles * htiles), SLBUF_DEV(next),
+                                     SLARG(width), SLARG(height), SLARG(htiles), SLARG(filters));
+      dt_slang_gpu_buffer_t *t = cur;
+      cur = next;
+      next = t;
+    }
+
+    if(ok && avoidshift && processpasstwo) ok = _cacorrect_avoid_shift(before, cur, width, height, filters);
+
+    dt_slang_gpu_buffer_free(before);
+    dt_slang_gpu_buffer_free(next);
+    dt_slang_gpu_buffer_free(raw);
+    dt_slang_gpu_buffer_free(green);
+    dt_slang_gpu_buffer_free(green2);
+    dt_slang_gpu_buffer_free(filt);
+    dt_slang_gpu_buffer_free(tsums);
+    dt_free_align(fit.blockwt);
+    dt_free_align(sums);
+    dt_free_align(shifts);
+  }
+
+  ok = ok && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_store", owidth, oheight,
+                                       SLBUF_DEV(cur), SLIMG_DEV(dev_out),
+                                       SLARG(width), SLARG(owidth), SLARG(oheight),
+                                       SLARG(dx), SLARG(dy), SLARG(scaler));
+  dt_slang_gpu_buffer_free(cur);
+  return ok;
+}
+#endif
+
 /*==================================================================================
  * end raw therapee code
  *==================================================================================*/
@@ -1726,6 +1910,18 @@ void distort_mask(dt_iop_module_t *self,
 {
   dt_iop_copy_image_roi(out, in, 1, roi_in, roi_out);
 }
+
+#ifdef HAVE_SLANG_GPU
+gboolean distort_mask_slang(dt_iop_module_t *self,
+                            dt_dev_pixelpipe_iop_t *piece,
+                            dt_slang_gpu_image_t *dev_in,
+                            dt_slang_gpu_image_t *dev_out,
+                            const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  return !dt_iop_copy_image_roi_slang(dev_out, dev_in, roi_in, roi_out);
+}
+#endif
 
 void reload_defaults(dt_iop_module_t *self)
 {

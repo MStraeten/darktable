@@ -43,6 +43,7 @@ struct dt_dev_pixelpipe_iop_t;
 struct dt_iop_roi_t;
 struct dt_develop_tiling_t;
 struct dt_iop_buffer_dsc_t;
+struct dt_slang_gpu_image_t;
 struct _GtkWidget;
 
 #ifndef DT_IOP_PARAMS_T
@@ -291,6 +292,20 @@ DEFAULT(int, process_tiling_cl, struct dt_iop_module_t *self,
                                 const int bpp);
 #endif
 
+#ifdef HAVE_SLANG_GPU
+/** process() on the Slang kernels, with input and output images on the device.
+ *  Returns TRUE on success; on failure the pixelpipe runs process() instead,
+ *  so dev_in must be left unchanged. Only called for 4-channel float images
+ *  that need no colorspace conversion or blending. A module whose images
+ *  don't fit the device is called once per tile, with the tile's rois. */
+OPTIONAL(gboolean, process_slang, struct dt_iop_module_t *self,
+                                  struct dt_dev_pixelpipe_iop_t *piece,
+                                  struct dt_slang_gpu_image_t *dev_in,
+                                  struct dt_slang_gpu_image_t *dev_out,
+                                  const struct dt_iop_roi_t *const roi_in,
+                                  const struct dt_iop_roi_t *const roi_out);
+#endif
+
 /** this functions are used for distort iop
  * points is an array of float {x1,y1,x2,y2,...}
  * size is 2*points_count */
@@ -310,6 +325,16 @@ OPTIONAL(void, distort_mask, struct dt_iop_module_t *self,
                              float *const out,
                              const struct dt_iop_roi_t *const roi_in,
                              const struct dt_iop_roi_t *const roi_out);
+#ifdef HAVE_SLANG_GPU
+/** distort_mask() on the Slang device, with 1-channel images. Returns TRUE
+ *  on success; on failure the whole mask is distorted on the host. */
+OPTIONAL(gboolean, distort_mask_slang, struct dt_iop_module_t *self,
+                                       struct dt_dev_pixelpipe_iop_t *piece,
+                                       struct dt_slang_gpu_image_t *dev_in,
+                                       struct dt_slang_gpu_image_t *dev_out,
+                                       const struct dt_iop_roi_t *const roi_in,
+                                       const struct dt_iop_roi_t *const roi_out);
+#endif
 
 // introspection related callbacks, will be auto-implemented if
 // DT_MODULE_INTROSPECTION() is used,

@@ -556,6 +556,83 @@ error:
 
 #endif
 
+#ifdef HAVE_SLANG_GPU
+// process_rcd_cl() on the Slang kernels: PPG for the borders, then RCD for
+// the rest. Returns TRUE on success.
+static gboolean process_rcd_slang(dt_dev_pixelpipe_iop_t *piece,
+                                  dt_slang_gpu_image_t *dev_in,
+                                  dt_slang_gpu_image_t *dev_out,
+                                  const int width,
+                                  const int height,
+                                  const uint32_t filters)
+{
+  const size_t bsize = sizeof(float) * width * height;
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_buffer_t *cfa = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *VH_dir = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *PQ_dir = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *VP_diff = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *HQ_diff = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *rgb0 = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *rgb1 = dt_slang_gpu_buffer_new(bsize, NULL);
+  dt_slang_gpu_buffer_t *rgb2 = dt_slang_gpu_buffer_new(bsize, NULL);
+
+  const int ppg_green_border = 32;
+  const int ppg_redblue_border = 16;
+  const int rcd_margin = RCD_MARGIN;
+  const float scaler = 1.0f / dt_iop_get_processed_maximum(piece);
+  const float rescaler = dt_iop_get_processed_maximum(piece);
+  const int half = width / 2;
+
+  const gboolean ok =
+    dev_tmp && cfa && VH_dir && PQ_dir && VP_diff && HQ_diff && rgb0 && rgb1 && rgb2
+    && !dt_slang_gpu_run_2d_args("demosaic_ppg", "border_interpolate", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height), SLARG(filters))
+    && !dt_slang_gpu_run_2d_args("demosaic_ppg", "ppg_demosaic_green", width, height,
+                                 SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(width), SLARG(height),
+                                 SLARG(filters), SLARG(ppg_green_border))
+    && !dt_slang_gpu_run_2d_args("demosaic_ppg", "ppg_demosaic_redblue", width, height,
+                                 SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                 SLARG(filters), SLARG(ppg_redblue_border))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_populate", width, height,
+                                 SLIMG_DEV(dev_in), SLBUF_DEV(cfa), SLBUF_DEV(rgb0), SLBUF_DEV(rgb1),
+                                 SLBUF_DEV(rgb2), SLARG(width), SLARG(height), SLARG(filters), SLARG(scaler))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_step_1", width, height,
+                                 SLBUF_DEV(cfa), SLBUF_DEV(VH_dir), SLARG(width), SLARG(height))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_step_2", half, height,
+                                 SLBUF_DEV(PQ_dir), SLBUF_DEV(cfa), SLARG(width), SLARG(height), SLARG(filters))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_step_3", half, height,
+                                 SLBUF_DEV(PQ_dir), SLBUF_DEV(cfa), SLBUF_DEV(rgb1), SLBUF_DEV(VH_dir),
+                                 SLARG(width), SLARG(height), SLARG(filters))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_step_4_0", half, height,
+                                 SLBUF_DEV(cfa), SLBUF_DEV(VP_diff), SLBUF_DEV(HQ_diff),
+                                 SLARG(width), SLARG(height), SLARG(filters))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_step_4_1", half, height,
+                                 SLBUF_DEV(PQ_dir), SLBUF_DEV(VP_diff), SLBUF_DEV(HQ_diff),
+                                 SLARG(width), SLARG(height), SLARG(filters))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_step_4_2", half, height,
+                                 SLBUF_DEV(PQ_dir), SLBUF_DEV(rgb0), SLBUF_DEV(rgb1), SLBUF_DEV(rgb2),
+                                 SLARG(width), SLARG(height), SLARG(filters))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_step_4_3", half, height,
+                                 SLBUF_DEV(VH_dir), SLBUF_DEV(rgb0), SLBUF_DEV(rgb1), SLBUF_DEV(rgb2),
+                                 SLARG(width), SLARG(height), SLARG(filters))
+    && !dt_slang_gpu_run_2d_args("demosaic_rcd", "rcd_write_output", width, height,
+                                 SLIMG_DEV(dev_out), SLBUF_DEV(rgb0), SLBUF_DEV(rgb1), SLBUF_DEV(rgb2),
+                                 SLARG(width), SLARG(height), SLARG(rescaler), SLARG(rcd_margin));
+
+  dt_slang_gpu_image_free(dev_tmp);
+  dt_slang_gpu_buffer_free(cfa);
+  dt_slang_gpu_buffer_free(VH_dir);
+  dt_slang_gpu_buffer_free(PQ_dir);
+  dt_slang_gpu_buffer_free(VP_diff);
+  dt_slang_gpu_buffer_free(HQ_diff);
+  dt_slang_gpu_buffer_free(rgb0);
+  dt_slang_gpu_buffer_free(rgb1);
+  dt_slang_gpu_buffer_free(rgb2);
+  return ok;
+}
+#endif
+
 #undef RCD_BORDER
 #undef RCD_MARGIN
 #undef RCD_TILEVALID

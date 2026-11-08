@@ -27,6 +27,9 @@
 #include "develop/masks/probe_image.h"
 #include "common/iop_profile.h"
 #include "develop/pixelpipe.h"
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -93,6 +96,14 @@ typedef struct
   // off, i.e. are migration's to answer for rather than a downstream stage's
   // (see dev_diff_after_nopost)
   int dev_gap_widened_own;
+
+  // the same for the Slang blend, against the CPU
+  int slang_compared;
+  double worst_slang_diff;       // Slang: worst classic-vs-migrated
+  int worst_slang_index;
+  double worst_slang_dev_before; // worst CPU/Slang gap on classic edits
+  double worst_slang_dev_after;  // ... and on migrated ones
+  int slang_gap_widened;
 } verify_stats_t;
 
 // ---------------------------------------------------------------------------
@@ -466,6 +477,9 @@ const char *dt_masks_harvest_read_classic_edit(JsonObject *edit,
     says it reports CPU results only */
 static int _verify_devid = -1;
 
+/** whether the replays run on the Slang device as well */
+static gboolean _verify_slang = FALSE;
+
 /** the output of the module the mask belongs to: the probe at +1 EV. The
     blend computes `out = in * (1 - mask) + module_out * mask`, so with the
     input as output every mask would render the same image; and blendif's
@@ -590,6 +604,62 @@ done:
   dt_opencl_release_mem_object(dev_in);
   dt_opencl_release_mem_object(dev_out);
   r->pipe.devid = DT_DEVICE_CPU;
+  return copy;
+#else
+  return NULL;
+#endif
+}
+
+/** the same render through dt_develop_blend_process_slang(), a third
+    implementation kept in step with the OpenCL one. NULL where the pipe would
+    blend on the CPU instead (dt_develop_blend_slang_supported()) */
+static float *_render_mask_slang(replay_t *r, float **image)
+{
+  if(image) *image = NULL;
+#ifdef HAVE_SLANG_GPU
+  if(!_verify_slang) return NULL;
+
+  const size_t npix = (size_t)r->roi.width * r->roi.height;
+  const int w = r->roi.width, h = r->roi.height;
+
+  float *copy = NULL;
+  // the blend reads the input and the module's output, and writes a third
+  // image, unlike the OpenCL one, which blends into the module's output
+  dt_slang_gpu_image_t *dev_in = dt_slang_gpu_image_new(w, h, 4, r->probe);
+  dt_slang_gpu_image_t *dev_module = dt_slang_gpu_image_new(w, h, 4, r->modout);
+  dt_slang_gpu_image_t *dev_out = dt_slang_gpu_image_new(w, h, 4, NULL);
+  if(!dev_in || !dev_module || !dev_out) goto done;
+
+  r->pipe.forms = r->dev.forms;
+
+  dt_develop_blend_params_t committed = *r->module.blend_params;
+  dt_iop_commit_blend_params(&r->module, &committed, &r->pipe);
+
+  if(!dt_develop_blend_slang_supported(&r->module, &r->piece, &r->roi, &r->roi)
+     || !dt_develop_blend_process_slang(&r->module, &r->piece, dev_in, dev_module, dev_out,
+                                        &r->roi, &r->roi))
+    goto done;
+
+  const float *m = _published_mask(r);
+  if(!m) goto done;
+
+  copy = dt_alloc_align_float(npix);
+  if(copy) memcpy(copy, m, sizeof(float) * npix);
+
+  if(image)
+  {
+    float *img = dt_alloc_align_float(npix * 4);
+    // as in _render_mask_cl(): no image rather than garbage
+    if(img && !dt_slang_gpu_image_read(dev_out, img))
+      *image = img;
+    else
+      dt_free_align(img);
+  }
+
+done:
+  dt_slang_gpu_image_free(dev_in);
+  dt_slang_gpu_image_free(dev_module);
+  dt_slang_gpu_image_free(dev_out);
   return copy;
 #else
   return NULL;
@@ -1014,6 +1084,14 @@ typedef struct
   gboolean nopost_ran;
   double dev_diff_after_nopost;
 
+  // the Slang replay, read as the OpenCL one above. `slang_ran` stays FALSE
+  // without a Slang device, and where dt_develop_blend_slang_supported()
+  // hands the blend to the CPU, as the pipe would
+  gboolean slang_ran;
+  double slang_max_diff;
+  double slang_dev_diff_before;
+  double slang_dev_diff_after;
+
 } edit_report_t;
 
 static void _verify_edit(JsonObject *edit, edit_report_t *rep)
@@ -1058,6 +1136,7 @@ static void _verify_edit(JsonObject *edit, edit_report_t *rep)
 
   // the classic edit on the GPU: the baseline of the CPU and GPU gap
   float *before_cl = _render_mask_cl(&r, &before_cl_img);
+  float *before_sl = _render_mask_slang(&r, NULL);
 
   // --- migrate ----------------------------------------------------------
   dt_masks_migrate_classic_to_flexi(&r.module, r.module.blend_params, -1);
@@ -1076,6 +1155,7 @@ static void _verify_edit(JsonObject *edit, edit_report_t *rep)
     rep->skip_reason = "flexi render produced no mask";
     dt_free_align(before);
     dt_free_align(before_cl);
+    dt_free_align(before_sl);
     dt_free_align(before_img);
     dt_free_align(before_cl_img);
     dt_masks_verify_replay_cleanup(&r);
@@ -1083,6 +1163,15 @@ static void _verify_edit(JsonObject *edit, edit_report_t *rep)
   }
 
   float *after_cl = _render_mask_cl(&r, &after_cl_img);
+  float *after_sl = _render_mask_slang(&r, NULL);
+
+  if(before_sl && after_sl)
+  {
+    rep->slang_ran = TRUE;
+    rep->slang_max_diff = dt_masks_verify_max_abs_diff(before_sl, after_sl, npix);
+    rep->slang_dev_diff_before = dt_masks_verify_max_abs_diff(before, before_sl, npix);
+    rep->slang_dev_diff_after = dt_masks_verify_max_abs_diff(after, after_sl, npix);
+  }
 
   // the GPU comparison needs both renders; one without the other is counted
   // as an error below
@@ -1214,6 +1303,12 @@ static void _verify_edit(JsonObject *edit, edit_report_t *rep)
     const double widened = rep->dev_diff_after - rep->dev_diff_before;
     if(widened > VERIFY_EPS_EQUIVALENT) verdict_d = MAX(verdict_d, widened);
   }
+  // the same for the Slang blend
+  if(rep->slang_ran)
+  {
+    const double widened = rep->slang_dev_diff_after - rep->slang_dev_diff_before;
+    if(widened > VERIFY_EPS_EQUIVALENT) verdict_d = MAX(verdict_d, widened);
+  }
 
   // `deltae`'s rule: over tolerance on the worst pixel, or over a third of it
   // on average, is a real difference; well under it everywhere is identical.
@@ -1229,11 +1324,19 @@ static void _verify_edit(JsonObject *edit, edit_report_t *rep)
     rep->skip_reason = before_cl ? "GPU rendered classic but not migrated"
                                  : "GPU rendered migrated but not classic";
   }
+  if(_verify_slang && !rep->slang_ran && (before_sl || after_sl))
+  {
+    rep->result = VERIFY_ERROR;
+    rep->skip_reason = before_sl ? "Slang rendered classic but not migrated"
+                                 : "Slang rendered migrated but not classic";
+  }
 
   dt_free_align(before);
   dt_free_align(after);
   dt_free_align(before_cl);
   dt_free_align(after_cl);
+  dt_free_align(before_sl);
+  dt_free_align(after_sl);
   dt_free_align(before_img);
   dt_free_align(after_img);
   dt_free_align(before_cl_img);
@@ -1285,6 +1388,11 @@ gboolean dt_masks_verify_harvest_section(const char *json_path, FILE *rf)
 #else
   printf("[verify] built without OpenCL: CPU blend only\n");
 #endif
+#ifdef HAVE_SLANG_GPU
+  _verify_slang = dt_slang_gpu_enabled();
+  printf(_verify_slang ? "[verify] Slang device available: Slang blend will be replayed too\n"
+                       : "[verify] no Slang device: Slang blend not replayed\n");
+#endif
 
   JsonParser *parser;
   JsonArray *edits = dt_masks_harvest_open_edits(json_path, "verify", &parser);
@@ -1296,6 +1404,7 @@ gboolean dt_masks_verify_harvest_section(const char *json_path, FILE *rf)
   st.worst_gpu_index = -1;
   st.worst_image_index = -1;
   st.worst_gpu_image_index = -1;
+  st.worst_slang_index = -1;
 
   if(rf) fprintf(rf, "\n  \"source\": \"%s\",\n  \"edits\": [", json_path);
   gboolean first_report = TRUE;
@@ -1413,6 +1522,19 @@ gboolean dt_masks_verify_harvest_section(const char *json_path, FILE *rf)
             st.dev_gap_widened_own++;
         }
       }
+      if(rep.slang_ran)
+      {
+        st.slang_compared++;
+        if(rep.slang_max_diff > st.worst_slang_diff)
+        {
+          st.worst_slang_diff = rep.slang_max_diff;
+          st.worst_slang_index = (int)i;
+        }
+        st.worst_slang_dev_before = MAX(st.worst_slang_dev_before, rep.slang_dev_diff_before);
+        st.worst_slang_dev_after = MAX(st.worst_slang_dev_after, rep.slang_dev_diff_after);
+        if(rep.slang_dev_diff_after - rep.slang_dev_diff_before > VERIFY_EPS_EQUIVALENT)
+          st.slang_gap_widened++;
+      }
     }
 
     // skipped edits are written too: the report has to account for every edit
@@ -1432,7 +1554,9 @@ gboolean dt_masks_verify_harvest_section(const char *json_path, FILE *rf)
                   " \"gpu_image_differing_pixels\": %d,"
                   " \"dev_diff_before\": %.9g,"
                   " \"dev_diff_after\": %.9g,"
-                  " \"nopost_ran\": %s, \"dev_diff_after_nopost\": %.9g%s%s%s}",
+                  " \"nopost_ran\": %s, \"dev_diff_after_nopost\": %.9g,"
+                  " \"slang_ran\": %s, \"slang_max_diff\": %.9g,"
+                  " \"slang_dev_diff_before\": %.9g, \"slang_dev_diff_after\": %.9g%s%s%s}",
               first_report ? "" : ",", i,
               dt_masks_harvest_obj_str(edit, "operation", "?"),
               _result_name(rep.result),
@@ -1448,6 +1572,8 @@ gboolean dt_masks_verify_harvest_section(const char *json_path, FILE *rf)
               rep.gpu_image_differing_pixels,
               rep.dev_diff_before, rep.dev_diff_after,
               rep.nopost_ran ? "true" : "false", rep.dev_diff_after_nopost,
+              rep.slang_ran ? "true" : "false", rep.slang_max_diff,
+              rep.slang_dev_diff_before, rep.slang_dev_diff_after,
               rep.skip_reason ? ", \"reason\": \"" : "",
               rep.skip_reason ? rep.skip_reason : "",
               rep.skip_reason ? "\"" : "");
@@ -1507,7 +1633,13 @@ gboolean dt_masks_verify_harvest_section(const char *json_path, FILE *rf)
     fprintf(rf, "    \"worst_dev_gap_classic\": %.9g,\n", st.worst_dev_before);
     fprintf(rf, "    \"worst_dev_gap_migrated\": %.9g,\n", st.worst_dev_after);
     fprintf(rf, "    \"dev_gap_widened\": %d,\n", st.dev_gap_widened);
-    fprintf(rf, "    \"dev_gap_widened_own\": %d\n", st.dev_gap_widened_own);
+    fprintf(rf, "    \"dev_gap_widened_own\": %d,\n", st.dev_gap_widened_own);
+    fprintf(rf, "    \"slang_compared\": %d,\n", st.slang_compared);
+    fprintf(rf, "    \"worst_slang_diff\": %.9g,\n", st.worst_slang_diff);
+    fprintf(rf, "    \"worst_slang_diff_index\": %d,\n", st.worst_slang_index);
+    fprintf(rf, "    \"worst_slang_gap_classic\": %.9g,\n", st.worst_slang_dev_before);
+    fprintf(rf, "    \"worst_slang_gap_migrated\": %.9g,\n", st.worst_slang_dev_after);
+    fprintf(rf, "    \"slang_gap_widened\": %d\n", st.slang_gap_widened);
     fputs("  }", rf);
   }
 
@@ -1568,6 +1700,21 @@ gboolean dt_masks_verify_harvest_section(const char *json_path, FILE *rf)
   }
   else
     printf("[verify] GPU: not replayed (no OpenCL device)\n");
+
+  if(st.slang_compared)
+  {
+    printf("[verify]\n");
+    printf("[verify] Slang blend, %d edits replayed on both paths:\n", st.slang_compared);
+    printf("[verify]   migration on Slang, worst difference : %.9g at edit %d\n",
+           st.worst_slang_diff, st.worst_slang_index);
+    printf("[verify]   CPU vs Slang gap, classic  : %.9g  (pre-existing baseline)\n",
+           st.worst_slang_dev_before);
+    printf("[verify]   CPU vs Slang gap, migrated : %.9g\n", st.worst_slang_dev_after);
+    printf("[verify]   edits where migration widened that gap by >1/255 : %d\n",
+           st.slang_gap_widened);
+  }
+  else if(_verify_slang)
+    printf("[verify] Slang: no edit replayed on both paths\n");
 
 #ifdef HAVE_OPENCL
   if(_verify_devid >= 0)

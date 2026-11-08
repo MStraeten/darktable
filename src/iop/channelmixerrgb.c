@@ -46,6 +46,7 @@
 #include "common/colorspaces_inline_conversions.h"
 #include "common/colorchecker.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/illuminants.h"
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
@@ -2552,6 +2553,59 @@ void cleanup_global(dt_iop_module_so_t *self)
 }
 #endif
 
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_channelmixer_rbg_data_t *const d = piece->data;
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_current_profile_info(self, piece->pipe);
+  if(piece->colors != 4 || !work_profile) return FALSE;
+
+  if(dt_pipe_is_preview(piece->pipe))
+    _declare_cat_on_pipe(self, FALSE);
+
+  dt_aligned_pixel_t illuminant;
+  _get_pipe_illuminant(self, piece->pipe, d, illuminant);
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const char *kernel;
+  switch(d->adaptation)
+  {
+    case DT_ADAPTATION_FULL_BRADFORD:
+      kernel = "channelmixerrgb_bradford_full";
+      break;
+    case DT_ADAPTATION_LINEAR_BRADFORD:
+      kernel = "channelmixerrgb_bradford_linear";
+      break;
+    case DT_ADAPTATION_CAT16:
+      kernel = "channelmixerrgb_CAT16";
+      break;
+    case DT_ADAPTATION_XYZ:
+      kernel = "channelmixerrgb_XYZ";
+      break;
+    case DT_ADAPTATION_RGB:
+    case DT_ADAPTATION_LAST:
+    default:
+      kernel = "channelmixerrgb_RGB";
+      break;
+  }
+
+  return !dt_slang_gpu_run_2d_args("channelmixer", kernel, width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLBUF(work_profile->matrix_in, 12 * sizeof(float)), SLBUF(work_profile->matrix_out, 12 * sizeof(float)),
+    SLBUF(d->MIX, 12 * sizeof(float)), SLARG(illuminant), SLARG(d->saturation),
+    SLARG(d->lightness), SLARG(d->grey), SLARG(d->p), SLARG(d->gamut), SLARG(d->clip),
+    SLARG(d->apply_grey), SLARG(d->version));
+}
+#endif
 
 static inline void _update_bounding_box(dt_iop_channelmixer_rgb_gui_data_t *g,
                                         const float x_increment,

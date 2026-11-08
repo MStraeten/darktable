@@ -19,6 +19,7 @@
 
 #include "bauhaus/bauhaus.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "control/control.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
@@ -241,6 +242,29 @@ int process_cl(dt_iop_module_t *self,
                                      CLARG(dev_in), CLARG(dev_out),
                                      CLARG(width), CLARG(height),
                                      CLARG(scale), CLARG(offset), CLARG(unbound));
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_colorcontrast_data_t *data = piece->data;
+
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  const float scale[4] = { 1.0f, data->a_steepness, data->b_steepness, 1.0f };
+  const float offset[4] = { 0.0f, data->a_offset, data->b_offset, 0.0f };
+  const int unbound = data->unbound;
+
+  return !dt_slang_gpu_run_2d_args("extended", "colorcontrast", width, height,
+                                   SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                   SLARG(scale), SLARG(offset), SLARG(unbound));
 }
 #endif
 

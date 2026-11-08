@@ -24,6 +24,7 @@
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
 #include "common/opencl.h"
+#include "common/slang_gpu.h"
 #include "common/utility.h"
 #include "control/conf.h"
 #include "control/control.h"
@@ -319,7 +320,7 @@ static float _lerp_lut(const float *const lut, const float v)
   return l1 * (1.0f - f) + l2 * f;
 }
 
-#ifdef HAVE_OPENCL
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
 // sample xform on a CLUT_LEVEL^3 grid over the Lab range LittleCMS encodes
 // floats in (L 0..100, a and b -128..127), the first channel varying fastest
 // as in the lut3d module. With gamut_marker, store 1 in all channels of a
@@ -462,6 +463,55 @@ error:
   dt_opencl_release_mem_object(dev_b);
   dt_opencl_release_mem_object(dev_coeffs);
   return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  dt_iop_colorout_data_t *d = piece->data;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+
+  // a Lab output profile is a plain copy
+  if(d->type == DT_COLORSPACE_LAB)
+  {
+    const int zero = 0;
+    return !dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
+      SLARG(zero), SLARG(zero));
+  }
+
+  // the LittleCMS path as a 3D LUT, as _process_cl_clut()
+  if(!dt_is_valid_colormatrix(d->cmatrix[0][0]))
+  {
+    const int gamutcheck = d->xform_nogamut != NULL;
+    if(!d->clut) d->clut = _bake_clut(gamutcheck ? d->xform_nogamut : d->xform, FALSE);
+    if(gamutcheck && !d->clut_gamut) d->clut_gamut = _bake_clut(d->xform, TRUE);
+    if(!d->clut || (gamutcheck && !d->clut_gamut)) return FALSE;
+
+    const int level = CLUT_LEVEL;
+    const size_t size = sizeof(float) * 3 * level * level * level;
+    // without gamut check the kernel never reads the marker LUT
+    return !dt_slang_gpu_run_2d_args("basic", "colorout_clut", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+      SLBUF(d->clut, size), SLARG(level), SLARG(gamutcheck),
+      SLBUF(gamutcheck ? d->clut_gamut : d->clut, size), SLARG(d->hdr_transfer));
+  }
+
+  float cmatrix[9];
+  pack_3xSSE_to_3x3(d->cmatrix, cmatrix);
+
+  return !dt_slang_gpu_run_2d_args("basic", "colorout", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLBUF(cmatrix, sizeof(cmatrix)), SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1),
+    SLIMG_IN(d->lut[2], 256, 256, 1), SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)),
+    SLARG(d->hdr_transfer));
 }
 #endif
 

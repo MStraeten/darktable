@@ -34,6 +34,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "iop/Permutohedral.h"
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+#endif
 #include <gtk/gtk.h>
 #include <inttypes.h>
 
@@ -497,6 +500,200 @@ int process_cl(dt_iop_module_t *self,
 
   for(int k = 0; k < 5; k++) sigma[k] = 1.0f / sigma[k];
   return _lattice_cl(gd, devid, dev_in, dev_out, width, height, roi_in->x, roi_in->y, sigma);
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+static int _slang_copy(dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const int width,
+                       const int height)
+{
+  const int zero = 0;
+  return dt_slang_gpu_run_2d_args("basic", "interpolation_copy", width, height,
+                                  SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+                                  SLARG(width), SLARG(height), SLARG(zero), SLARG(zero));
+}
+
+// the lattice on the device, see data/kernels/slang/permutohedral.slang.
+// sigma holds the inverted sigmas, as process() has them for the lattice.
+static int _slang_lattice(dt_slang_gpu_image_t *dev_in,
+                          dt_slang_gpu_image_t *dev_out,
+                          const int width,
+                          const int height,
+                          const int x0,
+                          const int y0,
+                          const float sigma[5])
+{
+  const size_t npixels = (size_t)width * height;
+  const size_t grid_points =
+    (height*sigma[0]) * (width*sigma[1]) * sigma[2] * sigma[3] * sigma[4];
+
+  // the scale factors of the PermutohedralLattice constructor, computed the
+  // same way so the vertices match the CPU's
+  float prm[12];
+  for(int i = 0; i < 5; i++)
+  {
+    prm[i] = sigma[i];
+    prm[5 + i] = 1.0f / (sqrtf((float)(i + 1) * (i + 2)));
+    prm[5 + i] *= (5 + 1) * sqrtf(2.0 / 3);
+  }
+  // the roi origin, for the image coordinates process() uses
+  prm[10] = x0;
+  prm[11] = y0;
+
+  // the CPU's estimate of the vertex count, which it uses to size its
+  // tables. A run that needs more entries starts again with the count it
+  // found.
+  size_t max_entries = PermutohedralLattice<5, 4>::estimatedHashEntries(grid_points, npixels);
+  const int row_width = 4096;
+  int err = 1;
+  for(int attempt = 0; attempt < 3; attempt++)
+  {
+    const size_t capacity = 2 * max_entries;
+    if(capacity > UINT32_MAX || max_entries == 0) return 1;
+    const uint32_t cap = capacity;
+    const uint32_t max_e = max_entries;
+
+    dt_slang_gpu_buffer_t *slots = dt_slang_gpu_buffer_new(2 * sizeof(uint32_t) * capacity, NULL);
+    dt_slang_gpu_buffer_t *keys = dt_slang_gpu_buffer_new_uninit(3 * sizeof(uint32_t) * max_entries);
+    dt_slang_gpu_buffer_t *counters = dt_slang_gpu_buffer_new(4 * sizeof(uint32_t), NULL);
+    dt_slang_gpu_buffer_t *params = dt_slang_gpu_buffer_new(sizeof(prm), prm);
+    dt_slang_gpu_buffer_t *values[2] = { NULL, NULL };
+    gboolean overflow = FALSE;
+    err = !slots || !keys || !counters || !params;
+
+    // more rounds only for vertices that lost their slot to another vertex
+    // with the same fingerprint
+    for(uint32_t round = 1; !err && round < 8; round++)
+    {
+      err = dt_slang_gpu_run_2d_args("permutohedral", "permutohedral_insert", width, height,
+                                     SLIMG_DEV(dev_in), SLBUF_DEV(slots), SLBUF_DEV(keys), SLBUF_DEV(counters),
+                                     SLBUF_DEV(params), SLARG(width), SLARG(height), SLARG(cap), SLARG(max_e),
+                                     SLARG(round));
+      uint32_t cnt[4] = { 0 };
+      if(!err) err = dt_slang_gpu_buffer_read(counters, cnt, sizeof(cnt));
+      if(err) break;
+      if(cnt[1])
+      {
+        // too many vertices for the estimate: size the next attempt by the count
+        overflow = TRUE;
+        max_entries = (size_t)cnt[0] + cnt[0] / 8 + 1024;
+        break;
+      }
+      const uint32_t entries = cnt[0];
+
+      for(int k = 0; k < 2; k++)
+      {
+        dt_slang_gpu_buffer_free(values[k]);
+        values[k] = k == 0 ? dt_slang_gpu_buffer_new(4 * sizeof(float) * entries, NULL)
+                           : dt_slang_gpu_buffer_new_uninit(4 * sizeof(float) * entries);
+      }
+      if(!values[0] || !values[1])
+      {
+        err = 1;
+        break;
+      }
+
+      err = dt_slang_gpu_run_2d_args("permutohedral", "permutohedral_splat", width, height,
+                                     SLIMG_DEV(dev_in), SLBUF_DEV(slots), SLBUF_DEV(keys), SLBUF_DEV(counters),
+                                     SLBUF_DEV(values[0]), SLBUF_DEV(params), SLARG(width), SLARG(height),
+                                     SLARG(cap), SLARG(entries));
+
+      const int rows = (entries + row_width - 1) / row_width;
+      int src = 0;
+      for(int j = 0; !err && j <= 5; j++)
+      {
+        err = dt_slang_gpu_run_2d_args("permutohedral", "permutohedral_blur", row_width, rows,
+                                       SLBUF_DEV(slots), SLBUF_DEV(keys), SLBUF_DEV(values[src]),
+                                       SLBUF_DEV(values[1 - src]), SLARG(cap), SLARG(entries),
+                                       SLARG(row_width), SLARG(j));
+        src = 1 - src;
+      }
+
+      if(!err)
+        err = dt_slang_gpu_run_2d_args("permutohedral", "permutohedral_slice", width, height,
+                                       SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLBUF_DEV(slots), SLBUF_DEV(keys),
+                                       SLBUF_DEV(values[src]), SLBUF_DEV(params), SLARG(width), SLARG(height),
+                                       SLARG(cap), SLARG(entries));
+
+      if(!err) err = dt_slang_gpu_buffer_read(counters, cnt, sizeof(cnt));
+      if(err || cnt[2] == 0) break;
+
+      dt_print(DT_DEBUG_SLANG, "[bilateral] %u vertices lost their slot, inserting again", cnt[2]);
+      // the next round starts with no missing vertices
+      dt_slang_gpu_buffer_free(counters);
+      cnt[2] = 0;
+      counters = dt_slang_gpu_buffer_new(sizeof(cnt), cnt);
+      err = !counters;
+      if(round == 7) err = 1;
+    }
+
+    dt_slang_gpu_buffer_free(values[0]);
+    dt_slang_gpu_buffer_free(values[1]);
+    dt_slang_gpu_buffer_free(params);
+    dt_slang_gpu_buffer_free(counters);
+    dt_slang_gpu_buffer_free(keys);
+    dt_slang_gpu_buffer_free(slots);
+    if(!overflow) break;
+    dt_print(DT_DEBUG_SLANG, "[bilateral] lattice outgrew its estimate, retrying with %zu entries",
+             max_entries);
+    err = 1;
+  }
+  return err;
+}
+
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  if(piece->colors != 4) return FALSE;
+  if(roi_in->width != roi_out->width || roi_in->height != roi_out->height) return FALSE;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+  if((size_t)width * height > INT_MAX) return FALSE;
+
+  dt_iop_bilateral_data_t *data = (dt_iop_bilateral_data_t *)piece->data;
+  float sigma[5];
+  _compute_sigmas(sigma, data, roi_in->scale, piece->iscale);
+  if(fmaxf(sigma[0], sigma[1]) < 0.1f)
+    return !_slang_copy(dev_in, dev_out, width, height);
+
+  // the branches of process()
+  const int prad = (int)(3.0f * fmaxf(sigma[0], sigma[1]) + 1.0f);
+  const int rad = MIN(prad, MIN(roi_out->width, roi_out->height) - 2 * prad);
+  const gboolean thumb = dt_pipe_is_thumb(piece->pipe);
+  if(rad < 1 || (rad <= MAX_DIRECT_STAMP_RADIUS && thumb))
+    return !_slang_copy(dev_in, dev_out, width, height);
+
+  if(rad <= MAX_DIRECT_STAMP_RADIUS)
+  {
+    const int wd = 2 * rad + 1;
+    float mat[(2 * MAX_DIRECT_STAMP_RADIUS + 1) * (2 * MAX_DIRECT_STAMP_RADIUS + 1)];
+    float *m = mat + rad * wd + rad;
+    float weight = 0.0f;
+    for(int l = -rad; l <= rad; l++)
+      for(int k = -rad; k <= rad; k++)
+        weight += m[l * wd + k] = expf(-(l * l + k * k) / (2.f * sigma[0] * sigma[0]));
+    for(int l = -rad; l <= rad; l++)
+      for(int k = -rad; k <= rad; k++)
+        m[l * wd + k] /= weight;
+    const dt_aligned_pixel_t isig2col = { 1.0f / (2.0f * sigma[2] * sigma[2]),
+                                          1.0f / (2.0f * sigma[3] * sigma[3]),
+                                          1.0f / (2.0f * sigma[4] * sigma[4]),
+                                          0.0f };
+    return !dt_slang_gpu_run_2d_args("permutohedral", "bilateral_direct", width, height,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out),
+                                     SLBUF(mat, sizeof(float) * wd * wd), SLARG(width), SLARG(height),
+                                     SLARG(rad), SLARG(isig2col));
+  }
+
+  for(int k = 0; k < 5; k++) sigma[k] = 1.0f / sigma[k];
+  return !_slang_lattice(dev_in, dev_out, width, height, roi_in->x, roi_in->y, sigma);
 }
 #endif
 
