@@ -50,7 +50,7 @@ float _gamma_out(float x)
 {
   if(x < 0.0f) return 0.0f;
   if(x * 65535.0f > 65534.99f) return 1.0f;
-  return x <= 0.031746f ? x / 17.0f : pow((x + 0.044445f) / 1.044445f, 2.4f);
+  return x <= 0.031746f ? fp32_div(x, 17.0f) : pow(fp32_div(x + 0.044445f, 1.044445f), 2.4f);
 }
 
 float _median3(float x0, float x1, float x2)
@@ -186,13 +186,13 @@ void _estimate(Buf diff, Buf lp, int i, int d, out float x, out float var)
     p[k] = lp[i + (k - 4) * d];
     mu += p[k];
   }
-  mu /= 9.0f;
+  mu = fp32_div(mu, 9.0f);
   float vx = 1e-7f;
   for(int k = 0; k < 9; k++) vx += fsquare(p[k] - mu);
   float vn = 1e-7f;
   for(int k = 0; k < 9; k++) vn += fsquare(p[k] - diff[i + (k - 4) * d]);
-  x = (diff[i] * vx + lp[i] * vn) / (vx + vn);
-  var = vx * vn / (vx + vn);
+  x = fp32_div(diff[i] * vx + lp[i] * vn, vx + vn);
+  var = fp32_div(vx * vn, vx + vn);
 }
 
 // interpolated G-R(B) at R(B)
@@ -214,7 +214,7 @@ void lmmse_interp(uint3 gid : SV_DispatchThreadID,
   float xh, vh, xv, vv;
   _estimate(hdiff, hlp, i, 1, xh, vh);
   _estimate(vdiff, vlp, i, pw, xv, vv);
-  interp[i] = (xh * vv + xv * vh) / (vh + vv);
+  interp[i] = fp32_div(xh * vv + xv * vh, vh + vv);
 }
 
 // the CFA values into their planes, and green at R/B. The planes take the
@@ -369,13 +369,13 @@ void lmmse_fill(uint3 gid : SV_DispatchThreadID,
 float _refine(Buf p, Buf a, Buf b, Buf green, int i, int w1)
 {
   const int w2 = 2 * w1;
-  const float dL = 1.0f / (1.0f + abs(a[i - 2] - a[i]) + abs(b[i + 1] - b[i - 1]));
-  const float dR = 1.0f / (1.0f + abs(a[i + 2] - a[i]) + abs(b[i + 1] - b[i - 1]));
-  const float dU = 1.0f / (1.0f + abs(a[i - w2] - a[i]) + abs(b[i + w1] - b[i - w1]));
-  const float dD = 1.0f / (1.0f + abs(a[i + w2] - a[i]) + abs(b[i + w1] - b[i - w1]));
-  return ((green[i - 1] - p[i - 1]) * dL + (green[i + 1] - p[i + 1]) * dR
-          + (green[i - w1] - p[i - w1]) * dU + (green[i + w1] - p[i + w1]) * dD)
-         / (dL + dR + dU + dD);
+  const float dL = fp32_div(1.0f, 1.0f + abs(a[i - 2] - a[i]) + abs(b[i + 1] - b[i - 1]));
+  const float dR = fp32_div(1.0f, 1.0f + abs(a[i + 2] - a[i]) + abs(b[i + 1] - b[i - 1]));
+  const float dU = fp32_div(1.0f, 1.0f + abs(a[i - w2] - a[i]) + abs(b[i + w1] - b[i - w1]));
+  const float dD = fp32_div(1.0f, 1.0f + abs(a[i + w2] - a[i]) + abs(b[i + w1] - b[i - w1]));
+  return fp32_div((green[i - 1] - p[i - 1]) * dL + (green[i + 1] - p[i + 1]) * dR
+                  + (green[i - w1] - p[i - w1]) * dU + (green[i + w1] - p[i + w1]) * dD,
+                  dL + dR + dU + dD);
 }
 
 // green at R/B

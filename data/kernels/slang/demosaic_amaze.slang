@@ -118,7 +118,13 @@ void amaze_init(uint3 gid : SV_DispatchThreadID,
   const int col = gid.x;
   const int row = gid.y;
   if(col >= pw || row >= ph) return;
-  cfa[row * pw + col] = in.Areadsingle(_mirror(col - 16, width), _mirror(row - 16, height));
+  const int x = col - 16, y = row - 16;
+  const bool xout = x < 0 || x >= width, yout = y < 0 || y >= height;
+  // the CPU fills the top left, top right and bottom left corners of the
+  // border from 16 pixels further in than the edges (amaze.cc:349)
+  const int sx = x < 0 && yout ? 16 - x : _mirror(x, width);
+  const int sy = y < 0 && xout ? 16 - y : _mirror(y, height);
+  cfa[row * pw + col] = in.Areadsingle(sx, sy);
 }
 
 [shader("compute")]
@@ -152,10 +158,10 @@ void amaze_cd(uint3 gid : SV_DispatchThreadID,
   const float d1m2 = _dirwts1(cfa, i - 2), d1 = _dirwts1(cfa, i), d1p2 = _dirwts1(cfa, i + 2);
 
   // color ratios in each cardinal direction
-  const float cru = cfa[i - v1] * (d0m2 + d0) / (d0m2 * (eps + c0) + d0 * (eps + cfa[i - v2]));
-  const float crd = cfa[i + v1] * (d0p2 + d0) / (d0p2 * (eps + c0) + d0 * (eps + cfa[i + v2]));
-  const float crl = cfa[i - 1] * (d1m2 + d1) / (d1m2 * (eps + c0) + d1 * (eps + cfa[i - 2]));
-  const float crr = cfa[i + 1] * (d1p2 + d1) / (d1p2 * (eps + c0) + d1 * (eps + cfa[i + 2]));
+  const float cru = fp32_div(cfa[i - v1] * (d0m2 + d0), d0m2 * (eps + c0) + d0 * (eps + cfa[i - v2]));
+  const float crd = fp32_div(cfa[i + v1] * (d0p2 + d0), d0p2 * (eps + c0) + d0 * (eps + cfa[i + v2]));
+  const float crl = fp32_div(cfa[i - 1] * (d1m2 + d1), d1m2 * (eps + c0) + d1 * (eps + cfa[i - 2]));
+  const float crr = fp32_div(cfa[i + 1] * (d1p2 + d1), d1p2 * (eps + c0) + d1 * (eps + cfa[i + 2]));
 
   // G interpolated in vert/hor directions using Hamilton-Adams method
   const float guha = cfa[i - v1] + 0.5f * (c0 - cfa[i - v2]);
@@ -170,8 +176,8 @@ void amaze_cd(uint3 gid : SV_DispatchThreadID,
   float grar = abs(1.0f - crr) < arthresh ? c0 * crr : grha;
 
   // adaptive weights for vertical/horizontal directions
-  const float hwt = _dirwts1(cfa, i - 1) / (_dirwts1(cfa, i - 1) + _dirwts1(cfa, i + 1));
-  const float vwt = _dirwts0(cfa, i - v1, v1) / (_dirwts0(cfa, i + v1, v1) + _dirwts0(cfa, i - v1, v1));
+  const float hwt = fp32_div(_dirwts1(cfa, i - 1), _dirwts1(cfa, i - 1) + _dirwts1(cfa, i + 1));
+  const float vwt = fp32_div(_dirwts0(cfa, i - v1, v1), _dirwts0(cfa, i + v1, v1) + _dirwts0(cfa, i - v1, v1));
 
   // interpolated G via adaptive weights of cardinal evaluations
   const float Gintvha = vwt * gdha + (1.0f - vwt) * guha;
@@ -252,7 +258,7 @@ float _cdbound(float d, float c0, float n1, float n2, bool gsite, float clip_pt)
         d = -_ulim(Gint, n1, n2) + c0;
       else
       {
-        const float wt = 1.0f - 3.0f * d / (eps + Gint + c0);
+        const float wt = 1.0f - fp32_div(3.0f * d, eps + Gint + c0);
         d = wt * d + (1.0f - wt) * (-_ulim(Gint, n1, n2) + c0);
       }
     }
@@ -267,7 +273,7 @@ float _cdbound(float d, float c0, float n1, float n2, bool gsite, float clip_pt)
         d = _ulim(Gint, n1, n2) - c0;
       else
       {
-        const float wt = 1.0f + 3.0f * d / (eps + Gint + c0);
+        const float wt = 1.0f + fp32_div(3.0f * d, eps + Gint + c0);
         d = wt * d + (1.0f - wt) * (_ulim(Gint, n1, n2) - c0);
       }
     }
@@ -415,8 +421,8 @@ void amaze_hvwt(uint3 gid : SV_DispatchThreadID,
   float Dgrbhvarr = fsquare(hcd[i] - rave) + fsquare(hcd[i + 1] - rave) + fsquare(hcd[i + 2] - rave)
                     + fsquare(hcd[i + 3] - rave);
 
-  const float hwt = _dirwts1(cfa, i - 1) / (_dirwts1(cfa, i - 1) + _dirwts1(cfa, i + 1));
-  const float vwt = _dirwts0(cfa, i - v1, v1) / (_dirwts0(cfa, i + v1, v1) + _dirwts0(cfa, i - v1, v1));
+  const float hwt = fp32_div(_dirwts1(cfa, i - 1), _dirwts1(cfa, i - 1) + _dirwts1(cfa, i + 1));
+  const float vwt = fp32_div(_dirwts0(cfa, i - v1, v1), _dirwts0(cfa, i + v1, v1) + _dirwts0(cfa, i - v1, v1));
 
   const float vcdvar = epssq + vwt * Dgrbvvard + (1.0f - vwt) * Dgrbvvaru;
   const float hcdvar = epssq + hwt * Dgrbhvarr + (1.0f - hwt) * Dgrbhvarl;
@@ -431,8 +437,8 @@ void amaze_hvwt(uint3 gid : SV_DispatchThreadID,
   const float hcdvar1 = epssq + hwt * Dgrbhvarr + (1.0f - hwt) * Dgrbhvarl;
 
   // adaptive weights for G interpolation
-  const float varwt = hcdvar / (vcdvar + hcdvar);
-  const float diffwt = hcdvar1 / (vcdvar1 + hcdvar1);
+  const float varwt = fp32_div(hcdvar, vcdvar + hcdvar);
+  const float diffwt = fp32_div(hcdvar1, vcdvar1 + hcdvar1);
 
   // if both agree on the direction, choose the one with the strongest
   // discrimination, otherwise the u/d and l/r difference fluctuation weights
@@ -516,7 +522,7 @@ void amaze_area(uint3 gid : SV_DispatchThreadID,
   areawt = 0.5f * areawt;
   const float hcdvar = epssq + abs(areawt * sumsqh - sumh * sumh);
   const float vcdvar = epssq + abs(areawt * sumsqv - sumv * sumv);
-  hvwt[i] = hcdvar / (vcdvar + hcdvar);
+  hvwt[i] = fp32_div(hcdvar, vcdvar + hcdvar);
 }
 
 // populate G at R/B sites
@@ -573,7 +579,7 @@ void amaze_nyquist_refine(uint3 gid : SV_DispatchThreadID,
   const float gvarh = _gvar(dgrb2h, i, pw);
   const float gvarv = _gvar(dgrb2v, i, pw);
   // use the results as weights for refined G interpolation
-  const float d = (hcd[i] * gvarv + vcd[i] * gvarh) / (gvarv + gvarh);
+  const float d = fp32_div((hcd[i] * gvarv + vcd[i] * gvarh), gvarv + gvarh);
   dgrb[i] = d;
   green[i] = cfa[i] + d;
 }
@@ -610,10 +616,10 @@ void amaze_diag(uint3 gid : SV_DispatchThreadID,
   const float c0 = cfa[i];
 
   // diagonal color ratios
-  const float crse = 2.0f * cfa[i + m1] / (eps + c0 + cfa[i + m2]);
-  const float crnw = 2.0f * cfa[i - m1] / (eps + c0 + cfa[i - m2]);
-  const float crne = 2.0f * cfa[i + p1] / (eps + c0 + cfa[i + p2]);
-  const float crsw = 2.0f * cfa[i - p1] / (eps + c0 + cfa[i - p2]);
+  const float crse = fp32_div(2.0f * cfa[i + m1], eps + c0 + cfa[i + m2]);
+  const float crnw = fp32_div(2.0f * cfa[i - m1], eps + c0 + cfa[i - m2]);
+  const float crne = fp32_div(2.0f * cfa[i + p1], eps + c0 + cfa[i + p2]);
+  const float crsw = fp32_div(2.0f * cfa[i - p1], eps + c0 + cfa[i - p2]);
 
   // assign B/R at R/B sites
   const float rbse = _rbdiag(c0, crse, cfa[i + m1], cfa[i + m2]);
@@ -627,12 +633,12 @@ void amaze_diag(uint3 gid : SV_DispatchThreadID,
   const float wtne = eps + dp + _delp(cfa, i + p1, ts) + _delp(cfa, i + p2, ts);
   const float wtsw = eps + dp + _delp(cfa, i - p1, ts) + _delp(cfa, i - p2, ts);
 
-  float m = (wtse * rbnw + wtnw * rbse) / (wtse + wtnw);
-  float p = (wtne * rbsw + wtsw * rbne) / (wtne + wtsw);
+  float m = fp32_div((wtse * rbnw + wtnw * rbse), wtse + wtnw);
+  float p = fp32_div((wtne * rbsw + wtsw * rbne), wtne + wtsw);
 
   // variance of R-B in plus/minus directions
   const float rbvarm = _rbvar(cfa, i, ts, false);
-  pmwt[i] = rbvarm / (_rbvar(cfa, i, ts, true) + rbvarm);
+  pmwt[i] = fp32_div(rbvarm, _rbvar(cfa, i, ts, true) + rbvarm);
 
   // bound the interpolation in regions of high saturation
   if(p < c0)
@@ -641,7 +647,7 @@ void amaze_diag(uint3 gid : SV_DispatchThreadID,
       p = _ulim(p, cfa[i - p1], cfa[i + p1]);
     else
     {
-      const float pwt = 2.0f * (c0 - p) / (eps + p + c0);
+      const float pwt = fp32_div(2.0f * (c0 - p), eps + p + c0);
       p = pwt * p + (1.0f - pwt) * _ulim(p, cfa[i - p1], cfa[i + p1]);
     }
   }
@@ -651,7 +657,7 @@ void amaze_diag(uint3 gid : SV_DispatchThreadID,
       m = _ulim(m, cfa[i - m1], cfa[i + m1]);
     else
     {
-      const float mwt = 2.0f * (c0 - m) / (eps + m + c0);
+      const float mwt = fp32_div(2.0f * (c0 - m), eps + m + c0);
       m = mwt * m + (1.0f - mwt) * _ulim(m, cfa[i - m1], cfa[i + m1]);
     }
   }
@@ -704,10 +710,10 @@ void amaze_green_diag(uint3 gid : SV_DispatchThreadID,
   const float rbu = rbint[i - 2 * v1], rbd = rbint[i + 2 * v1], rbl = rbint[i - 2], rbr = rbint[i + 2];
 
   // color ratios for G interpolation
-  const float cru = cfa[i - v1] * 2.0f / (eps + rb0 + rbu);
-  const float crd = cfa[i + v1] * 2.0f / (eps + rb0 + rbd);
-  const float crl = cfa[i - 1] * 2.0f / (eps + rb0 + rbl);
-  const float crr = cfa[i + 1] * 2.0f / (eps + rb0 + rbr);
+  const float cru = fp32_div(cfa[i - v1] * 2.0f, eps + rb0 + rbu);
+  const float crd = fp32_div(cfa[i + v1] * 2.0f, eps + rb0 + rbd);
+  const float crl = fp32_div(cfa[i - 1] * 2.0f, eps + rb0 + rbl);
+  const float crr = fp32_div(cfa[i + 1] * 2.0f, eps + rb0 + rbr);
 
   // interpolated G via adaptive ratios or Hamilton-Adams in each cardinal direction
   const float gu = _gdir(rb0, cru, cfa[i - v1], rbu);
@@ -718,8 +724,8 @@ void amaze_green_diag(uint3 gid : SV_DispatchThreadID,
   // interpolated G via adaptive weights of cardinal evaluations
   const float d0u = _dirwts0(cfa, i - v1, v1), d0d = _dirwts0(cfa, i + v1, v1);
   const float d1l = _dirwts1(cfa, i - 1), d1r = _dirwts1(cfa, i + 1);
-  float Gintv = (d0u * gd + d0d * gu) / (d0d + d0u);
-  float Ginth = (d1l * gr + d1r * gl) / (d1l + d1r);
+  float Gintv = fp32_div((d0u * gd + d0d * gu), d0d + d0u);
+  float Ginth = fp32_div((d1l * gr + d1r * gl), d1l + d1r);
 
   // bound the interpolation in regions of high saturation
   if(Gintv < rb0)
@@ -728,7 +734,7 @@ void amaze_green_diag(uint3 gid : SV_DispatchThreadID,
       Gintv = _ulim(Gintv, cfa[i - v1], cfa[i + v1]);
     else
     {
-      const float vwt = 2.0f * (rb0 - Gintv) / (eps + Gintv + rb0);
+      const float vwt = fp32_div(2.0f * (rb0 - Gintv), eps + Gintv + rb0);
       Gintv = vwt * Gintv + (1.0f - vwt) * _ulim(Gintv, cfa[i - v1], cfa[i + v1]);
     }
   }
@@ -738,7 +744,7 @@ void amaze_green_diag(uint3 gid : SV_DispatchThreadID,
       Ginth = _ulim(Ginth, cfa[i - 1], cfa[i + 1]);
     else
     {
-      const float hwt = 2.0f * (rb0 - Ginth) / (eps + Ginth + rb0);
+      const float hwt = fp32_div(2.0f * (rb0 - Ginth), eps + Ginth + rb0);
       Ginth = hwt * Ginth + (1.0f - hwt) * _ulim(Ginth, cfa[i - 1], cfa[i + 1]);
     }
   }
@@ -753,16 +759,16 @@ void amaze_green_diag(uint3 gid : SV_DispatchThreadID,
 float _chroma(Buf d, int i, int ts)
 {
   const int v2 = 2 * ts, p1 = -ts + 1, p3 = -3 * ts + 3, m1 = ts + 1, m3 = 3 * ts + 3;
-  const float wtnw = 1.0f / (eps + abs(d[i - m1] - d[i + m1]) + abs(d[i - m1] - d[i - m3]) + abs(d[i + m1] - d[i - m3]));
-  const float wtne = 1.0f / (eps + abs(d[i + p1] - d[i - p1]) + abs(d[i + p1] - d[i + p3]) + abs(d[i - p1] - d[i + p3]));
-  const float wtsw = 1.0f / (eps + abs(d[i - p1] - d[i + p1]) + abs(d[i - p1] - d[i + m3]) + abs(d[i + p1] - d[i - p3]));
-  const float wtse = 1.0f / (eps + abs(d[i + m1] - d[i - m1]) + abs(d[i + m1] - d[i - p3]) + abs(d[i - m1] - d[i + m3]));
+  const float wtnw = fp32_div(1.0f, eps + abs(d[i - m1] - d[i + m1]) + abs(d[i - m1] - d[i - m3]) + abs(d[i + m1] - d[i - m3]));
+  const float wtne = fp32_div(1.0f, eps + abs(d[i + p1] - d[i - p1]) + abs(d[i + p1] - d[i + p3]) + abs(d[i - p1] - d[i + p3]));
+  const float wtsw = fp32_div(1.0f, eps + abs(d[i - p1] - d[i + p1]) + abs(d[i - p1] - d[i + m3]) + abs(d[i + p1] - d[i - p3]));
+  const float wtse = fp32_div(1.0f, eps + abs(d[i + m1] - d[i - m1]) + abs(d[i + m1] - d[i - p3]) + abs(d[i - m1] - d[i + m3]));
 
-  return (wtnw * (1.325f * d[i - m1] - 0.175f * d[i - m3] - 0.075f * d[i - m1 - 2] - 0.075f * d[i - m1 - v2])
-          + wtne * (1.325f * d[i + p1] - 0.175f * d[i + p3] - 0.075f * d[i + p1 + 2] - 0.075f * d[i + p1 + v2])
-          + wtsw * (1.325f * d[i - p1] - 0.175f * d[i - p3] - 0.075f * d[i - p1 - 2] - 0.075f * d[i - p1 - v2])
-          + wtse * (1.325f * d[i + m1] - 0.175f * d[i + m3] - 0.075f * d[i + m1 + 2] - 0.075f * d[i + m1 + v2]))
-         / (wtnw + wtne + wtsw + wtse);
+  return fp32_div(wtnw * (1.325f * d[i - m1] - 0.175f * d[i - m3] - 0.075f * d[i - m1 - 2] - 0.075f * d[i - m1 - v2])
+                  + wtne * (1.325f * d[i + p1] - 0.175f * d[i + p3] - 0.075f * d[i + p1 + 2] - 0.075f * d[i + p1 + v2])
+                  + wtsw * (1.325f * d[i - p1] - 0.175f * d[i - p3] - 0.075f * d[i - p1 - 2] - 0.075f * d[i - p1 - v2])
+                  + wtse * (1.325f * d[i + m1] - 0.175f * d[i + m3] - 0.075f * d[i + m1 + 2] - 0.075f * d[i + m1 + v2]),
+                  wtnw + wtne + wtsw + wtse);
 }
 
 // fancy chrominance interpolation: G-R and G-B at every R/B site, the own
@@ -810,7 +816,7 @@ void amaze_output(uint3 gid : SV_DispatchThreadID,
   { // G site: the color differences of the four R/B neighbors
     g = cfa[i];
     const float wu = hvwt[i - v1], wd = hvwt[i + v1], wl = 1.0f - hvwt[i - 1], wr = 1.0f - hvwt[i + 1];
-    const float temp = 1.0f / (wu + wr + wl + wd);
+    const float temp = fp32_div(1.0f, wu + wr + wl + wd);
     r = g - (wu * dgr[i - v1] + wr * dgr[i + 1] + wl * dgr[i - 1] + wd * dgr[i + v1]) * temp;
     b = g - (wu * dgb[i - v1] + wr * dgb[i + 1] + wl * dgb[i - 1] + wd * dgb[i + v1]) * temp;
   }
