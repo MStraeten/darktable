@@ -19,11 +19,11 @@
 #ifdef HAVE_SLANG_GPU
 
 // amaze_demosaic() on the Slang device, see data/kernels/slang/demosaic_amaze.slang.
-// The buffers cover the image plus the 16 pixel border of the CPU tiles.
-// Twelve of them are live at the peak; later passes reuse the ones whose
-// contents are no longer read, as the CPU code does with its tile buffers.
-// The passes that update in place on the CPU run one 16x16 work group per
-// CPU tile of 160 pixels, 128 apart.
+// Every CPU tile of 160 pixels, 128 apart, has its own 160x160 part of the
+// buffers. Twelve of them are live at the peak; later passes reuse the ones
+// whose contents are no longer read, as the CPU code does with its tile
+// buffers. The passes that update in place on the CPU run one 16x16 work
+// group per tile.
 static gboolean process_amaze_slang(dt_dev_pixelpipe_iop_t *piece,
                                     dt_slang_gpu_image_t *dev_in,
                                     dt_slang_gpu_image_t *dev_out,
@@ -33,11 +33,14 @@ static gboolean process_amaze_slang(dt_dev_pixelpipe_iop_t *piece,
 {
   const int pw = width + 32;
   const int ph = height + 32;
-  const size_t bsize = sizeof(float) * pw * ph;
+  const int ntx = (pw - 16 + 127) / 128;
+  const int nty = (ph - 16 + 127) / 128;
+  const int gw = 160 * ntx, gh = 160 * nty;
+  const size_t bsize = sizeof(float) * gw * gh;
   const float clip_pt = dt_iop_get_processed_minimum(piece);
   const float clip_pt8 = 0.8f * clip_pt;
-  const int tw = 16 * ((pw - 16 + 127) / 128);
-  const int th = 16 * ((ph - 16 + 127) / 128);
+  const int tw = 16 * ntx;
+  const int th = 16 * nty;
   const int m8 = 8, m10 = 10;
 
   enum { NBUF = 12 };
@@ -70,12 +73,12 @@ static gboolean process_amaze_slang(dt_dev_pixelpipe_iop_t *piece,
   dt_slang_gpu_buffer_t *dgr = b[6], *dgb = b[7];
 
   ok = ok
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_init", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_init", gw, gh,
                                  SLIMG_DEV(dev_in), SLBUF_DEV(cfa),
                                  SLARG(width), SLARG(height), SLARG(pw), SLARG(ph))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_grad", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_grad", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(delhvsqsum), SLARG(pw), SLARG(ph))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_cd", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_cd", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(vcd), SLBUF_DEV(hcd), SLBUF_DEV(vcdalt),
                                  SLBUF_DEV(hcdalt), SLBUF_DEV(dgintv), SLBUF_DEV(dginth),
                                  SLARG(pw), SLARG(ph), SLARG(filters), SLARG(clip_pt8))
@@ -83,40 +86,40 @@ static gboolean process_amaze_slang(dt_dev_pixelpipe_iop_t *piece,
                                  SLBUF_DEV(cfa), SLBUF_DEV(vcd), SLBUF_DEV(hcd), SLBUF_DEV(vcdalt),
                                  SLBUF_DEV(hcdalt), SLBUF_DEV(vcd2), SLBUF_DEV(hcd2),
                                  SLARG(pw), SLARG(ph), SLARG(filters), SLARG(clip_pt))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_hvwt", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_hvwt", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(vcd2), SLBUF_DEV(hcd2), SLBUF_DEV(dgintv),
                                  SLBUF_DEV(dginth), SLBUF_DEV(delhvsqsum),
                                  SLBUF_DEV(hvwt), SLBUF_DEV(nyquist),
                                  SLARG(pw), SLARG(ph), SLARG(filters))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_nyquist2", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_nyquist2", gw, gh,
                                  SLBUF_DEV(nyquist), SLBUF_DEV(nyquist2), SLARG(pw), SLARG(ph), SLARG(filters))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_area", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_area", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(nyquist2), SLBUF_DEV(hvwt),
                                  SLARG(pw), SLARG(ph), SLARG(filters))
     && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_vote", tw, th,
                                  SLBUF_DEV(hvwt), SLBUF_DEV(hvwt2), SLARG(pw), SLARG(ph), SLARG(filters), SLARG(m8))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_green", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_green", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(vcd2), SLBUF_DEV(hcd2), SLBUF_DEV(hvwt2),
                                  SLBUF_DEV(nyquist2), SLBUF_DEV(dgrb), SLBUF_DEV(green),
                                  SLBUF_DEV(dgrb2h), SLBUF_DEV(dgrb2v),
                                  SLARG(pw), SLARG(ph), SLARG(filters))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_nyquist_refine", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_nyquist_refine", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(vcd2), SLBUF_DEV(hcd2), SLBUF_DEV(nyquist2),
                                  SLBUF_DEV(dgrb2h), SLBUF_DEV(dgrb2v), SLBUF_DEV(dgrb), SLBUF_DEV(green),
                                  SLARG(pw), SLARG(ph), SLARG(filters))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_diag", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_diag", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(rbm), SLBUF_DEV(rbp), SLBUF_DEV(pmwt),
                                  SLARG(pw), SLARG(ph), SLARG(filters), SLARG(clip_pt))
     && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_vote", tw, th,
                                  SLBUF_DEV(pmwt), SLBUF_DEV(pmwt2), SLARG(pw), SLARG(ph), SLARG(filters), SLARG(m10))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_rbint", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_rbint", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(rbm), SLBUF_DEV(rbp), SLBUF_DEV(pmwt2),
                                  SLBUF_DEV(rbint), SLARG(pw), SLARG(ph), SLARG(filters))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_green_diag", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_green_diag", gw, gh,
                                  SLBUF_DEV(cfa), SLBUF_DEV(hvwt2), SLBUF_DEV(pmwt2), SLBUF_DEV(rbint),
                                  SLBUF_DEV(dgrb), SLBUF_DEV(green),
                                  SLARG(pw), SLARG(ph), SLARG(filters), SLARG(clip_pt))
-    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_chroma", pw, ph,
+    && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_chroma", gw, gh,
                                  SLBUF_DEV(dgrb), SLBUF_DEV(dgr), SLBUF_DEV(dgb),
                                  SLARG(pw), SLARG(ph), SLARG(filters))
     && !dt_slang_gpu_run_2d_args("demosaic_amaze", "amaze_output", width, height,
