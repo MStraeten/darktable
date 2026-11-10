@@ -325,7 +325,12 @@ static id<MTLLibrary> _load_library(NSString *path, NSError **error)
   MTLCompileOptions *options = [MTLCompileOptions new];
 #if defined(MAC_OS_VERSION_15_0)
   if(@available(macOS 15.0, *))
+  {
+    // these default to fast functions, which fastMathEnabled = NO and
+    // metal -fno-fast-math do not use
     options.mathMode = MTLMathModeSafe;
+    options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+  }
   else
 #endif
   {

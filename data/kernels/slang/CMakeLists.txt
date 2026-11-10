@@ -31,6 +31,9 @@ set(DT_SLANG_SPIRV_FLAGS -preserve-params)
 # DT_SLANG_METALLIB comes from the probe for Apple's metal compiler in the top CMakeLists.txt
 
 set(DT_SLANG_OUTPUTS "")
+if(APPLE)
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/entries")
+endif()
 set(DT_SLANG_INSTALL "")
 
 foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
@@ -53,7 +56,9 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
     # 0 again. The libraries can't be linked into one, since every one of
     # them defines Slang's helper functions. The entry points come from the
     # Metal source, since some are declared through macros.
-    set(METAL_ALL "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.entries.metal")
+    # kept out of the kernel directory, where the Metal backend would take
+    # it for a kernel
+    set(METAL_ALL "${CMAKE_CURRENT_BINARY_DIR}/entries/${KERNAME}.metal")
     execute_process(COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -target metal ${DT_SLANG_FLAGS} -o ${METAL_ALL}
                     RESULT_VARIABLE SLANGC_RESULT OUTPUT_QUIET ERROR_QUIET)
     if(NOT SLANGC_RESULT EQUAL 0)
