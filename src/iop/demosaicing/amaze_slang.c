@@ -20,10 +20,12 @@
 
 // amaze_demosaic() on the Slang device, see data/kernels/slang/demosaic_amaze.slang.
 // Every CPU tile of 160 pixels, 128 apart, has its own 160x160 part of the
-// buffers. Twelve of them are live at the peak; later passes reuse the ones
-// whose contents are no longer read, as the CPU code does with its tile
-// buffers. The passes that update in place on the CPU run one 16x16 work
-// group per tile.
+// buffers. The passes write zeros where they compute nothing, because later
+// passes read those margins as the CPU does in its tiles; that is much
+// cheaper than clearing the buffers first. Twelve buffers are live at the
+// peak; later passes reuse the ones whose contents are no longer read, as
+// the CPU code does with its tile buffers. The passes that update in place
+// on the CPU run one 16x16 work group per tile.
 static gboolean process_amaze_slang(dt_dev_pixelpipe_iop_t *piece,
                                     dt_slang_gpu_image_t *dev_in,
                                     dt_slang_gpu_image_t *dev_out,
@@ -59,7 +61,7 @@ static gboolean process_amaze_slang(dt_dev_pixelpipe_iop_t *piece,
   dt_slang_gpu_buffer_t *b[NBUF] = { NULL };
   gboolean ok = TRUE;
   for(int k = 0; k < NBUF && ok; k++)
-    ok = (b[k] = dt_slang_gpu_buffer_new(bsize, NULL)) != NULL;
+    ok = (b[k] = dt_slang_gpu_buffer_new_uninit(bsize)) != NULL;
 
   dt_slang_gpu_buffer_t *cfa = b[0];
   // up to the hvwt pass
