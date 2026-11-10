@@ -542,3 +542,15 @@ jobs:
           echo "$(grep -c 'process slang' slang.log) module runs on Slang"
           grep -q 'process slang' slang.log
           ! grep 'slang fallback' slang.log
+      - name: Check that the Slang kernels build as Metal source too
+        if: matrix.slang
+        # what a Mac with only the Command Line Tools installs, one source
+        # file per .metallib; darktable compiles them at run time
+        run: |
+          cmake -DUSE_SLANG_METAL_SOURCE=ON "${BUILD_DIR}"
+          cmake --build "${BUILD_DIR}" --target slang_kernels
+          cd "${BUILD_DIR}/data/kernels/slang"
+          libs=$(ls *.metallib | wc -l)
+          sources=$(ls *.metal | grep -vc '\.entries\.metal$')
+          echo "${sources} Metal source files for ${libs} libraries"
+          [ "${sources}" -eq "${libs}" ]

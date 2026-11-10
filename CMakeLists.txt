@@ -346,16 +346,21 @@ if(USE_SLANG)
 endif()
 
 # slangc hands .metallib builds to Apple's metal compiler, which ships with
-# Xcode but not with the Command Line Tools. Probed here because both
-# data/kernels/slang and src need to know.
+# Xcode but not with the Command Line Tools. Without it the kernels are
+# installed as Metal source, which darktable compiles at run time. Probed
+# here because data/kernels/slang, src and src/tests/slang need to know.
 set(DT_SLANG_METALLIB OFF)
 if(USE_SLANG AND APPLE)
-  execute_process(COMMAND xcrun -sdk macosx -f metal
-                  RESULT_VARIABLE XCRUN_METAL_RESULT OUTPUT_QUIET ERROR_QUIET)
-  if(XCRUN_METAL_RESULT EQUAL 0)
-    set(DT_SLANG_METALLIB ON)
+  if(USE_SLANG_METAL_SOURCE)
+    message(STATUS "Slang kernels are installed as Metal source, as USE_SLANG_METAL_SOURCE asks")
   else()
-    message(STATUS "Metal compiler not found (needs Xcode), Slang kernels are translated to Metal source only")
+    execute_process(COMMAND xcrun -sdk macosx -f metal
+                    RESULT_VARIABLE XCRUN_METAL_RESULT OUTPUT_QUIET ERROR_QUIET)
+    if(XCRUN_METAL_RESULT EQUAL 0)
+      set(DT_SLANG_METALLIB ON)
+    else()
+      message(STATUS "Metal compiler not found (needs Xcode), Slang kernels are installed as Metal source")
+    endif()
   endif()
 endif()
 

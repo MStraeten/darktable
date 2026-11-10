@@ -408,8 +408,11 @@ The build also needs:
 
 * on Linux and Windows, the Vulkan headers and loader (`libvulkan-dev` on Debian and Ubuntu,
   `vulkan-headers` and `vulkan-loader` in MSYS2),
-* on macOS, Xcode rather than only the Command Line Tools, with its Metal toolchain
-  (`xcodebuild -downloadComponent MetalToolchain` on Xcode 26 and later).
+* on macOS, nothing beyond the Command Line Tools. With them alone the kernels are installed as
+  Metal source, which darktable compiles when it first runs each one. With Xcode and its Metal
+  toolchain (`xcodebuild -downloadComponent MetalToolchain` on Xcode 26 and later), they are
+  compiled into `.metallib` files at build time instead, so nothing is compiled at run time.
+  `-DUSE_SLANG_METAL_SOURCE=ON` installs the source even when Xcode is there.
 
 `slangc` is not needed at run time; the compiled kernels are installed in
 `share/darktable/kernels/slang`.

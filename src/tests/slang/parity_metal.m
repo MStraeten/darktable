@@ -17,9 +17,9 @@
 */
 
 // The Metal backend of parity.c: runs a test case's kernel from the
-// <program>.<entry>.metallib that data/kernels/slang/CMakeLists.txt builds,
-// binding the arguments as src/common/slang_gpu_metal.m does, with images as
-// linear textures on shared buffers.
+// <program>.<entry>.metallib or .metal that data/kernels/slang/CMakeLists.txt
+// builds, binding the arguments as src/common/slang_gpu_metal.m does, with
+// images as linear textures on shared buffers.
 
 #import <Metal/Metal.h>
 
@@ -103,14 +103,39 @@ static id<MTLTexture> image(const int w, const int h, const int channels, const 
   return t;
 }
 
+// <path>.metallib, or <path>.metal compiled here, as slang_gpu_metal.m does
+static id<MTLLibrary> load_library(NSString *path, NSError **error)
+{
+  NSString *lib_path = [path stringByAppendingString:@".metallib"];
+  if([[NSFileManager defaultManager] fileExistsAtPath:lib_path])
+    return [dev newLibraryWithURL:[NSURL fileURLWithPath:lib_path] error:error];
+  NSString *src = [NSString stringWithContentsOfFile:[path stringByAppendingString:@".metal"]
+                                            encoding:NSUTF8StringEncoding
+                                               error:error];
+  if(!src) return nil;
+  MTLCompileOptions *options = [MTLCompileOptions new];
+#if defined(MAC_OS_VERSION_15_0)
+  if(@available(macOS 15.0, *))
+    options.mathMode = MTLMathModeSafe;
+  else
+#endif
+  {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+  }
+  return [dev newLibraryWithSource:src options:options error:error];
+}
+
 void mtl_run(const char *dir, const test_t *t, void **outs)
 {
   @autoreleasepool
   {
     const char *entry = t->slang_kernel ? t->slang_kernel : t->kernel;
-    NSString *path = [NSString stringWithFormat:@"%s/%s.%s.metallib", dir, t->program, entry];
+    NSString *path = [NSString stringWithFormat:@"%s/%s.%s", dir, t->program, entry];
     NSError *error = nil;
-    id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+    id<MTLLibrary> lib = load_library(path, &error);
     if(!lib) die("can't load %s: %s", path.UTF8String, error.localizedDescription.UTF8String);
     id<MTLFunction> fn = [lib newFunctionWithName:@(entry)];
     if(!fn) die("no kernel %s in %s", entry, path.UTF8String);

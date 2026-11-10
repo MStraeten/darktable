@@ -16,9 +16,11 @@ https://github.com/shader-slang/slang/releases) on the `PATH`, and:
 
 - Linux: the Vulkan loader and headers (`libvulkan-dev` on Debian/Ubuntu) and
   a Vulkan driver for your GPU
-- macOS: Xcode, for the `metal` compiler (Command Line Tools alone fall back
-  to compiling Metal source at run time). Recent Xcode versions ship it as a
-  separate download: `xcodebuild -downloadComponent MetalToolchain`
+- macOS: the Command Line Tools are enough; darktable then compiles the
+  Metal source of each kernel the first time it runs it. With Xcode and its
+  `metal` compiler the kernels are compiled at build time instead. Recent
+  Xcode versions ship it as a separate download:
+  `xcodebuild -downloadComponent MetalToolchain`
 - Windows: untested
 
 ```bash

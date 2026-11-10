@@ -48,6 +48,9 @@ else ()
 endif ()
 
 option(USE_SLANG "Compile the Slang GPU kernels (needs slangc)" OFF)
+if(APPLE)
+    option(USE_SLANG_METAL_SOURCE "Install the Slang kernels as Metal source even when Xcode's metal compiler is there" OFF)
+endif()
 
 if(APPLE)
     option(USE_MAC_INTEGRATION "Enable macOS integration" ON)

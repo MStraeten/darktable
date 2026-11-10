@@ -310,20 +310,52 @@ static gboolean _reflect(MTLComputePipelineReflection *refl, DtSlangKernel *k)
   return TRUE;
 }
 
+// a build with Xcode installs <path>.metallib, one with only the Command
+// Line Tools <path>.metal, which is compiled here, without fast math like
+// the libraries, see data/kernels/slang/CMakeLists.txt
+static id<MTLLibrary> _load_library(NSString *path, NSError **error)
+{
+  NSString *lib_path = [path stringByAppendingString:@".metallib"];
+  if([[NSFileManager defaultManager] fileExistsAtPath:lib_path])
+    return [_mtl.dev newLibraryWithURL:[NSURL fileURLWithPath:lib_path] error:error];
+
+  NSString *src_path = [path stringByAppendingString:@".metal"];
+  NSString *src = [NSString stringWithContentsOfFile:src_path encoding:NSUTF8StringEncoding error:error];
+  if(!src) return nil;
+  MTLCompileOptions *options = [MTLCompileOptions new];
+#if defined(MAC_OS_VERSION_15_0)
+  if(@available(macOS 15.0, *))
+    options.mathMode = MTLMathModeSafe;
+  else
+#endif
+  {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+  }
+  const double start = dt_get_debug_wtime();
+  id<MTLLibrary> lib = [_mtl.dev newLibraryWithSource:src options:options error:error];
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] compiled %s in %.3f secs", src_path.lastPathComponent.UTF8String,
+           dt_get_debug_wtime() - start);
+  return lib;
+}
+
 static DtSlangKernel *_build_kernel(const char *program, const char *entry)
 {
   DtSlangKernel *k = nil;
 
   // one library per entry point, see data/kernels/slang/CMakeLists.txt. A
-  // library keeps its file open until it is released, and there are more
-  // of them than the 256 files macOS lets a process open by default, so
-  // only the pipeline is kept: it does not need the library once built
+  // library loaded from a file keeps it open until it is released, and
+  // there are more of them than the 256 files macOS lets a process open by
+  // default, so only the pipeline is kept: it does not need the library
+  // once built
   NSString *name = [NSString stringWithFormat:@"%s.%s", program, entry];
   NSError *error = nil;
   char datadir[PATH_MAX] = { 0 };
   dt_loc_get_datadir(datadir, sizeof(datadir));
-  NSString *path = [NSString stringWithFormat:@"%s/kernels/slang/%@.metallib", datadir, name];
-  id<MTLLibrary> lib = [_mtl.dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+  NSString *path = [NSString stringWithFormat:@"%s/kernels/slang/%@", datadir, name];
+  id<MTLLibrary> lib = _load_library(path, &error);
   if(!lib)
   {
     dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't load %s: %s", path.UTF8String,
@@ -334,7 +366,7 @@ static DtSlangKernel *_build_kernel(const char *program, const char *entry)
   id<MTLFunction> fn = [lib newFunctionWithName:@(entry)];
   if(!fn)
   {
-    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no kernel %s in %s.metallib", entry, name.UTF8String);
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] no kernel %s in %s", entry, name.UTF8String);
     return nil;
   }
   MTLComputePipelineReflection *refl = nil;
@@ -351,7 +383,7 @@ static DtSlangKernel *_build_kernel(const char *program, const char *entry)
   }
   if(!_reflect(refl, k))
   {
-    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't find the parameters of %s in %s.metallib", entry,
+    dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't find the parameters of %s in %s", entry,
              name.UTF8String);
     return nil;
   }
@@ -393,9 +425,9 @@ static gboolean _pipe_busy(void)
   return busy;
 }
 
-// loads every <program>.<entry>.metallib in kernels/slang and builds its
-// pipeline, which takes longer than running the kernel the first time.
-// It builds one at a time and only while no pipe is dispatching, so that
+// loads every <program>.<entry>.metallib or .metal in kernels/slang and
+// builds its pipeline, which takes longer than running the kernel the first
+// time. It builds one at a time and only while no pipe is dispatching, so that
 // a pipe's own builds do not queue behind it
 static void _preload_kernels(void)
 {
@@ -406,7 +438,7 @@ static void _preload_kernels(void)
   const gchar *file;
   while(dir && (file = g_dir_read_name(dir)) && !g_atomic_int_get(&_preload_stop))
   {
-    if(!g_str_has_suffix(file, ".metallib")) continue;
+    if(!g_str_has_suffix(file, ".metallib") && !g_str_has_suffix(file, ".metal")) continue;
     while(!g_atomic_int_get(&_preload_stop) && _pipe_busy()) g_usleep(10000);
     gchar **parts = g_strsplit(file, ".", 3);
     // drains the library each _get_kernel() call leaves behind, so that its

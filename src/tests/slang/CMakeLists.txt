@@ -9,7 +9,7 @@ if(NOT OpenCL_FOUND)
   return()
 endif()
 
-if(APPLE AND DT_SLANG_METALLIB)
+if(APPLE)
   enable_language(OBJC)
   add_executable(darktable-test-slang-parity parity.c parity_metal.m)
   target_compile_definitions(darktable-test-slang-parity PRIVATE PARITY_METAL)
