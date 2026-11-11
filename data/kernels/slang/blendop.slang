@@ -1276,7 +1276,7 @@ void calc_Y0_mask(uint3 gid : SV_DispatchThreadID,
   const int idx = row * w + col;
 
   const float4 pt = wb * max(0.0f, in.Areadpixel(col, row));
-  mask[idx] = dtcl_sqrt((pt.x + pt.y + pt.z) / 3.0f);
+  mask[idx] = dtcl_sqrt(fp32_div(pt.x + pt.y + pt.z, 3.0f));
 }
 
 [shader("compute")]
@@ -1297,10 +1297,11 @@ void calc_scharr_mask(uint3 gid : SV_DispatchThreadID,
   out[oidx] = clipf(gradient_magnitude / 16.0f);
 }
 
+// threshold is 16 / the inflexion point, as the host passes it
 float _calc_blend_factor(float val, float threshold)
 {
-  // sigmoid with its inflexion point at (threshold, 0.5)
-  return 1.0f / (1.0f + dt_fast_expf(16.0f - (16.0f / threshold) * val));
+  // sigmoid with its inflexion point at (16 / threshold, 0.5)
+  return 1.0f / (1.0f + dt_fast_expf(16.0f - threshold * val));
 }
 
 [shader("compute")]

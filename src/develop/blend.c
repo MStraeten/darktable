@@ -2324,7 +2324,7 @@ static int _refine_with_detail_mask_slang(dt_iop_module_t *self,
   if(feqf(level, 0.0f, 1e-6f)) return 0;
 
   const int detail = level > 0.0f;
-  const float threshold = _detail_mask_threshold(level, detail);
+  const float threshold = 16.0f / MAX(1e-7f, _detail_mask_threshold(level, detail));
 
   dt_dev_pixelpipe_t *p = piece->pipe;
   if(!dt_dev_scharr_mask_available(&p->scharr))

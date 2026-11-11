@@ -159,7 +159,7 @@ static gboolean dual_demosaic_slang(const dt_dev_pixelpipe_iop_t *const piece,
   const dt_dev_pixelpipe_t *p = piece->pipe;
   const dt_iop_demosaic_data_t *data = piece->data;
 
-  const float contrastf = _slider2contrast(data->dual_thrs);
+  const float contrastf = 16.0f / MAX(1e-7f, _slider2contrast(data->dual_thrs));
   const size_t bsize = sizeof(float) * width * height;
 
   const gboolean wboff = !p->dsc.temperature.enabled;
