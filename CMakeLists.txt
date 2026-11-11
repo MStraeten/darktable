@@ -349,17 +349,22 @@ endif()
 # Xcode but not with the Command Line Tools. Without it the kernels are
 # installed as Metal source, which darktable compiles at run time. Probed
 # here because data/kernels/slang, src and src/tests/slang need to know.
+# Run the compiler rather than only locate it: since Xcode 26 the Metal
+# Toolchain is a separate download, and xcrun finds the metal shim even
+# when that toolchain is missing or belongs to an older Xcode.
 set(DT_SLANG_METALLIB OFF)
 if(USE_SLANG AND APPLE)
   if(USE_SLANG_METAL_SOURCE)
     message(STATUS "Slang kernels are installed as Metal source, as USE_SLANG_METAL_SOURCE asks")
   else()
-    execute_process(COMMAND xcrun -sdk macosx -f metal
-                    RESULT_VARIABLE XCRUN_METAL_RESULT OUTPUT_QUIET ERROR_QUIET)
+    execute_process(COMMAND xcrun -sdk macosx metal --version
+                    RESULT_VARIABLE XCRUN_METAL_RESULT OUTPUT_QUIET
+                    ERROR_VARIABLE XCRUN_METAL_ERROR ERROR_STRIP_TRAILING_WHITESPACE)
     if(XCRUN_METAL_RESULT EQUAL 0)
       set(DT_SLANG_METALLIB ON)
     else()
-      message(STATUS "Metal compiler not found (needs Xcode), Slang kernels are installed as Metal source")
+      message(STATUS "Metal compiler not usable (${XCRUN_METAL_ERROR}), Slang kernels are installed as Metal source; "
+                     "with Xcode 26 or later, xcodebuild -downloadComponent MetalToolchain installs it")
     endif()
   endif()
 endif()
