@@ -868,7 +868,7 @@ static gboolean process_opposed_slang(dt_iop_module_t *self,
   const dt_aligned_pixel_t clips = { clipval * icoeffs[0], clipval * icoeffs[1], clipval * icoeffs[2], 1.0f};
 
   const dt_dev_wb_t *wb = &piece->pipe->wb;
-  const gboolean late = wb->late_correction;
+  const gboolean late = dt_dev_wb_late_correction(wb, dsc);
   dt_aligned_pixel_t correction;
   dt_dev_wb_get_rgb_correction(wb, late, correction);
 

@@ -1104,7 +1104,7 @@ gboolean process_slang(dt_iop_module_t *self,
   }
 
   const dt_dev_wb_t *wb = &pipe->wb;
-  const gboolean corrected = wb->late_correction && d->type != DT_COLORSPACE_LAB;
+  const gboolean corrected = dt_dev_wb_late_correction(wb, &pipe->dsc) && d->type != DT_COLORSPACE_LAB;
   dt_aligned_pixel_t coeffs;
   dt_dev_wb_get_rgb_correction(wb, corrected, coeffs);
 

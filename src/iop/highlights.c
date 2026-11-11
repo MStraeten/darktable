@@ -898,7 +898,7 @@ gboolean process_slang(dt_iop_module_t *self,
   {
     dt_aligned_pixel_t clips = { clipper, clipper, clipper, clipper};
     const dt_dev_wb_t *wb = &pipe->wb;
-    if(pipe->dsc.temperature.enabled && wb->late_correction)
+    if(dt_dev_wb_late_correction(wb, &pipe->dsc))
     {
       clips[0] *= wb->coeffs[0] / wb->D65coeffs[0];
       clips[1] *= wb->coeffs[1] / wb->D65coeffs[1];
