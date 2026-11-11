@@ -124,20 +124,20 @@ void cacorrect_green(uint3 gid : SV_DispatchThreadID,
   const int v1 = ewidth;
   const int v2 = 2 * ewidth;
   const int v3 = 3 * ewidth;
-  const float wtu = 1.0f / _sqrf(eps + abs(raw[i + v1] - raw[i - v1])
-                                     + abs(raw[i] - raw[i - v2])
-                                     + abs(raw[i - v1] - raw[i - v3]));
-  const float wtd = 1.0f / _sqrf(eps + abs(raw[i - v1] - raw[i + v1])
-                                     + abs(raw[i] - raw[i + v2])
-                                     + abs(raw[i + v1] - raw[i + v3]));
-  const float wtl = 1.0f / _sqrf(eps + abs(raw[i + 1] - raw[i - 1])
-                                     + abs(raw[i] - raw[i - 2])
-                                     + abs(raw[i - 1] - raw[i - 3]));
-  const float wtr = 1.0f / _sqrf(eps + abs(raw[i - 1] - raw[i + 1])
-                                     + abs(raw[i] - raw[i + 2])
-                                     + abs(raw[i + 1] - raw[i + 3]));
-  green[i] = (wtu * raw[i - v1] + wtd * raw[i + v1] + wtl * raw[i - 1] + wtr * raw[i + 1])
-             / (wtu + wtd + wtl + wtr);
+  const float wtu = fp32_div(1.0f, _sqrf(eps + abs(raw[i + v1] - raw[i - v1])
+                                             + abs(raw[i] - raw[i - v2])
+                                             + abs(raw[i - v1] - raw[i - v3])));
+  const float wtd = fp32_div(1.0f, _sqrf(eps + abs(raw[i - v1] - raw[i + v1])
+                                             + abs(raw[i] - raw[i + v2])
+                                             + abs(raw[i + v1] - raw[i + v3])));
+  const float wtl = fp32_div(1.0f, _sqrf(eps + abs(raw[i + 1] - raw[i - 1])
+                                             + abs(raw[i] - raw[i - 2])
+                                             + abs(raw[i - 1] - raw[i - 3])));
+  const float wtr = fp32_div(1.0f, _sqrf(eps + abs(raw[i - 1] - raw[i + 1])
+                                             + abs(raw[i] - raw[i + 2])
+                                             + abs(raw[i + 1] - raw[i + 3])));
+  green[i] = fp32_div(wtu * raw[i - v1] + wtd * raw[i + v1] + wtl * raw[i - 1] + wtr * raw[i + 1],
+                      wtu + wtd + wtl + wtr);
 }
 
 // the six high and low pass filters at the red and blue sensels, in planes of
@@ -220,10 +220,10 @@ void cacorrect_tile_sums(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID,
                     + 0.09375f * (green[i + ewidth + 1] - green[i - ewidth + 1]
                                   + green[i + ewidth - 1] - green[i - ewidth - 1]);
       const float deltgrb = raw[i] - green[i];
-      float gradwt = abs(0.25f * filt[h] + 0.125f * (filt[h + 1] + filt[h - 1]))
-                     * (filt[4 * plane + h - hv] + filt[4 * plane + h + hv])
-                     / (eps + 0.1f * (filt[4 * plane + h - hv] + filt[4 * plane + h + hv])
-                        + filt[2 * plane + h - hv] + filt[2 * plane + h + hv]);
+      float gradwt = fp32_div(abs(0.25f * filt[h] + 0.125f * (filt[h + 1] + filt[h - 1]))
+                              * (filt[4 * plane + h - hv] + filt[4 * plane + h + hv]),
+                              eps + 0.1f * (filt[4 * plane + h - hv] + filt[4 * plane + h + hv])
+                              + filt[2 * plane + h - hv] + filt[2 * plane + h + hv]);
       s[ci] += gradwt * deltgrb * deltgrb;
       s[2 + ci] += gradwt * gdiff * deltgrb;
       s[4 + ci] += gradwt * gdiff * gdiff;
@@ -232,10 +232,10 @@ void cacorrect_tile_sums(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID,
       gdiff = 0.3125f * (green[i + 1] - green[i - 1])
               + 0.09375f * (green[i + 1 + ewidth] - green[i - 1 + ewidth]
                             + green[i + 1 - ewidth] - green[i - 1 - ewidth]);
-      gradwt = abs(0.25f * filt[plane + h] + 0.125f * (filt[plane + h + hv] + filt[plane + h - hv]))
-               * (filt[5 * plane + h - 1] + filt[5 * plane + h + 1])
-               / (eps + 0.1f * (filt[5 * plane + h - 1] + filt[5 * plane + h + 1])
-                  + filt[3 * plane + h - 1] + filt[3 * plane + h + 1]);
+      gradwt = fp32_div(abs(0.25f * filt[plane + h] + 0.125f * (filt[plane + h + hv] + filt[plane + h - hv]))
+                        * (filt[5 * plane + h - 1] + filt[5 * plane + h + 1]),
+                        eps + 0.1f * (filt[5 * plane + h - 1] + filt[5 * plane + h + 1])
+                        + filt[3 * plane + h - 1] + filt[3 * plane + h + 1]);
       s[6 + ci] += gradwt * deltgrb * deltgrb;
       s[8 + ci] += gradwt * gdiff * deltgrb;
       s[10 + ci] += gradwt * gdiff * gdiff;
@@ -344,12 +344,12 @@ void cacorrect_correct(uint3 gid : SV_DispatchThreadID,
   }
   else
   {
-    const float p0 = 1.0f / (eps + abs(g - gshift[0]));
-    const float p1 = 1.0f / (eps + abs(g - gshift[1]));
-    const float p2 = 1.0f / (eps + abs(g - gshift[2]));
-    const float p3 = 1.0f / (eps + abs(g - gshift[3]));
-    grbdiffint = (p0 * grbdiff[0] + p1 * grbdiff[1] + p2 * grbdiff[2] + p3 * grbdiff[3])
-                 / (p0 + p1 + p2 + p3);
+    const float p0 = fp32_div(1.0f, eps + abs(g - gshift[0]));
+    const float p1 = fp32_div(1.0f, eps + abs(g - gshift[1]));
+    const float p2 = fp32_div(1.0f, eps + abs(g - gshift[2]));
+    const float p3 = fp32_div(1.0f, eps + abs(g - gshift[3]));
+    grbdiffint = fp32_div(p0 * grbdiff[0] + p1 * grbdiff[1] + p2 * grbdiff[2] + p3 * grbdiff[3],
+                          p0 + p1 + p2 + p3);
     if(abs(grbdiffold) > abs(grbdiffint)) o = g - grbdiffint;
   }
 
@@ -381,8 +381,9 @@ void cacorrect_factors(uint3 gid : SV_DispatchThreadID,
   if(row < height && col < width)
   {
     const int i = row * width + col;
-    // CLAMPF() turns the NaN of 0 / 0 into the lower bound
-    const float q = before[i] / after[i];
+    // CLAMPF() turns the NaN of 0 / 0 into the lower bound. fp32_div() gives
+    // NaN for x / 0, which process() clamps from +inf to the upper bound
+    const float q = after[i] != 0.0f ? fp32_div(before[i], after[i]) : before[i] / after[i];
     f = q >= 0.5f ? min(q, 2.0f) : 0.5f;
   }
   factors.write(int2(x, y), float4(f));
