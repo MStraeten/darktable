@@ -1290,18 +1290,14 @@ static gboolean _capture_sharpen_slang(dt_iop_module_t *self,
   if(table) memcpy(table, f_gauss_idx, pixels);
   dt_free_align(f_gauss_idx);
 
-  float *ones = dt_alloc_align_float(pixels);
-  if(ones) dt_iop_image_fill(ones, 1.0f, width, height, 1);
-
   dt_slang_gpu_buffer_t *blendmask = dt_slang_gpu_buffer_new_uninit(bsize);
   dt_slang_gpu_buffer_t *luminance = dt_slang_gpu_buffer_new_uninit(bsize);
-  dt_slang_gpu_buffer_t *tmp2 = ones ? dt_slang_gpu_buffer_new(bsize, ones) : NULL;
+  dt_slang_gpu_buffer_t *tmp2 = dt_slang_gpu_buffer_new_uninit(bsize);
   dt_slang_gpu_buffer_t *tmp1 = dt_slang_gpu_buffer_new_uninit(bsize);
   dt_slang_gpu_buffer_t *gcoeffs =
     dt_slang_gpu_buffer_new(sizeof(float) * (UCHAR_MAX + 1) * CAPTURE_KERNEL_ALIGN, gd->gauss_coeffs);
   dt_slang_gpu_buffer_t *gauss_idx = table ? dt_slang_gpu_buffer_new(table_size, table) : NULL;
   dt_slang_gpu_image_t *dev_rgb = dt_slang_gpu_image_new(width, height, 4, NULL);
-  dt_free_align(ones);
   free(table);
 
   const int zero = 0;
@@ -1314,8 +1310,11 @@ static gboolean _capture_sharpen_slang(dt_iop_module_t *self,
   if(!err)
     err = dt_slang_gpu_run_2d_args("capture", "prepare_blend", width, height,
                                    SLIMG_DEV(dev_in), SLIMG_DEV(dev_rgb), SLARG(filters),
-                                   SLBUF(xtrans, 36), SLBUF_DEV(tmp2), SLBUF_DEV(tmp1),
+                                   SLBUF(xtrans, 36), SLBUF_DEV(blendmask), SLBUF_DEV(tmp1),
                                    SLARG(icoeffs), SLARG(width), SLARG(height));
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("capture", "capture_dilatemask", width, height,
+                                   SLBUF_DEV(blendmask), SLBUF_DEV(tmp2), SLARG(width), SLARG(height));
   if(!err)
     err = dt_slang_gpu_run_2d_args("capture", "modify_blend", width, height,
                                    SLBUF_DEV(tmp2), SLBUF_DEV(tmp1), SLBUF_DEV(luminance), SLARG(thrs),

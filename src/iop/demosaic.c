@@ -1639,7 +1639,7 @@ gboolean process_slang(dt_iop_module_t *self,
   // the highlights mask views pass the raw data on
   // and showing a mask here replaces that, as in process()
   const gboolean demosaic_mask = !show_mask && pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
-  const gboolean dual = (d->demosaicing_method & DT_DEMOSAIC_DUAL) && !run_fast
+  const gboolean dual = (d->demosaicing_method & DT_DEMOSAIC_DUAL) && d->dual_thrs > 0.0f && !run_fast
                         && !show_sigma && !show_capture && !demosaic_mask;
 
   // the autotuning of capture sharpening, as in process_cl()

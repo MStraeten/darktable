@@ -921,11 +921,12 @@ static int make_tests(test_t *t)
   {
     enum { CS_ALIGN = 32, CS_TABLE = (W * H + 3) & ~3 };
     static float cs_ones[W * H], cs_y[W * H], cs_blend[W * H], cs_lum[W * H], cs_tmp[W * H];
-    static float cs_kernels[256 * CS_ALIGN], cs_gauss[25];
+    static float cs_kernels[256 * CS_ALIGN], cs_gauss[25], cs_sparse[W * H];
     static unsigned char cs_table[CS_TABLE];
     for(int k = 0; k < W * H; k++)
     {
       cs_ones[k] = 1.0f;
+      cs_sparse[k] = (k % 13 == 0) ? 1.0f : 0.0f;
       cs_y[k] = 0.02f + fabsf(image_in[4 * k + 1]);
       cs_blend[k] = (k % 11 == 0) ? 0.0f : fminf(fmaxf(image_in[4 * k + 2], 0.0f), 1.0f);
       cs_lum[k] = 0.01f + fabsf(image_in[4 * k]);
@@ -938,6 +939,9 @@ static int make_tests(test_t *t)
          RAW_IN("cfa", image_raw), IMG_IN("dev_out", image_in), INT("filters", bayer[0]),
          BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER_OUT("mask", cs_ones, sizeof(cs_ones)),
          BUFFER_OUT("Yold", NULL, sizeof(cs_y)), FLOAT4("wb", 0.9f, 0.95f, 0.85f, 0.0f), INT("w", W),
+         INT("height", H));
+    TEST("capture_dilatemask", "capture", "capture_dilatemask",
+         BUFFER("in", cs_sparse, sizeof(cs_sparse)), BUFFER_OUT("out", NULL, sizeof(cs_tmp)), INT("width", W),
          INT("height", H));
     TEST("modify_blend", "capture", "modify_blend",
          BUFFER_OUT("blend", cs_blend, sizeof(cs_blend)), BUFFER("Yold", cs_y, sizeof(cs_y)),

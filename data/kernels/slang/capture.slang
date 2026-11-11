@@ -66,7 +66,35 @@ void kernel_9x9_div(uint3 gid : SV_DispatchThreadID,
 
   const int t = _table(table, i);
   const float val = sum_9x9(in, kernels, CAPTURE_KERNEL_ALIGN * t, col, row, w1, height, t < CAPTURE_SMALL_ULIM);
-  out[i] = luminance[i] / max(val, CAPTURE_YMIN);
+  out[i] = fp32_div(luminance[i], max(val, CAPTURE_YMIN));
+}
+
+float _mask_dilated(StructuredBuffer<float> in, const int mx, const int w1)
+{
+  const int w2 = 2 * w1;
+  for(int y = -2; y <= 2; y++)
+  {
+    // the 5x5 square without its corners, as in capture.cl
+    const int r = (y == -2 || y == 2) ? 1 : 2;
+    for(int x = -r; x <= r; x++)
+      if(in[mx + y * w1 + x] != 0.0f) return 1.0f;
+  }
+  return 0.0f;
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void capture_dilatemask(uint3 gid : SV_DispatchThreadID,
+                        uniform StructuredBuffer<float> in, uniform RWStructuredBuffer<float> out,
+                        uniform int width, uniform int height)
+{
+  const int col = gid.x;
+  const int row = gid.y;
+  if(col >= width || row >= height) return;
+
+  const int mx = row * width + col;
+  const bool safe = col >= 2 && row >= 2 && col < width - 2 && row < height - 2;
+  out[mx] = safe ? _mask_dilated(in, mx, width) : in[mx];
 }
 
 [shader("compute")]
@@ -85,27 +113,13 @@ void prepare_blend(uint3 gid : SV_DispatchThreadID,
   float4 rgb = dev_out.Areadpixel(col, row);
   // Photometric/digital ITU BT.709
   rgb *= float4(0.212671f, 0.715160f, 0.072169f, 0.0f);
-  const float Y = max(0.0f, rgb.x + rgb.y + rgb.z);
+  const float Y = clipf(rgb.x + rgb.y + rgb.z);
   const int k = row * w + col;
   Yold[k] = Y;
 
-  if(row > 1 && col > 1 && (row < height - 2) && (col < w - 2))
-  {
-    const int w2 = 2 * w;
-    const int color = fcol(row, col, filters, xtrans);
-    const float val = cfa.Areadsingle(col, row);
-    // neighboring work items write the same zeros, so the overlap is harmless
-    if(val > whites[color] || Y < CAPTURE_YMIN)
-    {
-      mask[k-w2-1] = 0.0f; mask[k-w2] = 0.0f; mask[k-w2+1] = 0.0f;
-      mask[k-w-2] = 0.0f; mask[k-w-1] = 0.0f; mask[k-w] = 0.0f; mask[k-w+1] = 0.0f; mask[k-w+2] = 0.0f;
-      mask[k-2] = 0.0f; mask[k-1] = 0.0f; mask[k] = 0.0f; mask[k+1] = 0.0f; mask[k+2] = 0.0f;
-      mask[k+w-2] = 0.0f; mask[k+w-1] = 0.0f; mask[k+w] = 0.0f; mask[k+w+1] = 0.0f; mask[k+w+2] = 0.0f;
-      mask[k+w2-1] = 0.0f; mask[k+w2] = 0.0f; mask[k+w2+1] = 0.0f;
-    }
-  }
-  else
-    mask[k] = 0.0f;
+  const int color = fcol(row, col, filters, xtrans);
+  const float val = cfa.Areadsingle(col, row);
+  mask[k] = val > whites[color] || Y < CAPTURE_YMIN ? 0.0f : 1.0f;
 }
 
 [shader("compute")]
@@ -145,11 +159,11 @@ void modify_blend(uint3 gid : SV_DispatchThreadID,
   }
 
   const int k = irow * width + icol;
-  const float sum_of_squares = max(0.0f, sum_sq - fsquare(sum) / 21.0f);
-  const float std_deviation = dtcl_sqrt(sum_of_squares / 21.0f);
-  const float modified_coef_variation = std_deviation / dtcl_sqrt(max(NORM_MIN, sum / 21.0f));
+  const float sum_of_squares = max(0.0f, sum_sq - fp32_div(fsquare(sum), 21.0f));
+  const float std_deviation = sqrt(fp32_div(sum_of_squares, 21.0f));
+  const float modified_coef_variation = fp32_div(std_deviation, sqrt(max(NORM_MIN, fp32_div(sum, 21.0f))));
   const float t = dtcl_log(1.0f + modified_coef_variation);
-  const float weight = 1.0f / (1.0f + dtcl_exp(offset - tscale * t));
+  const float weight = fp32_div(1.0f, 1.0f + exp(offset - tscale * t));
   blend[k] = clipf(blend[k] * 1.01011f * (weight - 0.01f));
   luminance[k] = Yold[k];
 }
@@ -165,7 +179,7 @@ void final_blend(uint3 gid : SV_DispatchThreadID,
   if(k >= pixels) return;
 
   const float diff = unblurred[k] - blendmask[k];
-  const float w_tmp2 = 1.0f / (1.0f + dtcl_exp(5.0f - 10.0f * diff));
+  const float w_tmp2 = fp32_div(1.0f, 1.0f + exp(5.0f - 10.0f * diff));
   blendmask[k] = clipf(w_tmp2 * unblurred[k] + (1.0f - w_tmp2) * blendmask[k]);
 }
 
@@ -205,7 +219,7 @@ void capture_result(uint3 gid : SV_DispatchThreadID,
   {
     const float mixer = clipf(blendmask[k]);
     const float luminance_new = lerp(luminance[k], tmp[k], mixer);
-    pix *= float4(luminance_new / max(luminance[k], CAPTURE_YMIN));
+    pix *= float4(fp32_div(luminance_new, max(luminance[k], CAPTURE_YMIN)));
   }
   out.write(int2(col, row), pix);
 }
