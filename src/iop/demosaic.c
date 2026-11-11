@@ -1581,6 +1581,10 @@ gboolean process_slang(dt_iop_module_t *self,
   const gboolean passthru = method == DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME
                             || method == DT_IOP_DEMOSAIC_PASSTHROUGH_COLOR;
 
+  // the DNG OpcodeList3 GainMap has no Slang kernel yet, so such files run
+  // demosaic on OpenCL or the CPU
+  if(_gain_map(self, piece)) return FALSE;
+
   // low quality thumbnails are demosaiced while downscaling, as in process_cl()
   if(!_demosaic_full(pipe, img))
   {

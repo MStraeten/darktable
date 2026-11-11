@@ -508,6 +508,8 @@ gboolean process_slang(dt_iop_module_t *self,
   const gboolean color_sraw = !(dt_image_is_raw(&pipe->image) || dt_image_is_mono_sraw(&pipe->image));
   if(!mosaic && piece->dsc_in.channels != 4)
     return FALSE;
+  // the DNG OpcodeList3 GainMap of linear DNGs has no Slang kernel yet
+  if(d->gainmap_opcode3) return FALSE;
 
   const int csx = _compute_proper_crop(piece, roi_in, d->left);
   const int csy = _compute_proper_crop(piece, roi_in, d->top);
