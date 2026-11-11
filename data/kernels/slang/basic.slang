@@ -1586,10 +1586,9 @@ float4 _lens_bilinear(ImageIn in, const float rx, const float ry, const int iwid
 }
 
 // the weighted sum of the kwidth wide filter around (rx, ry), in all channels.
-// lanczos is 0 for bicubic. For the blue channel the bicubic OpenCL kernel
-// clamps the tap positions before it weighs them, which clamp_taps follows.
+// lanczos is 0 for bicubic.
 float4 _lens_filter(ImageIn in, const float rx, const float ry, const int kwidth, const int lanczos,
-                    const bool clamp_taps, const int iwidth, const int iheight)
+                    const int iwidth, const int iheight)
 {
   const int tx = int(floor(rx));
   const int ty = int(floor(ry));
@@ -1599,13 +1598,8 @@ float4 _lens_filter(ImageIn in, const float rx, const float ry, const int kwidth
   for(int jj = 1 - kwidth; jj <= kwidth; jj++)
     for(int ii = 1 - kwidth; ii <= kwidth; ii++)
     {
-      int i = tx + ii;
-      int j = ty + jj;
-      if(clamp_taps)
-      {
-        i = clamp(i, 0, iwidth - 1);
-        j = clamp(j, 0, iheight - 1);
-      }
+      const int i = tx + ii;
+      const int j = ty + jj;
 
       const float wx = lanczos != 0 ? interpolation_func_lanczos(float(lanczos), float(i) - rx)
                                     : interpolation_func_bicubic(float(i) - rx);
@@ -1667,7 +1661,7 @@ void clip_rotate(uint3 gid : SV_DispatchThreadID,
     const int tx = int(floor(po.x));
     const int ty = int(floor(po.y));
     if(tx >= -1 && ty >= -1 && tx < in_width && ty < in_height)
-      pixel = _lens_filter(in, po.x, po.y, kwidth, lanczos, false, in_width, in_height);
+      pixel = _lens_filter(in, po.x, po.y, kwidth, lanczos, in_width, in_height);
   }
   out.write(int2(x, y), pixel);
 }
@@ -1708,7 +1702,7 @@ void liquify_warp(uint3 gid : SV_DispatchThreadID,
       const int tx = int(floor(p.x));
       const int ty = int(floor(p.y));
       if(tx >= -1 && ty >= -1 && tx < in_width && ty < in_height)
-        pixel = _lens_filter(in, p.x, p.y, kwidth, lanczos, false, in_width, in_height);
+        pixel = _lens_filter(in, p.x, p.y, kwidth, lanczos, in_width, in_height);
     }
   }
   out.write(int2(x, y), pixel);
@@ -1742,10 +1736,13 @@ void _lens_distort(const uint3 gid, ImageIn in, ImageOut out, const int width, c
   float4 pixel = float4(0.0f);
   for(int c = 0; c < 3; c++)
   {
-    const float rx = ppi[2 * c] - float(roi_in_x);
-    const float ry = ppi[2 * c + 1] - float(roi_in_y);
+    // held inside the input as in the CPU path of src/iop/lens.cc, so that
+    // coordinates past the edge sample the edge pixel. fmin() and fmax()
+    // also map NaN to an edge there.
+    const float rx = fmax(fmin(ppi[2 * c] - float(roi_in_x), float(iwidth) - 1.0f), 0.0f);
+    const float ry = fmax(fmin(ppi[2 * c + 1] - float(roi_in_y), float(iheight) - 1.0f), 0.0f);
     const float4 px = bilinear != 0 ? _lens_bilinear(in, rx, ry, iwidth, iheight)
-                                    : _lens_filter(in, rx, ry, kwidth, lanczos, c == 2 && lanczos == 0, iwidth, iheight);
+                                    : _lens_filter(in, rx, ry, kwidth, lanczos, iwidth, iheight);
     // green carries the mask along
     if(c == 0) pixel.x = px.x;
     else if(c == 1) pixel.yw = px.yw;
