@@ -847,6 +847,41 @@ void spektrafilm_yvv_col_4c(uint3 gid : SV_DispatchThreadID,
   }
 }
 
+// spektrafilm_yvv_col_4c with spektrafilm_diffusion_accum folded into its
+// backward sweep; dst is scratch for the forward sweep
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void spektrafilm_yvv_col_4c_accum(uint3 gid : SV_DispatchThreadID,
+                                  uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float4> dst,
+                                  uniform RWStructuredBuffer<float4> acc,
+                                  uniform int w, uniform int h, uniform float4 B, uniform float4 B2, uniform float4 B3,
+                                  uniform float wr, uniform float wg, uniform float wb, uniform int reset)
+{
+  const int col = gid.y * 16 + gid.x;
+  if(col >= w) return;
+  float4 w1 = src[col], w2 = w1, w3 = w1;
+  for(int i = 0; i < h; i++)
+  {
+    const int k = i * w + col;
+    const float4 v = w1 + fma(B, src[k] - w1, fma(B2, w2 - w1, B3 * (w3 - w1)));
+    dst[k] = v;
+    w3 = w2;
+    w2 = w1;
+    w1 = v;
+  }
+  float4 v1 = dst[(h - 1) * w + col], v2 = v1, v3 = v1;
+  for(int i = h - 1; i >= 0; i--)
+  {
+    const int k = i * w + col;
+    const float4 v = v1 + fma(B, dst[k] - v1, fma(B2, v2 - v1, B3 * (v3 - v1)));
+    const float4 a = reset != 0 ? float4(0.f) : acc[k];
+    acc[k] = float4(fma(wr, v.x, a.x), fma(wg, v.y, a.y), fma(wb, v.z, a.z), v.w);
+    v3 = v2;
+    v2 = v1;
+    v1 = v;
+  }
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void spektrafilm_wide_rows(uint3 gid : SV_DispatchThreadID,
@@ -940,6 +975,29 @@ void spektrafilm_gauss_col_4c(uint3 gid : SV_DispatchThreadID,
     acc = fma(weights[k + radius], src[yy * w + x], acc);
   }
   dst[y * w + x] = acc;
+}
+
+// spektrafilm_gauss_col_4c followed by spektrafilm_diffusion_accum, without
+// storing the blurred value in between
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void spektrafilm_gauss_col_4c_accum(uint3 gid : SV_DispatchThreadID,
+                                    uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float4> acc,
+                                    uniform int w, uniform int h, uniform StructuredBuffer<float4> weights,
+                                    uniform int radius,
+                                    uniform float wr, uniform float wg, uniform float wb, uniform int reset)
+{
+  const int x = gid.x, y = gid.y;
+  if(x >= w || y >= h) return;
+  float4 b = float4(0.0f);
+  for(int k = -radius; k <= radius; k++)
+  {
+    const int yy = clamp(y + k, 0, h - 1);
+    b = fma(weights[k + radius], src[yy * w + x], b);
+  }
+  const int i = y * w + x;
+  const float4 a = reset != 0 ? float4(0.f) : acc[i];
+  acc[i] = float4(fma(wr, b.x, a.x), fma(wg, b.y, a.y), fma(wb, b.z, a.z), b.w);
 }
 
 [shader("compute")]

@@ -3988,7 +3988,10 @@ static int _sf_yvv_blur_slang(dt_slang_gpu_buffer_t *src,
                               dt_slang_gpu_buffer_t *tmp,
                               const int w,
                               const int h,
-                              const float sigma[3])
+                              const float sigma[3],
+                              dt_slang_gpu_buffer_t *acc,
+                              const float *wt,
+                              const int reset)
 {
   float B[4], B2[4], B3[4];
   int passes = 1;
@@ -4014,7 +4017,12 @@ static int _sf_yvv_blur_slang(dt_slang_gpu_buffer_t *src,
     dt_slang_gpu_buffer_t *in = pass ? dst : src;
     err = dt_slang_gpu_run_1d_args("spektrafilm", krow, h, SLBUF_DEV(in), SLBUF_DEV(tmp),
                                    SLARG(w), SLARG(h), SLARG(B), SLARG(B2), SLARG(B3));
-    if(!err)
+    if(!err && acc && pass == passes - 1)
+      err = dt_slang_gpu_run_1d_args("spektrafilm", "spektrafilm_yvv_col_4c_accum", w,
+                                     SLBUF_DEV(tmp), SLBUF_DEV(dst), SLBUF_DEV(acc), SLARG(w),
+                                     SLARG(h), SLARG(B), SLARG(B2), SLARG(B3), SLARG(wt[0]),
+                                     SLARG(wt[1]), SLARG(wt[2]), SLARG(reset));
+    else if(!err)
       err = dt_slang_gpu_run_1d_args("spektrafilm", kcol, w, SLBUF_DEV(tmp), SLBUF_DEV(dst),
                                      SLARG(w), SLARG(h), SLARG(B), SLARG(B2), SLARG(B3));
     // one pass per device submission, as in _sf_yvv_blur_cl()
@@ -4085,14 +4093,17 @@ static int _sf_blur_wide_slang(dt_slang_gpu_buffer_t *src,
 
 /* the exact separable Gaussian of the SF_GAUSS_BLUR* macros in process_cl():
    rows of src into tmp, then columns of tmp into dst, which may be src.
-   `sigma` holds one sigma per color channel for ch == 4 and one for ch == 1 */
+   `sigma` holds one sigma per color channel for ch == 4 and one for ch == 1.
+   With `wt` (ch == 4 only), `dst` is the accumulator of _sf_blur_accum_cl() */
 static int _sf_gauss_exact3_slang(dt_slang_gpu_buffer_t *src,
                                   dt_slang_gpu_buffer_t *dst,
                                   dt_slang_gpu_buffer_t *tmp,
                                   const int w,
                                   const int h,
                                   const float *sigma,
-                                  const int ch)
+                                  const int ch,
+                                  const float *wt,
+                                  const int reset)
 {
   float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
   const int kr = (ch == 4) ? _sf_gauss_kernel4(sigma, kw)
@@ -4103,7 +4114,12 @@ static int _sf_gauss_exact3_slang(dt_slang_gpu_buffer_t *src,
   const char *kcol = (ch == 4) ? "spektrafilm_gauss_col_4c" : "spektrafilm_gauss_col_1c";
   int err = dt_slang_gpu_run_2d_args("spektrafilm", krow, w, h, SLBUF_DEV(src), SLBUF_DEV(tmp),
                                      SLARG(w), SLARG(h), SLBUF_DEV(kw_dev), SLARG(kr));
-  if(!err)
+  if(!err && wt)
+    err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_gauss_col_4c_accum", w, h,
+                                   SLBUF_DEV(tmp), SLBUF_DEV(dst), SLARG(w), SLARG(h),
+                                   SLBUF_DEV(kw_dev), SLARG(kr), SLARG(wt[0]), SLARG(wt[1]),
+                                   SLARG(wt[2]), SLARG(reset));
+  else if(!err)
     err = dt_slang_gpu_run_2d_args("spektrafilm", kcol, w, h, SLBUF_DEV(tmp), SLBUF_DEV(dst),
                                    SLARG(w), SLARG(h), SLBUF_DEV(kw_dev), SLARG(kr));
   dt_slang_gpu_buffer_free(kw_dev);
@@ -4118,7 +4134,8 @@ static int _sf_gauss_exact_slang(dt_slang_gpu_buffer_t *src,
                                  const float sigma,
                                  const int ch)
 {
-  return _sf_gauss_exact3_slang(src, dst, tmp, w, h, (const float[3]){ sigma, sigma, sigma }, ch);
+  return _sf_gauss_exact3_slang(src, dst, tmp, w, h, (const float[3]){ sigma, sigma, sigma }, ch,
+                                NULL, 0);
 }
 
 static int _sf_copy_slang(dt_slang_gpu_buffer_t *src,
@@ -4139,7 +4156,8 @@ static int _sf_blur4_op_slang(dt_slang_gpu_buffer_t *src,
                               const float sigma)
 {
   if(sigma >= SF_GAUSS_EXACT_MAX_SIGMA)
-    return _sf_yvv_blur_slang(src, dst, tmp, w, h, (const float[3]){ sigma, sigma, sigma });
+    return _sf_yvv_blur_slang(src, dst, tmp, w, h, (const float[3]){ sigma, sigma, sigma },
+                              NULL, NULL, 0);
   return _sf_gauss_exact_slang(src, dst, tmp, w, h, sigma, 4);
 }
 
@@ -4171,6 +4189,22 @@ static int _sf_blur_fast_slang(dt_slang_gpu_buffer_t *buf,
   return _sf_blur4_op_slang(buf, buf, tmp, w, h, sigma);
 }
 
+/* _sf_blur_accum_cl() */
+static int _sf_blur_accum_slang(dt_slang_gpu_buffer_t *src,
+                                dt_slang_gpu_buffer_t *acc,
+                                dt_slang_gpu_buffer_t *blur,
+                                dt_slang_gpu_buffer_t *tmp,
+                                const int w,
+                                const int h,
+                                const float sigma[3],
+                                const float wt[3],
+                                const int reset)
+{
+  if(_sf_blur_rounds(sigma[0]))
+    return _sf_yvv_blur_slang(src, blur, tmp, w, h, sigma, acc, wt, reset);
+  return _sf_gauss_exact3_slang(src, acc, tmp, w, h, sigma, 4, wt, reset);
+}
+
 /* _sf_scatter_blur_cl() */
 static int _sf_scatter_blur_slang(dt_slang_gpu_buffer_t *src,
                                   dt_slang_gpu_buffer_t *acc,
@@ -4195,14 +4229,36 @@ static int _sf_scatter_blur_slang(dt_slang_gpu_buffer_t *src,
       sg[i] = member ? sigma[i] : sigma[c];
       wt[i] = member ? weight : 0.0f;
     }
-    err = rounds[c] ? _sf_yvv_blur_slang(src, blur, tmp, w, h, sg)
-                    : _sf_gauss_exact3_slang(src, blur, tmp, w, h, sg, 4);
-    if(!err)
-      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
-                                     SLBUF_DEV(blur), SLBUF_DEV(acc), SLARG(w), SLARG(h),
-                                     SLARG(wt[0]), SLARG(wt[1]), SLARG(wt[2]), SLARG(reset));
+    err = _sf_blur_accum_slang(src, acc, blur, tmp, w, h, sg, wt, reset);
     reset = 0;
   }
+  return err;
+}
+
+/* _sf_diffusion_term_cl() */
+static int _sf_diffusion_term_slang(dt_slang_gpu_buffer_t *src,
+                                    dt_slang_gpu_buffer_t *acc,
+                                    dt_slang_gpu_buffer_t *blur,
+                                    dt_slang_gpu_buffer_t *tmp,
+                                    const int w,
+                                    const int h,
+                                    const int roi_x,
+                                    const int roi_y,
+                                    const float sigma,
+                                    const sf_diffusion_plan_t *plan,
+                                    const int j)
+{
+  const float wt[3] = { plan->wr[j], plan->wg[j], plan->wb[j] };
+  const int reset = (j == 0);
+  if(sigma < SF_WIDE_BLUR_EFFECT_SIGMA)
+    return _sf_blur_accum_slang(src, acc, blur, tmp, w, h,
+                                (const float[3]){ sigma, sigma, sigma }, wt, reset);
+  int wide = 0;
+  int err = _sf_blur_wide_slang(src, blur, w, h, roi_x, roi_y, sigma, &wide);
+  if(!err)
+    err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
+                                   SLBUF_DEV(blur), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                   SLARG(wt[0]), SLARG(wt[1]), SLARG(wt[2]), SLARG(reset));
   return err;
 }
 
@@ -4346,13 +4402,8 @@ gboolean process_slang(dt_iop_module_t *self,
       {
         const float sigma
             = (float)((double)plan.sigma_um[j] * dsc / fmax((double)pixel_um, 1e-3));
-        err = _sf_blur4_wide_op_slang(plane, tmpa, gtmp4, w, h, roi_x, roi_y, sigma);
-        const int reset = (j == 0);
-        const float wr = plan.wr[j], wg = plan.wg[j], wb = plan.wb[j];
-        if(!err)
-          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
-                                         SLBUF_DEV(tmpa), SLBUF_DEV(acc), SLARG(w), SLARG(h),
-                                         SLARG(wr), SLARG(wg), SLARG(wb), SLARG(reset));
+        err = _sf_diffusion_term_slang(plane, acc, tmpa, gtmp4, w, h, roi_x, roi_y, sigma,
+                                       &plan, j);
       }
       const float ps = plan.p_s;
       if(!err)
@@ -4462,17 +4513,23 @@ gboolean process_slang(dt_iop_module_t *self,
       for(int g3 = 0; g3 < 4; g3++)
       {
         /* the same three cuts as process_cl() */
+        const int reset = (g3 == 0);
+        const float a = amp[g3];
+        if(sig[g3] >= SF_GAUSS_MIN_SIGMA && sig[g3] < SF_WIDE_BLUR_MIN_SIGMA)
+        {
+          err = _sf_blur_accum_slang(acc, tmpa, plane2, gtmp4, w, h,
+                                     (const float[3]){ sig[g3], sig[g3], sig[g3] },
+                                     (const float[3]){ a, a, a }, reset);
+          SF_SL_STEP("coupler tail accum");
+          continue;
+        }
         if(sig[g3] >= SF_WIDE_BLUR_MIN_SIGMA)
         {
           int wide = 0;
           err = _sf_blur_wide_slang(acc, plane2, w, h, roi_x, roi_y, sig[g3], &wide);
         }
-        else if(sig[g3] >= SF_GAUSS_MIN_SIGMA)
-          err = _sf_blur4_op_slang(acc, plane2, gtmp4, w, h, sig[g3]);
         else
           err = _sf_copy_slang(acc, plane2, w, h);
-        const int reset = (g3 == 0);
-        const float a = amp[g3];
         if(!err)
           err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
                                          SLBUF_DEV(plane2), SLBUF_DEV(tmpa), SLARG(w), SLARG(h),
@@ -4625,13 +4682,8 @@ gboolean process_slang(dt_iop_module_t *self,
         {
           const float sigma
               = (float)((double)pplan.sigma_um[j] * pdsc / fmax((double)pixel_um, 1e-3));
-          err = _sf_blur4_wide_op_slang(plane, tmpa, gtmp4, w, h, roi_x, roi_y, sigma);
-          const int reset = (j == 0);
-          const float wr = pplan.wr[j], wg = pplan.wg[j], wb = pplan.wb[j];
-          if(!err)
-            err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
-                                           SLBUF_DEV(tmpa), SLBUF_DEV(acc), SLARG(w), SLARG(h),
-                                           SLARG(wr), SLARG(wg), SLARG(wb), SLARG(reset));
+          err = _sf_diffusion_term_slang(plane, acc, tmpa, gtmp4, w, h, roi_x, roi_y, sigma,
+                                         &pplan, j);
         }
         const float ps = pplan.p_s;
         if(!err)
