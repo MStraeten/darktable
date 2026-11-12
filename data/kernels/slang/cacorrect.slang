@@ -36,7 +36,6 @@ import common;
 static const float eps = 1e-5f;
 static const int TILE = 112; // ts - 2 * border in cacorrect.c
 
-float _sqrf(float x) { return x * x; }
 float _interpolatef(float a, float b, float c) { return a * (b - c) + c; }
 
 [shader("compute")]
@@ -124,16 +123,16 @@ void cacorrect_green(uint3 gid : SV_DispatchThreadID,
   const int v1 = ewidth;
   const int v2 = 2 * ewidth;
   const int v3 = 3 * ewidth;
-  const float wtu = fp32_div(1.0f, _sqrf(eps + abs(raw[i + v1] - raw[i - v1])
+  const float wtu = fp32_div(1.0f, fsquare(eps + abs(raw[i + v1] - raw[i - v1])
                                              + abs(raw[i] - raw[i - v2])
                                              + abs(raw[i - v1] - raw[i - v3])));
-  const float wtd = fp32_div(1.0f, _sqrf(eps + abs(raw[i - v1] - raw[i + v1])
+  const float wtd = fp32_div(1.0f, fsquare(eps + abs(raw[i - v1] - raw[i + v1])
                                              + abs(raw[i] - raw[i + v2])
                                              + abs(raw[i + v1] - raw[i + v3])));
-  const float wtl = fp32_div(1.0f, _sqrf(eps + abs(raw[i + 1] - raw[i - 1])
+  const float wtl = fp32_div(1.0f, fsquare(eps + abs(raw[i + 1] - raw[i - 1])
                                              + abs(raw[i] - raw[i - 2])
                                              + abs(raw[i - 1] - raw[i - 3])));
-  const float wtr = fp32_div(1.0f, _sqrf(eps + abs(raw[i - 1] - raw[i + 1])
+  const float wtr = fp32_div(1.0f, fsquare(eps + abs(raw[i - 1] - raw[i + 1])
                                              + abs(raw[i] - raw[i + 2])
                                              + abs(raw[i + 1] - raw[i + 3])));
   green[i] = fp32_div(wtu * raw[i - v1] + wtd * raw[i + v1] + wtl * raw[i - 1] + wtr * raw[i + 1],

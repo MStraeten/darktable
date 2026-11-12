@@ -36,11 +36,6 @@
 #define CA_EPS 1e-5f
 #define CA_TILE 112 // ts - 2 * border in cacorrect.c
 
-static inline float _ca_sqrf(const float x)
-{
-  return x * x;
-}
-
 static inline float _ca_interpolatef(const float a, const float b, const float c)
 {
   return a * (b - c) + c;
@@ -142,18 +137,18 @@ cacorrect_green(global const float *raw,
   const int v1 = ewidth;
   const int v2 = 2 * ewidth;
   const int v3 = 3 * ewidth;
-  const float wtu = fp32_div(1.0f, _ca_sqrf(CA_EPS + fabs(raw[i + v1] - raw[i - v1])
-                                            + fabs(raw[i] - raw[i - v2])
-                                            + fabs(raw[i - v1] - raw[i - v3])));
-  const float wtd = fp32_div(1.0f, _ca_sqrf(CA_EPS + fabs(raw[i - v1] - raw[i + v1])
-                                            + fabs(raw[i] - raw[i + v2])
-                                            + fabs(raw[i + v1] - raw[i + v3])));
-  const float wtl = fp32_div(1.0f, _ca_sqrf(CA_EPS + fabs(raw[i + 1] - raw[i - 1])
-                                            + fabs(raw[i] - raw[i - 2])
-                                            + fabs(raw[i - 1] - raw[i - 3])));
-  const float wtr = fp32_div(1.0f, _ca_sqrf(CA_EPS + fabs(raw[i - 1] - raw[i + 1])
-                                            + fabs(raw[i] - raw[i + 2])
-                                            + fabs(raw[i + 1] - raw[i + 3])));
+  const float wtu = fp32_div(1.0f, fsquare(CA_EPS + fabs(raw[i + v1] - raw[i - v1])
+                                           + fabs(raw[i] - raw[i - v2])
+                                           + fabs(raw[i - v1] - raw[i - v3])));
+  const float wtd = fp32_div(1.0f, fsquare(CA_EPS + fabs(raw[i - v1] - raw[i + v1])
+                                           + fabs(raw[i] - raw[i + v2])
+                                           + fabs(raw[i + v1] - raw[i + v3])));
+  const float wtl = fp32_div(1.0f, fsquare(CA_EPS + fabs(raw[i + 1] - raw[i - 1])
+                                           + fabs(raw[i] - raw[i - 2])
+                                           + fabs(raw[i - 1] - raw[i - 3])));
+  const float wtr = fp32_div(1.0f, fsquare(CA_EPS + fabs(raw[i - 1] - raw[i + 1])
+                                           + fabs(raw[i] - raw[i + 2])
+                                           + fabs(raw[i + 1] - raw[i + 3])));
   green[i] = fp32_div(wtu * raw[i - v1] + wtd * raw[i + v1] + wtl * raw[i - 1] + wtr * raw[i + 1],
                       wtu + wtd + wtl + wtr);
 }
