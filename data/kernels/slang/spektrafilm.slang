@@ -792,7 +792,7 @@ void spektrafilm_passthrough(uint3 gid : SV_DispatchThreadID,
 [numthreads(16, 16, 1)]
 void spektrafilm_yvv_row_4c(uint3 gid : SV_DispatchThreadID,
                             uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float4> dst,
-                            uniform int w, uniform int h, uniform float B, uniform float B2, uniform float B3)
+                            uniform int w, uniform int h, uniform float4 B, uniform float4 B2, uniform float4 B3)
 {
   const int row = gid.y * 16 + gid.x;
   if(row >= h) return;
@@ -821,7 +821,7 @@ void spektrafilm_yvv_row_4c(uint3 gid : SV_DispatchThreadID,
 [numthreads(16, 16, 1)]
 void spektrafilm_yvv_col_4c(uint3 gid : SV_DispatchThreadID,
                             uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float4> dst,
-                            uniform int w, uniform int h, uniform float B, uniform float B2, uniform float B3)
+                            uniform int w, uniform int h, uniform float4 B, uniform float4 B2, uniform float4 B3)
 {
   const int col = gid.y * 16 + gid.x;
   if(col >= w) return;
@@ -840,65 +840,6 @@ void spektrafilm_yvv_col_4c(uint3 gid : SV_DispatchThreadID,
   {
     const int k = i * w + col;
     const float4 v = v1 + fma(B, dst[k] - v1, fma(B2, v2 - v1, B3 * (v3 - v1)));
-    dst[k] = v;
-    v3 = v2;
-    v2 = v1;
-    v1 = v;
-  }
-}
-
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void spektrafilm_yvv_row_1c(uint3 gid : SV_DispatchThreadID,
-                            uniform StructuredBuffer<float> src, uniform RWStructuredBuffer<float> dst,
-                            uniform int w, uniform int h, uniform float B, uniform float B2, uniform float B3)
-{
-  const int row = gid.y * 16 + gid.x;
-  if(row >= h) return;
-  const int o = row * w;
-  float w1 = src[o], w2 = src[o], w3 = src[o];
-  for(int j = 0; j < w; j++)
-  {
-    const float v = w1 + fma(B, src[o + j] - w1, fma(B2, w2 - w1, B3 * (w3 - w1)));
-    dst[o + j] = v;
-    w3 = w2;
-    w2 = w1;
-    w1 = v;
-  }
-  float v1 = dst[o + w - 1], v2 = v1, v3 = v1;
-  for(int j = w - 1; j >= 0; j--)
-  {
-    const float v = v1 + fma(B, dst[o + j] - v1, fma(B2, v2 - v1, B3 * (v3 - v1)));
-    dst[o + j] = v;
-    v3 = v2;
-    v2 = v1;
-    v1 = v;
-  }
-}
-
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void spektrafilm_yvv_col_1c(uint3 gid : SV_DispatchThreadID,
-                            uniform StructuredBuffer<float> src, uniform RWStructuredBuffer<float> dst,
-                            uniform int w, uniform int h, uniform float B, uniform float B2, uniform float B3)
-{
-  const int col = gid.y * 16 + gid.x;
-  if(col >= w) return;
-  float w1 = src[col], w2 = w1, w3 = w1;
-  for(int i = 0; i < h; i++)
-  {
-    const int k = i * w + col;
-    const float v = w1 + fma(B, src[k] - w1, fma(B2, w2 - w1, B3 * (w3 - w1)));
-    dst[k] = v;
-    w3 = w2;
-    w2 = w1;
-    w1 = v;
-  }
-  float v1 = dst[(h - 1) * w + col], v2 = v1, v3 = v1;
-  for(int i = h - 1; i >= 0; i--)
-  {
-    const int k = i * w + col;
-    const float v = v1 + fma(B, dst[k] - v1, fma(B2, v2 - v1, B3 * (v3 - v1)));
     dst[k] = v;
     v3 = v2;
     v2 = v1;
@@ -969,7 +910,7 @@ void spektrafilm_wide_up(uint3 gid : SV_DispatchThreadID,
 [numthreads(16, 16, 1)]
 void spektrafilm_gauss_row_4c(uint3 gid : SV_DispatchThreadID,
                               uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float4> dst,
-                              uniform int w, uniform int h, uniform StructuredBuffer<float> weights,
+                              uniform int w, uniform int h, uniform StructuredBuffer<float4> weights,
                               uniform int radius)
 {
   const int x = gid.x, y = gid.y;
@@ -978,7 +919,7 @@ void spektrafilm_gauss_row_4c(uint3 gid : SV_DispatchThreadID,
   for(int k = -radius; k <= radius; k++)
   {
     const int xx = clamp(x + k, 0, w - 1);
-    acc = fma(float4(weights[k + radius]), src[y * w + xx], acc);
+    acc = fma(weights[k + radius], src[y * w + xx], acc);
   }
   dst[y * w + x] = acc;
 }
@@ -987,7 +928,7 @@ void spektrafilm_gauss_row_4c(uint3 gid : SV_DispatchThreadID,
 [numthreads(16, 16, 1)]
 void spektrafilm_gauss_col_4c(uint3 gid : SV_DispatchThreadID,
                               uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float4> dst,
-                              uniform int w, uniform int h, uniform StructuredBuffer<float> weights,
+                              uniform int w, uniform int h, uniform StructuredBuffer<float4> weights,
                               uniform int radius)
 {
   const int x = gid.x, y = gid.y;
@@ -996,7 +937,7 @@ void spektrafilm_gauss_col_4c(uint3 gid : SV_DispatchThreadID,
   for(int k = -radius; k <= radius; k++)
   {
     const int yy = clamp(y + k, 0, h - 1);
-    acc = fma(float4(weights[k + radius]), src[yy * w + x], acc);
+    acc = fma(weights[k + radius], src[yy * w + x], acc);
   }
   dst[y * w + x] = acc;
 }
@@ -1071,39 +1012,6 @@ void spektrafilm_accum(uint3 gid : SV_DispatchThreadID,
   a.x = fma(wk, b.x, a.x);
   a.y = fma(wk, b.y, a.y);
   a.z = fma(wk, b.z, a.z);
-  acc[k] = a;
-}
-
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void spektrafilm_channel_extract(uint3 gid : SV_DispatchThreadID,
-                                 uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float> dst,
-                                 uniform int w, uniform int h, uniform int channel)
-{
-  const int x = gid.x, y = gid.y;
-  if(x >= w || y >= h) return;
-  const int k = y * w + x;
-  const float4 s = src[k];
-  dst[k] = (channel == 0) ? s.x : (channel == 1) ? s.y : s.z;
-}
-
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void spektrafilm_channel_accum(uint3 gid : SV_DispatchThreadID,
-                               uniform StructuredBuffer<float> blurred, uniform RWStructuredBuffer<float4> acc,
-                               uniform int w, uniform int h, uniform float weight, uniform int channel,
-                               uniform int reset)
-{
-  const int x = gid.x, y = gid.y;
-  if(x >= w || y >= h) return;
-  const int k = y * w + x;
-  const float bv = blurred[k];
-  float4 a = reset != 0 ? float4(0.f) : acc[k];
-  const float av = (channel == 0) ? a.x : (channel == 1) ? a.y : a.z;
-  const float nv = fma(weight, bv, av);
-  if(channel == 0) a.x = nv;
-  else if(channel == 1) a.y = nv;
-  else a.z = nv;
   acc[k] = a;
 }
 
