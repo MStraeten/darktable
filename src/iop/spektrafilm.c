@@ -3999,7 +3999,9 @@ static int _sf_yvv_blur_slang(dt_slang_gpu_buffer_t *src,
   {
     float b[4];
     float pass_sigma = sigma[c];
-    passes = sf_gauss_iir_passes(sigma[c], &pass_sigma);
+    const int n = sf_gauss_iir_passes(sigma[c], &pass_sigma);
+    if(c > 0 && n != passes) return 1;
+    passes = n;
     sf_gauss_yvv_coeffs(pass_sigma, b);
     B[c] = b[0];
     B2[c] = b[2];
@@ -4038,15 +4040,12 @@ static int _sf_blur_wide_slang(dt_slang_gpu_buffer_t *src,
                                const int h,
                                const int roi_x,
                                const int roi_y,
-                               const float sigma,
-                               int *const done)
+                               const float sigma)
 {
   int k, lw, lh, ox, oy;
   float sigma_low;
-  *done = 0;
   if(!sf_wide_blur_plan(sigma, w, h, roi_x, roi_y, &k, &sigma_low, &lw, &lh, &ox, &oy))
-    return 0;
-  *done = 1;
+    return 1;
   float *inv = dt_alloc_align_float((size_t)k + 1);
   float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
   const int kr = _sf_gauss_kernel4((const float[3]){ sigma_low, sigma_low, sigma_low }, kw);
@@ -4173,8 +4172,7 @@ static int _sf_blur4_wide_op_slang(dt_slang_gpu_buffer_t *src,
 {
   if(sigma >= SF_WIDE_BLUR_EFFECT_SIGMA)
   {
-    int wide = 0;
-    return _sf_blur_wide_slang(src, dst, w, h, roi_x, roi_y, sigma, &wide);
+    return _sf_blur_wide_slang(src, dst, w, h, roi_x, roi_y, sigma);
   }
   return _sf_blur4_op_slang(src, dst, tmp, w, h, sigma);
 }
@@ -4200,7 +4198,9 @@ static int _sf_blur_accum_slang(dt_slang_gpu_buffer_t *src,
                                 const float wt[3],
                                 const int reset)
 {
-  if(_sf_blur_rounds(sigma[0]))
+  const int rounds = _sf_blur_rounds(sigma[0]);
+  if(_sf_blur_rounds(sigma[1]) != rounds || _sf_blur_rounds(sigma[2]) != rounds) return 1;
+  if(rounds)
     return _sf_yvv_blur_slang(src, blur, tmp, w, h, sigma, acc, wt, reset);
   return _sf_gauss_exact3_slang(src, acc, tmp, w, h, sigma, 4, wt, reset);
 }
@@ -4253,8 +4253,7 @@ static int _sf_diffusion_term_slang(dt_slang_gpu_buffer_t *src,
   if(sigma < SF_WIDE_BLUR_EFFECT_SIGMA)
     return _sf_blur_accum_slang(src, acc, blur, tmp, w, h,
                                 (const float[3]){ sigma, sigma, sigma }, wt, reset);
-  int wide = 0;
-  int err = _sf_blur_wide_slang(src, blur, w, h, roi_x, roi_y, sigma, &wide);
+  int err = _sf_blur_wide_slang(src, blur, w, h, roi_x, roi_y, sigma);
   if(!err)
     err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
                                    SLBUF_DEV(blur), SLBUF_DEV(acc), SLARG(w), SLARG(h),
@@ -4525,8 +4524,7 @@ gboolean process_slang(dt_iop_module_t *self,
         }
         if(sig[g3] >= SF_WIDE_BLUR_MIN_SIGMA)
         {
-          int wide = 0;
-          err = _sf_blur_wide_slang(acc, plane2, w, h, roi_x, roi_y, sig[g3], &wide);
+          err = _sf_blur_wide_slang(acc, plane2, w, h, roi_x, roi_y, sig[g3]);
         }
         else
           err = _sf_copy_slang(acc, plane2, w, h);
@@ -4541,8 +4539,7 @@ gboolean process_slang(dt_iop_module_t *self,
     {
       if(csigma >= SF_WIDE_BLUR_MIN_SIGMA)
       {
-        int wide = 0;
-        err = _sf_blur_wide_slang(acc, acc, w, h, roi_x, roi_y, csigma, &wide);
+        err = _sf_blur_wide_slang(acc, acc, w, h, roi_x, roi_y, csigma);
         SF_SL_STEP("coupler blur");
       }
       else if(csigma >= SF_GAUSS_MIN_SIGMA)
