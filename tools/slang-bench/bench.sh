@@ -10,6 +10,9 @@
 # "reference" uses fixed, machine-independent memory limits and tiles more)
 # extra darktable-cli arguments for every run can be passed in BENCH_ARGS
 # IMG sets the raw to export (default: the integration tests' mire1.cr2)
+# XMP sets the edit: a path, or "heavy" for heavy.xmp (the same edit plus
+# diffuse and drawn masks with feathering, blur, groups, parametric ranges
+# and details refinement); default scene-referred.xmp
 set -u
 # darktable prints its timings in the user's locale ("took 1,637 secs" in
 # German), which the patterns below do not read
@@ -22,6 +25,9 @@ CLI=$SRC/build/bin/darktable-cli
 IMG=${IMG:-$SRC/src/tests/integration/images/mire1.cr2}
 [ -f "$IMG" ] || { echo "no such image: $IMG" >&2; exit 1; }
 IMG=$(cd "$(dirname "$IMG")" && pwd)/$(basename "$IMG")
+XMP=${XMP:-scene-referred}
+case $XMP in */*|*.xmp) ;; *) XMP=$HERE/$XMP.xmp ;; esac
+[ -f "$XMP" ] || { echo "no such edit: $XMP" >&2; exit 1; }
 # darktable picks the loader by extension, so the links keep the raw's own
 EXT=${IMG##*.}
 DE=$SRC/src/tests/integration/deltae
@@ -38,13 +44,13 @@ for i in $(seq 1 $N); do ln -s "$IMG" "$OUT/in/img$i.$EXT"; done
 run() { # <name> [extra args]
   local name=$1; shift
   mkdir -p "$OUT/$name"
-  "$CLI" "$OUT/in" "$HERE/scene-referred.xmp" "$OUT/$name/\$(FILE_NAME).png" \
+  "$CLI" "$OUT/in" "$XMP" "$OUT/$name/\$(FILE_NAME).png" \
     --width $SIZE --height $SIZE --hq true --apply-custom-presets false \
     --core --configdir "$OUT/config-$name" --conf host_memory_limit=8192 --conf resourcelevel=$RESOURCES \
     --conf plugins/lighttable/export/force_lcms2=FALSE \
     --conf plugins/lighttable/export/pixel_interpolator=lanczos3 \
     --conf plugins/lighttable/export/pixel_interpolator_warp=bicubic \
-    --conf plugins/lighttable/export/iccintent=0 -d perf -d pipe -d opencl -d slang ${BENCH_ARGS:-} "$@" > "$OUT/$name.log" 2>&1
+    --conf plugins/lighttable/export/iccintent=0 -d perf -d pipe -d opencl -d slang -d masks -d imageio ${BENCH_ARGS:-} "$@" > "$OUT/$name.log" 2>&1
   echo "$name exit $?"
 }
 run cpu    --disable-opencl --conf slang_gpu=FALSE
@@ -58,7 +64,9 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
   echo "- os: $(uname -srm)"
   echo "- cpu: ${cpu# }"
   echo "- commit: $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null)"
-  echo "- image: $(basename "$IMG")"
+  echo "- image: $(basename "$IMG"), $(grep -m1 -oE 'export imgid [0-9]+, [0-9]+x[0-9]+' "$OUT/cpu.log" | awk '{print $NF}')"
+  echo "- edit: $(basename "$XMP")"
+  echo "- module memory: opencl $(grep -m1 -oE 'AVAILABLE MEM SIZE: +[0-9]+ MB' "$OUT/opencl.log" | grep -oE '[0-9]+ MB' || echo 'no OpenCL device'), slang $(grep -m1 -oE 'modules may use [0-9]+ MB' "$OUT/slang.log" | grep -oE '[0-9]+ MB' || echo 'not logged (Metal or no Slang device)')"
   echo "- slang device: $(grep -m1 -oE 'using (Vulkan|Metal) device .*' "$OUT/slang.log" | cut -d' ' -f2-)"
   echo "- opencl devices: $(grep -E "^ +DEVICE: +[0-9]+: '" "$OUT/opencl.log" | sed -E "s/.*DEVICE: +[0-9]+: ('[^']*').*/\1/" | tr '\n' ' ')"
   echo "- export size: $([ "$SIZE" = 0 ] && echo full resolution || echo "${SIZE} px"), resourcelevel: $RESOURCES"
@@ -78,6 +86,13 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
     first=$(echo "$ms" | head -1)
     over=$([ -n "$med" ] && [ -n "$first" ] && echo "$((first - med))")
     echo "| $p | $t | ${med:--} | ${over:--} |"
+  done
+  echo
+  echo; echo "drawn mask rendering on the host, ms per export (median of exports 2-$N):"; echo
+  for p in cpu opencl slang; do
+    # each export renders the masks of every masked module; sum them per export
+    ms=$(awk '/render all masks took/{t+=$(NF-1)} /pixel pipeline processing took/{printf "%.0f\n", t*1000; t=0}' "$OUT/$p.log" | tail -n +2 | sort -n | awk '{v[NR]=$1} END{if(NR) print v[int((NR+1)/2)]}')
+    echo "- $p: ${ms:-none}"
   done
   echo
   echo "- slang device and kernel preparation at startup: $(grep -m1 -oE 'preparing the (Metal|Vulkan) device( and kernels)? took [0-9.]+ secs' "$OUT/slang.log" | sed -E 's/.*took ([0-9.]+) secs/\1 s/')"

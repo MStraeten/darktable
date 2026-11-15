@@ -53,6 +53,27 @@ is full resolution). `RESOURCES` sets darktable's `resourcelevel`: the default,
 tiled because of it. Extra `darktable-cli` arguments go in `BENCH_ARGS`, for
 example to pick an OpenCL platform.
 
+### heavy edit, other raws
+
+`XMP=heavy` runs `heavy.xmp` instead: the same edit plus diffuse, with
+drawn masks on three modules (circle, ellipse, path, brush and gradient,
+nested mask groups, an inverted group), feathering, mask blur, parametric
+ranges and details refinement. `XMP` also takes the path of your own xmp.
+`IMG` exports another raw, for example a 30 or 60 MP one:
+
+```bash
+IMG=/path/to/large.raw XMP=heavy bash <darktable>/tools/slang-bench/bench.sh <darktable> 3
+```
+
+`heavy.xmp` leaves the raw's black levels and crop to the camera and sets
+white balance to camera reference, so it suits any raw. The default
+`scene-referred.xmp` carries mire1's black levels and white balance, so
+other raws come out with a strong color cast under it. For each path the
+summary adds the image size, the memory darktable allowed the GPU modules,
+and the time spent rendering the drawn masks on the host.
+
+### devices
+
 With several Vulkan devices, Slang uses a discrete GPU first, then an
 integrated one. To choose another, pass its index or part of its name, for
 example `BENCH_ARGS="--conf slang_gpu_device=nvidia"`; `slang.log` lists
