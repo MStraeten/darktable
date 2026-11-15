@@ -122,6 +122,12 @@ gboolean dt_slang_gpu_avoid_module(const char *op);
 // without memory of its own, or automatic if it is not set
 float dt_slang_gpu_unified_fraction(const float automatic);
 
+// the most memory a module may use on a device with device_memory bytes,
+// by the rule dt_opencl_update_settings() applies to an OpenCL device:
+// resource level fraction and headroom, opencl_tune_headroom, and the
+// unified fraction for a device without memory of its own
+size_t dt_slang_gpu_memory_limit(const size_t device_memory, const gboolean unified);
+
 // sets up the device and loads every kernel in a background thread, so that
 // the first module doesn't wait for that. Does nothing unless slang_gpu is set.
 void dt_slang_gpu_prepare(void);

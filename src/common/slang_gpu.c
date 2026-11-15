@@ -21,6 +21,7 @@
 
 #include "common/slang_gpu.h"
 #include "common/darktable.h"
+#include "common/opencl.h"
 #include "control/conf.h"
 #include "control/control.h"
 #include "common/utility.h"
@@ -64,6 +65,31 @@ float dt_slang_gpu_unified_fraction(const float automatic)
 {
   const float fraction = dt_conf_get_float("slang_gpu_unified_fraction");
   return fraction > 0.0f ? CLAMP(fraction, 0.02f, 0.9f) : automatic;
+}
+
+size_t dt_slang_gpu_memory_limit(const size_t device_memory, const gboolean unified)
+{
+  // the same numbers as OpenCL (opencl.c, dt_opencl_update_settings()), so
+  // that both paths keep the same margin and tile the same modules. Unlike
+  // OpenCL, tuned headroom doesn't need a second device: Slang has only one
+  const dt_sys_resources_t *res = &darktable.dtresources;
+  const int level = res->level;
+  const size_t lowmem = 256ul * DT_MEGA;
+  const size_t headroom = DT_OPENCL_DEFAULT_HEADROOM * DT_MEGA;
+  size_t limit;
+  if(level < 0)
+    limit = (size_t)res->refresource[4 * (-level - 1) + 3] * DT_MEGA;
+  else if(!dt_gimpmode() && dt_conf_get_bool("opencl_tune_headroom"))
+    limit = device_memory > headroom ? device_memory - headroom : lowmem;
+  else
+  {
+    const size_t disposable = device_memory > headroom ? device_memory - headroom : 0;
+    const int fraction = MIN(1024, res->fractions[4 * level + 3]);
+    limit = MAX(lowmem, disposable / 1024ul * fraction);
+  }
+  if(unified)
+    limit = MIN(limit, (size_t)(res->total_memory * dt_slang_gpu_unified_fraction(0.25f)));
+  return limit;
 }
 
 gboolean dt_slang_gpu_avoid_module(const char *op)

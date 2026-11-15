@@ -1761,7 +1761,7 @@ static void _preferences_slang_device(GtkGrid *grid,
   gtk_size_group_add_widget(widget_group, widget);
   gtk_widget_set_tooltip_text(widget, _("the most device memory a module may use on the Slang GPU path"
                                         " before it is processed in tiles.\n"
-                                        "0 uses what the device reports as free"));
+                                        "0 uses the same limit as an OpenCL device"));
   g_signal_connect(widget, "value-changed", G_CALLBACK(_slang_memory_changed), NULL);
   gtk_grid_attach(grid, label, 0, *line, 1, 1);
   gtk_grid_attach(grid, widget, 2, (*line)++, 1, 1);

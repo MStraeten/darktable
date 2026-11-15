@@ -582,7 +582,7 @@
     <type min="0">int</type>
     <default>0</default>
     <shortdescription>device memory for the Slang GPU kernels (MB)</shortdescription>
-    <longdescription>experimental: the most device memory, in MB, a module may use on the Slang GPU path before it is processed in tiles. 0 uses what the device reports as free</longdescription>
+    <longdescription>experimental: the most device memory, in MB, a module may use on the Slang GPU path before it is processed in tiles. 0 uses the same limit as an OpenCL device (resource level, tuned GPU memory, unified fraction), lowered when the device reports less free</longdescription>
   </dtconfig>
   <dtconfig>
     <name>slang_gpu_private_memory</name>
@@ -596,7 +596,7 @@
     <type min="0.0" max="0.9">float</type>
     <default>0.0</default>
     <shortdescription>share of system memory for a Slang GPU without memory of its own</shortdescription>
-    <longdescription>experimental: the share of system memory the Slang GPU path may use on an integrated GPU or Apple silicon, like the unified fraction of an OpenCL device. 0 uses a quarter of it on Vulkan and what macOS recommends on Metal</longdescription>
+    <longdescription>experimental: the share of system memory the Slang GPU path may use on an integrated GPU or Apple silicon, like the unified fraction of an OpenCL device. 0 uses a quarter of it, as OpenCL does</longdescription>
   </dtconfig>
   <dtconfig>
     <name>slang_gpu_avoid</name>

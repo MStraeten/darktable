@@ -1111,13 +1111,13 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
   // what the pools keep counts as allocated although it would be freed for
   // the module
   const size_t pooled = _pooled_bytes();
-  // macOS recommends most of the system memory to a unified-memory GPU,
-  // which slang_gpu_unified_fraction can lower as OpenCL's unified_fraction does
-  size_t limit = _mtl.dev.recommendedMaxWorkingSetSize;
-  if(_mtl.dev.hasUnifiedMemory)
-    limit = MIN(limit, (size_t)(darktable.dtresources.total_memory * dt_slang_gpu_unified_fraction(1.0f)));
+  const size_t recommended = _mtl.dev.recommendedMaxWorkingSetSize;
   const size_t used = _mtl.dev.currentAllocatedSize > pooled ? _mtl.dev.currentAllocatedSize - pooled : 0;
-  size_t best = limit > used ? limit - used : 0;
+  // OpenCL's limit for the device, lowered only when the device is nearly
+  // full. macOS recommends most of the system memory to a unified-memory
+  // GPU, so there the unified fraction sets the limit, as on OpenCL
+  size_t best = recommended > used ? recommended - used : 0;
+  best = MIN(best, dt_slang_gpu_memory_limit(recommended, _mtl.dev.hasUnifiedMemory));
   const int cap = dt_conf_get_int("slang_gpu_memory");
   if(cap > 0) best = MIN(best, (size_t)cap << 20);
   *available = best;

@@ -95,6 +95,7 @@ typedef struct dt_slang_vulkan_t
   float timestamp_period; // ns per timestamp tick
   VkDeviceSize pool_budget; // bytes the image and buffer pools may keep together
   VkDeviceSize host_cap;    // integrated GPU: bytes of system memory the host heaps may hold, 0 for no cap
+  VkDeviceSize device_memory; // what dt_slang_gpu_memory_limit() is given: the largest device heap, all heaps on an integrated GPU
   uint32_t host_heaps;      // bit mask of the heaps that are system memory
   gboolean memory_budget;   // VK_EXT_memory_budget reports the free device memory
   gboolean discrete;        // the device has memory of its own, which OpenCL shares
@@ -287,6 +288,9 @@ static gboolean _init_device(void)
       all_heaps += _vk.memprops.memoryHeaps[h].size;
     }
   if(!_vk.discrete) _vk.pool_budget = all_heaps / 2;
+  for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
+    if(_device_heap(h))
+      _vk.device_memory = _vk.discrete ? MAX(_vk.device_memory, _vk.memprops.memoryHeaps[h].size) : all_heaps;
 
   // an integrated GPU's memory is system memory, except a carve-out the
   // firmware reserves, which shows as a device local heap next to a host
@@ -309,8 +313,13 @@ static gboolean _init_device(void)
     _vk.pool_budget = MIN(_vk.pool_budget, (VkDeviceSize)cap << 20);
   }
   if(_vk.host_cap) _vk.pool_budget = MIN(_vk.pool_budget, _vk.host_cap / 2);
-  dt_print(DT_DEBUG_SLANG, "[slang_gpu] pools keep up to %" PRIu64 " MB, system memory capped at %" PRIu64 " MB",
-           (uint64_t)(_vk.pool_budget >> 20), (uint64_t)(_vk.host_cap >> 20));
+  // the pools are idle memory OpenCL would not hold, so they stay within
+  // half of what a module may use
+  const VkDeviceSize limit = dt_slang_gpu_memory_limit(_vk.device_memory, !_vk.discrete);
+  _vk.pool_budget = MIN(_vk.pool_budget, limit / 2);
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] modules may use %" PRIu64 " MB, pools keep up to %" PRIu64 " MB,"
+           " system memory capped at %" PRIu64 " MB",
+           (uint64_t)(limit >> 20), (uint64_t)(_vk.pool_budget >> 20), (uint64_t)(_vk.host_cap >> 20));
 
   uint32_t next = 0;
   vkEnumerateDeviceExtensionProperties(_vk.pdev, NULL, &next, NULL);
@@ -2532,13 +2541,9 @@ void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
     }
   }
   else
-    for(uint32_t h = 0; h < _vk.memprops.memoryHeapCount; h++)
-      if(_device_heap(h))
-      {
-        VkDeviceSize usable = _vk.memprops.memoryHeaps[h].size / 4 * 3;
-        if(_vk.host_cap && (_vk.host_heaps & (1u << h))) usable = MIN(usable, _vk.host_cap);
-        best = _vk.discrete ? MAX(best, usable) : best + usable;
-      }
+    best = _vk.device_memory;
+  // the live budget only lowers OpenCL's limit, for other programs on the device
+  best = MIN(best, dt_slang_gpu_memory_limit(_vk.device_memory, !_vk.discrete));
   const int cap = dt_conf_get_int("slang_gpu_memory");
   if(cap > 0) best = MIN(best, (VkDeviceSize)cap << 20);
   *available = best;
