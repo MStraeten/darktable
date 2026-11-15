@@ -2337,6 +2337,16 @@ static gboolean _slang_blend_possible(dt_iop_module_t *module,
          || (ch_in == ch_out && dt_develop_blend_slang_supported(module, piece, roi_in, roi_out));
 }
 
+// the module's or the blend's output. On unified memory it can be the
+// cacheline, which makes syncing the cacheline free
+static dt_slang_gpu_image_t *_slang_output_image(const dt_iop_roi_t *roi_out,
+                                                 const int ch_out,
+                                                 void *output)
+{
+  dt_slang_gpu_image_t *img = dt_slang_gpu_image_alias(roi_out->width, roi_out->height, ch_out, output);
+  return img ? img : dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL);
+}
+
 // a 1-channel float image of uint16 raw data
 static dt_slang_gpu_image_t *_slang_upload_u16(const int width,
                                                const int height,
@@ -2460,16 +2470,18 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   const dt_iop_colorspace_type_t cst_to = module->input_colorspace(module, pipe, piece);
   const gboolean convert = input_format->cst != cst_to;
 
-  // sized like dt_opencl_image_fits_device(), plus the images a conversion
-  // on the device and blending add. A module that doesn't fit runs in tiles
-  // from the CPU path, which then also converts, collects the histogram and
-  // blends on the host.
+  // sized like dt_opencl_image_fits_device(), plus the image a conversion
+  // on the device adds. Blending is counted as on OpenCL, in the larger of
+  // the module's and the blend's requirements: the blend's output is only
+  // allocated once the module has run. A module that doesn't fit runs in
+  // tiles from the CPU path, which then also converts, collects the
+  // histogram and blends on the host.
   size_t available = 0;
   int max_dim = 0;
   dt_slang_gpu_memory_info(&available, &max_dim);
   const int m_width = MAX(roi_in->width, roi_out->width);
   const int m_height = MAX(roi_in->height, roi_out->height);
-  const float images = tiling->factor_cl + (convert ? 1.0f : 0.0f) + (_piece_wants_blending(piece) ? 1.0f : 0.0f);
+  const float images = tiling->factor_cl + (convert ? 1.0f : 0.0f);
   const float needed = 4.0f * sizeof(float) * m_width * m_height * images + tiling->overhead;
   const gboolean too_large = m_width > max_dim || m_height > max_dim;
   // as OpenCL's fast tiling: a module that doesn't fit runs in strips copied
@@ -2483,9 +2495,8 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   {
     const size_t iplane = sizeof(float) * ch_in * roi_in->width * roi_in->height;
     const size_t oplane = sizeof(float) * ch_out * roi_out->width * roi_out->height;
-    // a converted input and a blended module's own output are full images too
-    const size_t full = iplane + oplane + (convert ? iplane : 0)
-                        + (_piece_wants_blending(piece) ? oplane : 0) + tiling->overhead;
+    // a converted input is a full image too
+    const size_t full = iplane + oplane + (convert ? iplane : 0) + tiling->overhead;
     if(available > full + DT_MEGA)
     {
       strip_avail = available - full;
@@ -2593,15 +2604,6 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                              converted || (!converted_on_device && (!on_device || pipe->slang_host_valid))
                                ? host_in : NULL,
                              roi_in, module, piece, pixelpipe_flow);
-  // on unified memory the output can be its cacheline, which makes syncing
-  // the cacheline free
-  dt_slang_gpu_image_t *dev_out = NULL;
-  if(dev_in)
-  {
-    dev_out = dt_slang_gpu_image_alias(roi_out->width, roi_out->height, ch_out, *output);
-    if(!dev_out) dev_out = dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL);
-  }
-
   const dt_iop_colorspace_type_t cst_out = module->output_colorspace(module, pipe, piece);
   dt_print_pipe(DT_DEBUG_PIPE,
                 on_device || (resident && converted_on_device) ? "process slang" : "process slang, upload",
@@ -2614,11 +2616,12 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   // demosaic in a thumbnail's downscaling pipe, which is expected. Kernels
   // that fail are reported by the dispatcher.
   // a blended module writes its own output to a separate image, which the
-  // blend then mixes with the input into dev_out
+  // blend then mixes with the input into dev_out. dev_out is allocated after
+  // the module ran, so that the module's own buffers are back in the pools
   const gboolean blending = _piece_wants_blending(piece);
-  dt_slang_gpu_image_t *dev_module = dev_out && blending
-    ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL)
-    : dev_out;
+  dt_slang_gpu_image_t *dev_module = !dev_in ? NULL
+    : blending ? dt_slang_gpu_image_new(roi_out->width, roi_out->height, ch_out, NULL)
+               : _slang_output_image(roi_out, ch_out, *output);
   // the pipe's dsc as the module got it, for the CPU run of --opencl-diffstat
   const dt_iop_buffer_dsc_t dsc_in = pipe->dsc;
   gboolean ok = dev_module
@@ -2629,8 +2632,13 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   if(ok)
     _slang_diff_against_cpu(pipe, module, piece, &dsc_in, raw_u16 ? input : NULL, dev_in, dev_module,
                             *output, roi_in, roi_out, ch_in, ch_out);
+  dt_slang_gpu_image_t *dev_out = blending ? NULL : dev_module;
   if(ok && blending)
-    ok = dt_develop_blend_process_slang(module, piece, dev_in, dev_module, dev_out, roi_in, roi_out);
+  {
+    dev_out = _slang_output_image(roi_out, ch_out, *output);
+    ok = dev_out
+      && dt_develop_blend_process_slang(module, piece, dev_in, dev_module, dev_out, roi_in, roi_out);
+  }
   if(blending) dt_slang_gpu_image_free(dev_module);
   if(!ok)
   {
