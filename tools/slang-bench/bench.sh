@@ -98,7 +98,8 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
   echo "- slang device and kernel preparation at startup: $(grep -m1 -oE 'preparing the (Metal|Vulkan) device( and kernels)? took [0-9.]+ secs' "$OUT/slang.log" | sed -E 's/.*took ([0-9.]+) secs/\1 s/')"
   echo; echo "module runs over all $N exports:"; echo
   for p in opencl slang; do
-    echo "- $p: $(grep -c "processed .* on GPU" "$OUT/$p.log") on GPU; on CPU: $(grep "processed .* on CPU" "$OUT/$p.log" | sed -E "s/.*processed .([a-z0-9_]+). on CPU.*/\1/" | sort | uniq -c | awk '{printf "%s(%s) ", $2, $1}')"
+    # where the module ran, not where it was blended ("on GPU, blended on CPU")
+    echo "- $p: $(grep -cE "processed .[^']+' on GPU" "$OUT/$p.log") on GPU; on CPU: $(grep -E "processed .[^']+' on CPU" "$OUT/$p.log" | sed -E "s/.*processed .([^']+)' on CPU.*/\1/" | sort | uniq -c | awk '{printf "%s(%s) ", $2, $1}')"
   done
   echo "- slang fallbacks/failures: $(grep -ciE 'slang (fallback|failure)' "$OUT/slang.log")"
   echo; echo "slang per-module time, last export (ms; GPU work is async, so trust the pipe total):"; echo
