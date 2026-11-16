@@ -251,14 +251,11 @@ void markesteijn_solitary_green(uint3 gid : SV_DispatchThreadID,
 
   const int glidx = y * width + x;
 
-  float color[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-  float ocolor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-
-  if(d > 0)
-  {
-    const float4 a = aux[glidx];
-    for(int c = 0; c < 4; c++) ocolor[c] = color[c] = a[c];
-  }
+  // h is 0 or 2, so the colors are picked with selects. The Radeon Pro
+  // 5500M's Metal compiler got .x and .z of the even directions after the
+  // first two wrong when this wrote a private float[4] at index h
+  float4 color = (d > 0) ? aux[glidx] : float4(0.0f);
+  const float4 ocolor = color;
 
   float diff = 0.0f;
 
@@ -269,25 +266,34 @@ void markesteijn_solitary_green(uint3 gid : SV_DispatchThreadID,
     const int k = 1 << c;
     const float4 pp = _rgb(rgb, x + k * dir.x, y + k * dir.y, width, height);
     const float4 pm = _rgb(rgb, x - k * dir.x, y - k * dir.y, width, height);
+    const float pph = (h == 0) ? pp.x : pp.z;
+    const float pmh = (h == 0) ? pm.x : pm.z;
     const float g = 2.0f * center.y - pp.y - pm.y;
-    color[h] = g + pp[h] + pm[h];
-    diff += (d > 1) ? fsquare(pp.y - pm.y - pp[h] + pm[h]) + fsquare(g) : 0.0f;
+    const float v = g + pph + pmh;
+    if(h == 0)
+      color.x = v;
+    else
+      color.z = v;
+    diff += (d > 1) ? fsquare(pp.y - pm.y - pph + pmh) + fsquare(g) : 0.0f;
   }
 
-  color[3] = diff;
+  color.w = diff;
 
-  if((d > 1) && (d & 1) != 0)
-    for(int c = 0; c < 2; c++) color[c * 2] = (ocolor[3] < diff) ? ocolor[c * 2] : color[c * 2];
+  if((d > 1) && (d & 1) != 0 && ocolor.w < diff)
+  {
+    color.x = ocolor.x;
+    color.z = ocolor.z;
+  }
 
   if((d < 2) || (d & 1) != 0)
   {
     float4 out = rgb[glidx];
-    out.x = color[0] / 2.0f;
-    out.z = color[2] / 2.0f;
+    out.x = color.x / 2.0f;
+    out.z = color.z / 2.0f;
     rgb[glidx] = out;
   }
 
-  aux[glidx] = float4(color[0], color[1], color[2], color[3]);
+  aux[glidx] = color;
 }
 
 // recalculate green from interpolated values of closer pixels.
