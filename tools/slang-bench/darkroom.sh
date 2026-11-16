@@ -48,6 +48,7 @@ run() { # <name> [extra args]
     --conf ui_last/window_w=${WINDOW%x*} --conf ui_last/window_h=${WINDOW#*x} \
     --conf ui_last/maximized=FALSE --conf ui_last/fullscreen=FALSE \
     --conf host_memory_limit=8192 --conf resourcelevel=default \
+    --conf ui/show_welcome_screen=FALSE \
     --luacmd "dofile('$HERE/darkroom.lua')" \
     -d lua -d pipe -d perf -d opencl -d slang -d tiling ${BENCH_ARGS:-} "$@" > "$OUT/$name.log" 2>&1 &
   local pid=$!
