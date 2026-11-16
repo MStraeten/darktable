@@ -44,7 +44,7 @@ run() { # <name> [extra args]
   cp "$IMG" "$work/img.$EXT"
   cp "$XMP" "$work/img.$EXT.xmp"
   BENCH_IMG=$work/img.$EXT BENCH_PANS=$PANS BENCH_WAIT_MS=$WAIT_MS \
-    "${XRUN[@]}" "$DT" --configdir "$OUT/config-$name" --library :memory: \
+    ${XRUN[@]+"${XRUN[@]}"} "$DT" --configdir "$OUT/config-$name" --library :memory: \
     --conf ui_last/window_w=${WINDOW%x*} --conf ui_last/window_h=${WINDOW#*x} \
     --conf ui_last/maximized=FALSE --conf ui_last/fullscreen=FALSE \
     --conf host_memory_limit=8192 --conf resourcelevel=default \
