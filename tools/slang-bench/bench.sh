@@ -22,7 +22,8 @@ RESOURCES=${RESOURCES:-default}
 HERE=$(cd "$(dirname "$0")" && pwd)
 CLI=$SRC/build/bin/darktable-cli
 [ -x "$CLI" ] || CLI=$(ls -d $SRC/build/bin/darktable-cli* 2>/dev/null | head -1)
-IMG=${IMG:-$SRC/src/tests/integration/images/mire1.cr2}
+DEFAULT_IMG=$SRC/src/tests/integration/images/mire1.cr2
+IMG=${IMG:-$DEFAULT_IMG}
 [ -f "$IMG" ] || { echo "no such image: $IMG" >&2; exit 1; }
 IMG=$(cd "$(dirname "$IMG")" && pwd)/$(basename "$IMG")
 XMP=${XMP:-scene-referred}
@@ -64,7 +65,8 @@ run slang  --disable-opencl --conf slang_gpu=TRUE
   echo "- os: $(uname -srm)"
   echo "- cpu: ${cpu# }"
   echo "- commit: $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null)"
-  echo "- image: $(basename "$IMG"), $(grep -m1 -oE 'export imgid [0-9]+, [0-9]+x[0-9]+' "$OUT/cpu.log" | awk '{print $NF}')"
+  # the summary gets posted: name the test image only, not people's photos
+  echo "- image: $([ "$IMG" = "$DEFAULT_IMG" ] && echo mire1.cr2 || echo "a .$EXT raw"), $(grep -m1 -oE 'export imgid [0-9]+, [0-9]+x[0-9]+' "$OUT/cpu.log" | awk '{print $NF}')"
   echo "- edit: $(basename "$XMP")"
   echo "- module memory: opencl $(grep -m1 -oE 'AVAILABLE MEM SIZE: +[0-9]+ MB' "$OUT/opencl.log" | grep -oE '[0-9]+ MB' || echo 'no OpenCL device'), slang $(grep -m1 -oE 'modules may use [0-9]+ MB' "$OUT/slang.log" | grep -oE '[0-9]+ MB' || echo 'not logged (Metal or no Slang device)')"
   echo "- slang device: $(grep -m1 -oE 'using (Vulkan|Metal) device .*' "$OUT/slang.log" | cut -d' ' -f2-)"

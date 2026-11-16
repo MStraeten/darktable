@@ -79,6 +79,25 @@ integrated one. To choose another, pass its index or part of its name, for
 example `BENCH_ARGS="--conf slang_gpu_device=nvidia"`; `slang.log` lists
 every device it found.
 
+### darkroom
+
+`darkroom.sh` times the darkroom instead of exports. It opens the raw in
+darktable, zooms to 100%, pans 8 times to new parts of the image, and zooms
+back to fit, once per path. The steps are driven by `darkroom.lua`, so
+darktable must be built with Lua (`-DUSE_LUA=ON`). The run also needs a
+display; on Linux without one, it starts under `xvfb-run`.
+
+```bash
+IMG=/path/to/large.raw XMP=heavy bash <darktable>/tools/slang-bench/darkroom.sh <darktable>
+```
+
+The results go to `darkroom-results/summary.md`. For each step, it lists
+the time until the full pipe finished, and for the 100% view the size the
+pipe rendered. Each step waits `WAIT_MS` (4000 by default). A pan whose
+pipe hasn't finished by then doesn't count, so raise `WAIT_MS` on slow
+devices. `WINDOW` sets the window size (1600x1000 by default), and `PATHS`
+picks the paths.
+
 ## report
 
 Post `summary.md` on darktable-org/darktable#22732, with your
