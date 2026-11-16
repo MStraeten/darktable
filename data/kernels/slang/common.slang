@@ -167,6 +167,27 @@ public float fp32_div(float a, float b)
   return fma(r, y, q);
 }
 
+// compensated radius for the lens kernels, see _radius_hypotf() in
+// ../common.h: dt_hypot() can be an ulp off, which moves where the lens
+// correction samples
+public float dt_radius_hypot(float x, float y)
+{
+  const float ax = abs(x), ay = abs(y);
+  const float a = max(ax, ay), b = min(ax, ay);
+  if(a == 0.0f) return 0.0f;
+
+  const float aa = a * a;
+  const float bb = b * b;
+  const float s = aa + bb;
+
+  const float e = ((aa - s) + bb)
+                + (fma(a, a, -aa) + fma(b, b, -bb));
+
+  const float h = sqrt(s);
+  const float residual = fma(-h, h, s) + e;
+  return fma(residual, fp32_div(0.5f, h), h);
+}
+
 public int FC(int row, int col, uint filters)
 {
   return int(filters >> ((((row) << 1 & 14) + ((col) & 1)) << 1) & 3);

@@ -3657,7 +3657,7 @@ static int _process_slang_md(dt_iop_module_t *self,
 
   const float w2 = 0.5f * roi_in->scale * piece->buf_in.width;
   const float h2 = 0.5f * roi_in->scale * piece->buf_in.height;
-  const float r = 1.0f / dt_fast_hypotf(w2, h2);
+  const float r = 1.0f / _radius_hypotf(w2, h2);
   const int knots = d->nc;
 
   const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
@@ -3726,7 +3726,7 @@ gboolean process_slang(dt_iop_module_t *self,
 
     const float w2 = 0.5f * roi_in->scale * piece->buf_in.width;
     const float h2 = 0.5f * roi_in->scale * piece->buf_in.height;
-    const float inv_maxr = 1.0f / dt_fast_hypotf(w2, h2);
+    const float inv_maxr = 1.0f / _radius_hypotf(w2, h2);
     const float strength = 2.0f * d->v_strength;
     const int splinesize = VIGSPLINES;
     const int vigmask = mask;
@@ -3843,7 +3843,7 @@ static int _distort_mask_slang_md(dt_iop_module_t *self,
 
   const float w2 = 0.5f * roi_in->scale * piece->buf_in.width;
   const float h2 = 0.5f * roi_in->scale * piece->buf_in.height;
-  const float r = 1.0f / dt_fast_hypotf(w2, h2);
+  const float r = 1.0f / _radius_hypotf(w2, h2);
   const int knots = d->nc;
 
   const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);

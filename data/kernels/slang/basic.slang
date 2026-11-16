@@ -1410,10 +1410,10 @@ float maketaps_lanczos(out float taps[MAX_KERNEL_REQ], const int num_taps, const
       const float r = vt[c] - float(a);
       const float sign = (a & 1) != 0 ? -1.0f : 1.0f;
       const float sine1 = vector_sin(M_PI_F * r);
-      const float sine2 = vector_sin(M_PI_F * vt[c] / width);
+      const float sine2 = vector_sin(M_PI_F * fp32_div(vt[c], width));
       const float num = (width * sign * sine1 * sine2) + 1e-9f;
       const float denom = (M_PI_F * M_PI_F * vt[c] * vt[c]) + 1e-9f;
-      taps[4 * i + c] = num / denom;
+      taps[4 * i + c] = fp32_div(num, denom);
     }
     vt += 4.0f * interval;
   }
@@ -1464,7 +1464,7 @@ float interpolation_compute_single(ImageIn in, const int itor_mode, const int it
         h += kernelh[j] * in.Areadpixel(clip_mirror(ix + j, width - 1), clip_mirror(iy + i, height - 1))[channel];
       s += kernelv[i] * h;
     }
-    s = s / (normh * normv);
+    s = s * fp32_div(1.0f, normh * normv);
   }
   return s;
 }
@@ -1496,7 +1496,7 @@ float4 interpolation_pixel4(ImageIn in, const float px, const float py, const in
     pixel += kv[i] * h;
   }
 
-  return pixel * (1.0f / (normh * normv));
+  return pixel * fp32_div(1.0f, normh * normv);
 }
 
 // rotatepixels in ../basic.cl
@@ -1801,12 +1801,12 @@ float _calc_vignette_spline(const float radius, StructuredBuffer<float> spline, 
 {
   if(radius >= 1.0f) return spline[splinesize - 1];
 
-  const float r = radius * float(splinesize - 1 - 1);
+  const float r = radius * float(splinesize - 1);
+  const float frac = r - trunc(r);
   const int i = int(r);
-  const float frac = r - float(i);
 
   const float p0 = spline[i];
-  return p0 + (spline[i + 1] - p0) * frac;
+  return fma(spline[i + 1] - p0, frac, p0);
 }
 
 // yi starts at yoff, for the rows of md_lens_correction's cor_rgb
@@ -1818,8 +1818,11 @@ float _interpolate_linear_spline(StructuredBuffer<float> xi, StructuredBuffer<fl
   {
     if(x >= xi[i - 1] && x <= xi[i])
     {
-      const float dydx = (yi[yoff + i] - yi[yoff + i - 1]) / (xi[i] - xi[i - 1]);
-      return yi[yoff + i - 1] + (x - xi[i - 1]) * dydx;
+      const float dx = x - xi[i - 1];
+      const float dy = yi[yoff + i] - yi[yoff + i - 1];
+      const float span = xi[i] - xi[i - 1];
+      const float dydx = fp32_div(dy, span);
+      return fma(dx, dydx, yi[yoff + i - 1]);
     }
   }
   return yi[yoff + ni - 1];
@@ -1839,7 +1842,7 @@ void md_vignette(uint3 gid : SV_DispatchThreadID,
 
   const float cx = (float(roix + x) - w2);
   const float cy = (float(roiy + y) - h2);
-  const float spline = _interpolate_linear_spline(knots_vig, vig, 0, knots, r * dt_fast_hypot(cx, cy));
+  const float spline = _interpolate_linear_spline(knots_vig, vig, 0, knots, r * dt_radius_hypot(cx, cy));
 
   float4 pixel = in.Areadpixel(x, y);
   const float mask = pixel.w;
@@ -1865,7 +1868,7 @@ void lens_man_vignette(uint3 gid : SV_DispatchThreadID,
 
   const float dx = (float(roix + x) - w2);
   const float dy = (float(roiy + y) - h2);
-  const float radius = dt_fast_hypot(dx, dy) * inv_maxr;
+  const float radius = dt_radius_hypot(dx, dy) * inv_maxr;
   const float val = max(0.0f, intensity * _calc_vignette_spline(radius, spline, splinesize));
 
   float4 pixel = in.Areadpixel(x, y);
@@ -1913,7 +1916,7 @@ void md_lens_correction(uint3 gid : SV_DispatchThreadID,
   const float iscale = fp32_div(1.0f, scale);
   const float cx = (float(roox + x) - w2) * iscale;
   const float cy = (float(rooy + y) - h2) * iscale;
-  const float radius = r * dt_fast_hypot(cx, cy);
+  const float radius = r * dt_radius_hypot(cx, cy);
   const float limw = float(iwidth) - 1.0f;
   const float limh = float(iheight) - 1.0f;
   float4 pixel;
@@ -1921,8 +1924,8 @@ void md_lens_correction(uint3 gid : SV_DispatchThreadID,
   {
     const int plane = (c == 3 || pass_mode != 0) ? 1 : c;
     const float dr = _interpolate_linear_spline(knots_dist, cor_rgb, plane * MAXKNOTS, knots, radius);
-    const float xs = clamp(dr * cx + w2 - roix, 0.0f, limw);
-    const float ys = clamp(dr * cy + h2 - roiy, 0.0f, limh);
+    const float xs = clamp(fma(dr, cx, w2) - roix, 0.0f, limw);
+    const float ys = clamp(fma(dr, cy, h2) - roiy, 0.0f, limh);
     pixel[c] = interpolation_compute_single(in, itor_mode, itor_width, xs, ys, iwidth, iheight, c);
   }
   out.write(int2(x, y), pixel);
