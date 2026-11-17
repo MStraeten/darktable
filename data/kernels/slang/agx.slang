@@ -98,26 +98,26 @@ float4 _agx_compress_into_gamut(float4 pixel)
 
   const float luminance_ratio =
     (y_new > y_compensate_negative && y_new > _epsilon)
-    ? y_compensate_negative / y_new
+    ? fp32_div(y_compensate_negative, y_new)
     : 1.f;
   return luminance_ratio * rgb_offset;
 }
 
 float _agx_apply_log_encoding(const float x, const float range_in_ev, const float min_ev)
 {
-  const float x_relative = max(_epsilon, x / 0.18f);
-  const float mapped = (log2(max(x_relative, 0.0f)) - min_ev) / range_in_ev;
+  const float x_relative = max(_epsilon, fp32_div(x, 0.18f));
+  const float mapped = fp32_div(log2(max(x_relative, 0.0f)) - min_ev, range_in_ev);
   return clipf(mapped);
 }
 
 float _agx_sigmoid(const float x, const float power)
 {
-  return x / dtcl_pow(1.0f + dtcl_pow(x, power), 1.0f / power);
+  return fp32_div(x, dtcl_pow(1.0f + dtcl_pow(x, power), fp32_div(1.0f, power)));
 }
 
 float _agx_scaled_sigmoid(const float x, const float scale, const float slope, const float power, const float transition_x, const float transition_y)
 {
-  return scale * _agx_sigmoid(slope * (x - transition_x) / scale, power) + transition_y;
+  return scale * _agx_sigmoid(slope * fp32_div(x - transition_x, scale), power) + transition_y;
 }
 
 float _agx_fallback_toe(const float x, const dt_iop_agx_tone_mapping_params_t params)
@@ -150,7 +150,7 @@ float _agx_apply_curve(const float x, const dt_iop_agx_tone_mapping_params_t par
 
 float _agx_apply_slope_offset(const float x, const float slope, const float offset)
 {
-  const float m = slope / (1.0f + offset);
+  const float m = fp32_div(slope, 1.0f + offset);
   const float b = offset * m;
   return m * x + b;
 }
