@@ -1093,15 +1093,6 @@ static size_t _pooled_bytes(void)
   return pooled + _staging_bytes();
 }
 
-size_t dt_slang_gpu_pooled_memory(void)
-{
-  if(!dt_slang_gpu_enabled()) return 0;
-  g_mutex_lock(&_mtl_lock);
-  const size_t pooled = _pooled_bytes();
-  g_mutex_unlock(&_mtl_lock);
-  return pooled;
-}
-
 void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
 {
   *available = 0;
