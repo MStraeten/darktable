@@ -2495,8 +2495,9 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
   {
     const size_t iplane = sizeof(float) * ch_in * roi_in->width * roi_in->height;
     const size_t oplane = sizeof(float) * ch_out * roi_out->width * roi_out->height;
-    // a converted input is a full image too
-    const size_t full = iplane + oplane + (convert ? iplane : 0) + tiling->overhead;
+    // as on OpenCL, a converted input replaces the input on the device, so
+    // only one input image stays
+    const size_t full = iplane + oplane + tiling->overhead;
     if(available > full + DT_MEGA)
     {
       strip_avail = available - full;
@@ -2567,6 +2568,17 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
       dev_in = NULL;
     }
     if(!resident) dt_slang_gpu_image_free(src);
+    // the strips were sized without the resident input, which the CPU
+    // fallback could otherwise need: it goes to its cacheline now
+    if(dev_in && resident && fast_tiling)
+    {
+      if(!_slang_sync_host(pipe))
+      {
+        dt_slang_gpu_image_free(dev_in);
+        return -1;
+      }
+      _slang_release(pipe);
+    }
   }
   const gboolean converted_on_device = dev_in != NULL;
 
