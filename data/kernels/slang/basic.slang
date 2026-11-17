@@ -1093,6 +1093,52 @@ void interpolation_resample(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), pixel);
 }
 
+// the two passes of _resample_slang() for downscaling: rows of tmp hold the
+// horizontal sums of input rows ymin.., summed in the order above
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void interpolation_resample_h(uint3 gid : SV_DispatchThreadID,
+                              uniform ImageIn in, uniform ImageOut tmp, uniform int width, uniform int rows,
+                              uniform int ymin, uniform StructuredBuffer<int> hmeta,
+                              uniform StructuredBuffer<int> hlength, uniform StructuredBuffer<int> hindex,
+                              uniform StructuredBuffer<float> hkernel)
+{
+  const int x = gid.x;
+  const int r = gid.y;
+  if(x >= width || r >= rows) return;
+
+  const int hl = hlength[hmeta[x * 3]];
+  const int hkidx = hmeta[x * 3 + 1];
+  const int hiidx = hmeta[x * 3 + 2];
+
+  float4 hpixel = float4(0.0f);
+  for(int ix = 0; ix < hl; ix++)
+    hpixel += in.readpixel(hindex[hiidx + ix], ymin + r) * hkernel[hkidx + ix];
+  tmp.write(int2(x, r), hpixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void interpolation_resample_v(uint3 gid : SV_DispatchThreadID,
+                              uniform ImageIn tmp, uniform ImageOut out, uniform int width, uniform int height,
+                              uniform int ymin, uniform StructuredBuffer<int> vmeta,
+                              uniform StructuredBuffer<int> vlength, uniform StructuredBuffer<int> vindex,
+                              uniform StructuredBuffer<float> vkernel)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int vl = vlength[vmeta[y * 3]];
+  const int vkidx = vmeta[y * 3 + 1];
+  const int viidx = vmeta[y * 3 + 2];
+
+  float4 pixel = float4(0.0f);
+  for(int iy = 0; iy < vl; iy++)
+    pixel += tmp.Areadpixel(x, vindex[viidx + iy] - ymin) * vkernel[vkidx + iy];
+  out.write(int2(x, y), pixel);
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void interpolation_copy(uint3 gid : SV_DispatchThreadID,

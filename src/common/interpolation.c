@@ -1490,6 +1490,41 @@ static int _resample_slang(const dt_interpolation_t *itor,
   for(int k = 0; k < width; k++) hmaxtaps = MAX(hmaxtaps, hlength[k]);
   for(int k = 0; k < height; k++) vmaxtaps = MAX(vmaxtaps, vlength[k]);
 
+  // when downscaling, the taps grow as 1/scale in each direction, and a
+  // 2D gather costs hl * vl reads per output pixel: about 20000 at the 0.04
+  // of a 42 MP thumbnail, 6 s on a UHD 620. The same sums split into a
+  // horizontal pass over the input rows the plan uses, then a vertical one,
+  // cost hl + vl reads per pixel and give the same result.
+  if(roi_out->scale < 1.0f)
+  {
+    int ymin = INT_MAX, ymax = -1;
+    for(int y = 0; y < height; y++)
+    {
+      const int vl = vlength[vmeta[y * 3]];
+      const int *vi = vindex + vmeta[y * 3 + 2];
+      for(int k = 0; k < vl; k++)
+      {
+        ymin = MIN(ymin, vi[k]);
+        ymax = MAX(ymax, vi[k]);
+      }
+    }
+    const int rows = ymax - ymin + 1;
+    dt_slang_gpu_image_t *tmp = rows > 0 ? dt_slang_gpu_image_new(width, rows, 4, NULL) : NULL;
+    err = !tmp
+      || dt_slang_gpu_run_2d_args("basic", "interpolation_resample_h", width, rows,
+           SLIMG_DEV(dev_in), SLIMG_DEV(tmp), SLARG(width), SLARG(rows), SLARG(ymin),
+           SLBUF(hmeta, sizeof(int) * width * 3), SLBUF(hlength, sizeof(int) * width),
+           SLBUF(hindex, sizeof(int) * width * (hmaxtaps + 1)),
+           SLBUF(hkernel, sizeof(float) * width * (hmaxtaps + 1)))
+      || dt_slang_gpu_run_2d_args("basic", "interpolation_resample_v", width, height,
+           SLIMG_DEV(tmp), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(ymin),
+           SLBUF(vmeta, sizeof(int) * height * 3), SLBUF(vlength, sizeof(int) * height),
+           SLBUF(vindex, sizeof(int) * height * (vmaxtaps + 1)),
+           SLBUF(vkernel, sizeof(float) * height * (vmaxtaps + 1)));
+    dt_slang_gpu_image_free(tmp);
+    goto error;
+  }
+
   // the same buffer sizes as dt_interpolation_resample_cl() copies
   err = dt_slang_gpu_run_2d_args("basic", "interpolation_resample", width, height,
           SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
