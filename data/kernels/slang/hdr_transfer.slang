@@ -27,8 +27,8 @@ public static const int DT_HDR_HLG_REC2020 = 2;
 public static const int DT_HDR_HLG_P3 = 3;
 
 // BT.2408 reference white; BT.2100 nominal HLG display, zero black
-static const float DT_HDR_REFERENCE_WHITE_NITS = 203.0f;
-static const float DT_HDR_PQ_PEAK_NITS = 10000.0f;
+public static const float DT_HDR_REFERENCE_WHITE_NITS = 203.0f;
+public static const float DT_HDR_PQ_PEAK_NITS = 10000.0f;
 static const float DT_HDR_HLG_PEAK_NITS = 1000.0f;
 static const float DT_HDR_HLG_SYSTEM_GAMMA = 1.2f;
 static const float DT_HDR_PQ_M1 = 2610.0f / 16384.0f;
@@ -81,6 +81,17 @@ public float dt_hdr_hlg_luminance(float3 rgb, int transfer)
     : 0.2627f * rgb[0] + 0.6780f * rgb[1] + 0.0593f * rgb[2];
 }
 
+// takes display light of luminance y to HLG scene light: the inverse of
+// the BT.2100 OOTF
+public float dt_hdr_hlg_scene_scale(float y)
+{
+  return y > 0.0f
+    ? pow(DT_HDR_REFERENCE_WHITE_NITS / DT_HDR_HLG_PEAK_NITS,
+          1.0f / DT_HDR_HLG_SYSTEM_GAMMA)
+      * pow(y, 1.0f / DT_HDR_HLG_SYSTEM_GAMMA - 1.0f)
+    : 0.0f;
+}
+
 public void dt_hdr_decode(inout float3 rgb, int transfer)
 {
   if(transfer == DT_HDR_PQ)
@@ -106,12 +117,7 @@ public void dt_hdr_encode(inout float3 rgb, int transfer)
   else if(transfer != DT_HDR_NONE)
   {
     for(int c = 0; c < 3; c++) rgb[c] = max(rgb[c], 0.0f);
-    const float y = dt_hdr_hlg_luminance(rgb, transfer);
-    const float scale = y > 0.0f
-      ? pow(DT_HDR_REFERENCE_WHITE_NITS / DT_HDR_HLG_PEAK_NITS,
-            1.0f / DT_HDR_HLG_SYSTEM_GAMMA)
-        * pow(y, 1.0f / DT_HDR_HLG_SYSTEM_GAMMA - 1.0f)
-      : 0.0f;
+    const float scale = dt_hdr_hlg_scene_scale(dt_hdr_hlg_luminance(rgb, transfer));
     for(int c = 0; c < 3; c++) rgb[c] = dt_hdr_hlg_encode(rgb[c] * scale);
   }
 }

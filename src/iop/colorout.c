@@ -475,9 +475,6 @@ gboolean process_slang(dt_iop_module_t *self,
       SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
       SLARG(zero), SLARG(zero));
   }
-  // the soft proof's clip and gamut marker are not in the Slang kernels
-  if(d->mode != DT_PROFILE_NORMAL) return FALSE;
-
   // the LittleCMS path as a 3D LUT, as _process_cl_clut()
   if(!dt_is_valid_colormatrix(d->cmatrix[0][0]))
   {
@@ -486,14 +483,12 @@ gboolean process_slang(dt_iop_module_t *self,
 
     const int level = CLUT_LEVEL;
     const size_t size = sizeof(float) * 3 * level * level * level;
-    const int gamutcheck = 0;
-    // without gamut check the kernel never reads the marker LUT
     return !dt_slang_gpu_run_2d_args("basic", "colorout_clut", width, height,
       SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
-      SLBUF(d->clut, size), SLARG(level), SLARG(gamutcheck),
-      SLBUF(d->clut, size), SLARG(d->hdr_transfer));
+      SLBUF(d->clut, size), SLARG(level), SLARG(d->hdr_transfer), SLARG(d->clip));
   }
 
+  const int gamutcheck = d->mode == DT_PROFILE_GAMUTCHECK;
   float cmatrix[9];
   pack_3xSSE_to_3x3(d->cmatrix, cmatrix);
 
@@ -501,7 +496,8 @@ gboolean process_slang(dt_iop_module_t *self,
     SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
     SLBUF(cmatrix, sizeof(cmatrix)), SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1),
     SLIMG_IN(d->lut[2], 256, 256, 1), SLBUF(d->unbounded_coeffs, sizeof(d->unbounded_coeffs)),
-    SLARG(d->hdr_transfer));
+    SLARG(d->hdr_transfer), SLARG(d->clip), SLARG(gamutcheck), SLARG(d->gamut_scale),
+    SLARG(d->gamut_tolerance), SLARG(d->gamut_black), SLARG(d->gamut_mark));
 }
 #endif
 

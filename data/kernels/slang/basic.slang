@@ -368,6 +368,31 @@ void colorin_rgb(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), pixel);
 }
 
+/* a soft proof's export clips the linear value rgb, see _out_of_gamut() in
+   colorout.c */
+static bool colorout_out_of_gamut(const float3 rgb,
+                                  const int hdr_transfer,
+                                  const float4 gamut_scale,
+                                  const float tolerance,
+                                  const float black)
+{
+  float3 scale = gamut_scale.xyz;
+  if(hdr_transfer == DT_HDR_PQ)
+  {
+    for(int c = 0; c < 3; c++) scale[c] = DT_HDR_REFERENCE_WHITE_NITS / DT_HDR_PQ_PEAK_NITS;
+  }
+  else if(hdr_transfer != DT_HDR_NONE)
+  {
+    const float3 positive = max(rgb, float3(0.0f));
+    const float hlg = dt_hdr_hlg_scene_scale(dt_hdr_hlg_luminance(positive, hdr_transfer));
+    for(int c = 0; c < 3; c++) scale[c] = hlg;
+  }
+  const float below = -tolerance * max(max(max(rgb[0], rgb[1]), rgb[2]), 0.0f) - black;
+  for(int c = 0; c < 3; c++)
+    if(rgb[c] < below || rgb[c] * scale[c] > 1.0f + tolerance) return true;
+  return false;
+}
+
 /* kernel for the plugin colorout, fast matrix + shaper path only */
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -375,7 +400,9 @@ void colorout(uint3 gid : SV_DispatchThreadID,
               uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
               uniform StructuredBuffer<float> mat,
               uniform ImageIn lutr, uniform ImageIn lutg, uniform ImageIn lutb,
-              uniform StructuredBuffer<float> a, uniform int hdr_transfer)
+              uniform StructuredBuffer<float> a, uniform int hdr_transfer,
+              uniform int clip, uniform int gamutcheck, uniform float4 gamut_scale,
+              uniform float gamut_tolerance, uniform float gamut_black, uniform float4 gamut_mark)
 {
   const int x = gid.x;
   const int y = gid.y;
@@ -391,10 +418,20 @@ void colorout(uint3 gid : SV_DispatchThreadID,
     rgb[i] = 0.0f;
     for(int j=0;j<3;j++) rgb[i] += mat[3*i+j]*XYZ[j];
   }
+  const bool marked = gamutcheck != 0
+    && colorout_out_of_gamut(rgb, hdr_transfer, gamut_scale, gamut_tolerance, gamut_black);
   dt_hdr_encode(rgb, hdr_transfer);
   pixel.x = lerp_lookup_unbounded0(lutr, rgb[0], a, 0);
   pixel.y = lerp_lookup_unbounded0(lutg, rgb[1], a, 1);
   pixel.z = lerp_lookup_unbounded0(lutb, rgb[2], a, 2);
+  // a soft proof clips as its integer export does
+  if(clip != 0)
+  {
+    pixel.x = clipf(pixel.x);
+    pixel.y = clipf(pixel.y);
+    pixel.z = clipf(pixel.z);
+  }
+  if(marked) pixel.xyz = gamut_mark.xyz;
   out.write(int2(x, y), pixel);
 }
 
@@ -404,8 +441,8 @@ void colorout(uint3 gid : SV_DispatchThreadID,
 [numthreads(16, 16, 1)]
 void colorout_clut(uint3 gid : SV_DispatchThreadID,
                    uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
-                   uniform StructuredBuffer<float> clut, uniform int level, uniform int gamutcheck,
-                   uniform StructuredBuffer<float> gamut, uniform int hdr_transfer)
+                   uniform StructuredBuffer<float> clut, uniform int level,
+                   uniform int hdr_transfer, uniform int clip)
 {
   const int x = gid.x;
   const int y = gid.y;
@@ -413,19 +450,16 @@ void colorout_clut(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   const float4 Lab = in.readpixel(x, y);
-  const float4 coord = clip4(float4(Lab.x / 100.0f, (Lab.y + 128.0f) / 255.0f, (Lab.z + 128.0f) / 255.0f, 0.0f));
+  const float4 coord = clip4(float4(fp32_div(Lab.x, 100.0f), fp32_div(Lab.y + 128.0f, 255.0f),
+                                    fp32_div(Lab.z + 128.0f, 255.0f), 0.0f));
   float4 pixel = dt_lut3d_tetrahedral(coord, clut, level);
   pixel.w = Lab.w;
 
-  // as _transform_lcms(): out of gamut, or negative, shows as cyan
-  if(gamutcheck != 0
-     && (dt_lut3d_tetrahedral(coord, gamut, level).x > 0.5f
-         || pixel.x < 0.0f || pixel.y < 0.0f || pixel.z < 0.0f))
-    pixel = float4(0.0f, 1.0f, 1.0f, 0.0f);
-
   float3 rgb = pixel.xyz;
   dt_hdr_encode(rgb, hdr_transfer);
-  pixel.xyz = rgb;
+  pixel.x = clip != 0 ? clipf(rgb[0]) : rgb[0];
+  pixel.y = clip != 0 ? clipf(rgb[1]) : rgb[1];
+  pixel.z = clip != 0 ? clipf(rgb[2]) : rgb[2];
   out.write(int2(x, y), pixel);
 }
 
