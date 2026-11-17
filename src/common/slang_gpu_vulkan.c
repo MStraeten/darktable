@@ -2464,6 +2464,17 @@ static VkDeviceSize _pooled_bytes(const gboolean staging)
   return pooled;
 }
 
+size_t dt_slang_gpu_pooled_memory(void)
+{
+  if(!dt_slang_gpu_enabled()) return 0;
+  g_mutex_lock(&_vk_lock);
+  // dt_slang_gpu_memory_info() counts the idle staging buffers only on an
+  // integrated GPU, where they share the heaps with the images
+  const VkDeviceSize pooled = _pooled_bytes(!_vk.discrete);
+  g_mutex_unlock(&_vk_lock);
+  return pooled;
+}
+
 void dt_slang_gpu_memory_info(size_t *available, int *max_dim)
 {
   *available = 0;

@@ -2501,6 +2501,17 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
     {
       strip_avail = available - full;
       const size_t per_line = sizeof(float) * MAX(ch_in, ch_out) * roi_in->width * MAX(tiling->factor_cl, 1.0f);
+      // strips in the memory the pools hold evict the full-size images the
+      // next modules need: on a Radeon 780M a 61 MP denoiseprofile took 3
+      // strips instead of 8 in the pooled memory, ran no faster, and lens and
+      // colorequal then waited 0.5 s each to allocate their images again. So
+      // the strips take the free memory, and of the pooled memory only what
+      // they need for at most 8 strips with three quarters of their rows
+      // besides the overlap
+      const size_t pooled = dt_slang_gpu_pooled_memory();
+      const size_t unpooled = available > full + pooled ? available - full - pooled : 0;
+      const size_t enough = per_line * MAX((size_t)8 * tiling->overlap, (size_t)roi_in->height / 8);
+      strip_avail = MIN(strip_avail, MAX(unpooled, enough));
       const int64_t lines = strip_avail / per_line;
       const int64_t valid = lines - 2 * tiling->overlap;
       fast_tiling = valid > 0 && valid > lines / 5;
