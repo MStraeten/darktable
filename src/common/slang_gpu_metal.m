@@ -75,6 +75,7 @@ typedef struct dt_slang_metal_t
   __strong NSMutableArray *staging;       // transfer buffers, see _staging_get()
   NSUInteger max_image_dim;
   gboolean private_storage; // device images and buffers in private storage
+  size_t pool_budget;       // bytes the image and buffer pools may keep together
   // host memory to free once its command buffer is done, as pairs of the
   // last command buffer committed before the free and an NSValue pointer
   __strong NSMutableArray<NSArray *> *deferred_free;
@@ -188,6 +189,17 @@ static gboolean _init_device(void)
   dt_print(DT_DEBUG_SLANG, "[slang_gpu] using Metal device %s%s%s", _mtl.dev.name.UTF8String,
            _mtl.dev.hasUnifiedMemory ? " (unified memory)" : "",
            _mtl.private_storage ? ", images in private storage" : "");
+  // the pools are idle memory OpenCL would not hold, so they stay within
+  // half of what a module may use, as on Vulkan. On unified memory that is
+  // system memory: four pooled 61 MP images and the demosaic buffers came to
+  // more than an 8 GB Mac had, and every path then ran into swap
+  const size_t limit = dt_slang_gpu_memory_limit(_mtl.dev.recommendedMaxWorkingSetSize,
+                                                 _mtl.dev.hasUnifiedMemory);
+  _mtl.pool_budget = limit / 2;
+  const int cap = dt_conf_get_int("slang_gpu_memory");
+  if(cap > 0) _mtl.pool_budget = MIN(_mtl.pool_budget, (size_t)cap << 20);
+  dt_print(DT_DEBUG_SLANG, "[slang_gpu] modules may use %zu MB, pools keep up to %zu MB",
+           limit >> 20, _mtl.pool_budget >> 20);
   return TRUE;
 }
 
@@ -1085,6 +1097,28 @@ void dt_slang_gpu_free_align(void *mem)
   if(!last) dt_free_align(mem);
 }
 
+// keeps the most recently freed images, then buffers, within pool_budget.
+// A pending command buffer keeps its own reference to what is dropped
+static void _trim_pools(void)
+{
+  size_t bytes = 0;
+  NSUInteger keep = 0;
+  for(; keep < _mtl.images.count; keep++)
+  {
+    bytes += _image_bytes(_mtl.images[keep]);
+    if(bytes > _mtl.pool_budget) break;
+  }
+  if(keep < _mtl.images.count)
+    [_mtl.images removeObjectsInRange:NSMakeRange(keep, _mtl.images.count - keep)];
+  for(keep = 0; keep < _mtl.buffers.count; keep++)
+  {
+    bytes += ((DtSlangBuffer *)_mtl.buffers[keep])->buffer.length;
+    if(bytes > _mtl.pool_budget) break;
+  }
+  if(keep < _mtl.buffers.count)
+    [_mtl.buffers removeObjectsInRange:NSMakeRange(keep, _mtl.buffers.count - keep)];
+}
+
 static size_t _pooled_bytes(void)
 {
   size_t pooled = 0;
@@ -1146,6 +1180,7 @@ void dt_slang_gpu_image_free(dt_slang_gpu_image_t *image)
   {
     [_mtl.images insertObject:img atIndex:0];
     while(_mtl.images.count > DT_SLANG_POOL_SIZE) [_mtl.images removeLastObject];
+    _trim_pools();
   }
   g_mutex_unlock(&_mtl_lock);
 }
@@ -1408,6 +1443,7 @@ void dt_slang_gpu_buffer_free(dt_slang_gpu_buffer_t *buffer)
   {
     [_mtl.buffers insertObject:buf atIndex:0];
     while(_mtl.buffers.count > DT_SLANG_BUFFER_POOL_SIZE) [_mtl.buffers removeLastObject];
+    _trim_pools();
   }
   g_mutex_unlock(&_mtl_lock);
 }
