@@ -1783,6 +1783,19 @@ static float *_blend_transform_buffer(const dt_dev_pixelpipe_t *pipe,
   return copy;
 }
 
+#ifdef HAVE_SLANG_GPU
+static void _slang_tiled_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
+                                          dt_iop_module_t *module,
+                                          dt_dev_pixelpipe_iop_t *piece,
+                                          const dt_iop_buffer_dsc_t *dsc_in,
+                                          const void *input,
+                                          void *output,
+                                          const dt_iop_roi_t *roi_in,
+                                          const dt_iop_roi_t *roi_out,
+                                          const size_t in_bpp,
+                                          const size_t out_bpp);
+#endif
+
 static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                                           dt_develop_t *dev,
                                           float *input,
@@ -1899,8 +1912,13 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                   dt_iop_colorspace_to_name(cst_to),
                   cst_to != cst_out ? " -> " : "",
                   cst_to != cst_out ? dt_iop_colorspace_to_name(cst_out) : "");
+    // the pipe's dsc as the module got it, for the CPU run of --opencl-diffstat
+    const dt_iop_buffer_dsc_t was_dsc = pipe->dsc;
     tiled_on_slang = !default_process_tiling_slang(module, piece, tmp, *output, roi_in, roi_out, in_bpp);
-    if(!tiled_on_slang)
+    if(tiled_on_slang)
+      _slang_tiled_diff_against_cpu(pipe, module, piece, &was_dsc, tmp, *output, roi_in, roi_out,
+                                    in_bpp, bpp);
+    else
       dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "slang fallback",
                     pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "running on the CPU");
   }
@@ -2957,6 +2975,47 @@ static void _slang_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
     }
   }
   dt_free_align(host_in);
+  dt_free_align(gpu_out);
+}
+
+// --opencl-diffstat and --dump-diff-pipe for default_process_tiling_slang(),
+// whose tiles leave input and output on the host, as for process_tiling_cl().
+// in_bpp and out_bpp are bytes per pixel
+static void _slang_tiled_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
+                                          dt_iop_module_t *module,
+                                          dt_dev_pixelpipe_iop_t *piece,
+                                          const dt_iop_buffer_dsc_t *dsc_in,
+                                          const void *input,
+                                          void *output,
+                                          const dt_iop_roi_t *roi_in,
+                                          const dt_iop_roi_t *roi_out,
+                                          const size_t in_bpp,
+                                          const size_t out_bpp)
+{
+  if(!(darktable.dump_diff_pipe || darktable.cldiff_stats)
+     || !_is_debug_pipe(pipe)
+     || ((module->flags() & IOP_FLAGS_HIDDEN) && (darktable.unmuted & DT_DEBUG_VERBOSE) == 0)
+     || pipe->mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE)
+    return;
+
+  const int cho = out_bpp / sizeof(float);
+  const size_t nfloats = (size_t)roi_out->width * roi_out->height * cho;
+  const gboolean visualize = darktable.cldiff_stats && dt_pipe_is_full(pipe) && dt_iop_has_focus(module);
+  gboolean do_diffstat, do_dumpfile;
+  float *gpu_out = _want_diff_against_cpu(module, in_bpp, cho, &do_diffstat, &do_dumpfile)
+                   ? dt_alloc_align_float(nfloats) : NULL;
+  if(!gpu_out) return;
+
+  dt_iop_image_copy(gpu_out, output, nfloats);
+  _diff_against_cpu(pipe, module, piece, dsc_in, input, gpu_out, roi_out, roi_in, in_bpp, cho,
+                    module->output_colorspace(module, pipe, piece), visualize,
+                    DT_DEVICE_NONE, "Slang diff stats");
+  if(visualize)
+  {
+    dt_iop_image_copy(output, gpu_out, nfloats);
+    dt_dev_pixelpipe_invalidate_cacheline(pipe, output, NULL);
+    pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+  }
   dt_free_align(gpu_out);
 }
 #endif // HAVE_SLANG_GPU
