@@ -217,7 +217,7 @@ void green_equilibration_lavg(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_Gr
   const int xul = x - int(lid.x) - 2;
   const int yul = y - int(lid.y) - 2;
   for(int k = int(lid.y * 16 + lid.x); k < 20 * 20; k += 256)
-    lavg_tile[k] = in.readsingle(xul + k % 20, yul + k / 20);
+    lavg_tile[k] = in.Areadsingle(clamp(xul + k % 20, 0, width - 1), clamp(yul + k / 20, 0, height - 1));
   GroupMemoryBarrierWithGroupSync();
 
   if(x >= width || y >= height) return;
@@ -225,8 +225,14 @@ void green_equilibration_lavg(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_Gr
   const int t0 = (int(lid.y) + 2) * 20 + int(lid.x) + 2;
 #define BUF(dx, dy) lavg_tile[t0 + (dy) * 20 + (dx)]
 
-  const float maximum = 1.0f;
   float o = BUF(0, 0);
+
+  // we don't correct the outermost two photosites as on CPU
+  if(x < 2 || y < 2 || x >= width - 2 || y >= height - 2)
+  {
+    out.write(int2(x, y), float4(o));
+    return;
+  }
 
   // check lines to be used as we do in cpu code
   int oj = 2, oi = 2;
@@ -234,9 +240,7 @@ void green_equilibration_lavg(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_Gr
   if(FC(oj, oi, filters) != GREEN) oi++;
   if(FC(oj, oi, filters) != GREEN) oj--;
 
-  const bool row_ok = (oj & 1) == (y & 1);
-  const bool col_ok = (oi & 1) == (x & 1);
-  if(row_ok && col_ok && x >= 2 && y >= 2 && x < width - 2 && y < height - 2)
+  if((oj & 1) == (y & 1) && (oi & 1) == (x & 1))
   {
     const float o1_1 = BUF(-1, -1);
     const float o1_2 = BUF(1, -1);
@@ -247,18 +251,18 @@ void green_equilibration_lavg(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_Gr
     const float o2_3 = BUF(-2, 0);
     const float o2_4 = BUF(2, 0);
 
-    const float m1 = (o1_1 + o1_2 + o1_3 + o1_4) / 4.0f;
-    const float m2 = (o2_1 + o2_2 + o2_3 + o2_4) / 4.0f;
+    const float m1 = fp32_div(o1_1 + o1_2 + o1_3 + o1_4, 4.0f);
+    const float m2 = fp32_div(o2_1 + o2_2 + o2_3 + o2_4, 4.0f);
 
-    if((m2 > 0.0f) && (m1 > 0.0f) && (m1 / m2 < maximum * 2.0f))
+    if(m2 > 0.0f && m1 > 0.0f && fp32_div(m1, m2) < 2.0f)
     {
-      const float c1 = (abs(o1_1 - o1_2) + abs(o1_1 - o1_3) + abs(o1_1 - o1_4) + abs(o1_2 - o1_3)
-                        + abs(o1_3 - o1_4) + abs(o1_2 - o1_4)) / 6.0f;
-      const float c2 = (abs(o2_1 - o2_2) + abs(o2_1 - o2_3) + abs(o2_1 - o2_4) + abs(o2_2 - o2_3)
-                        + abs(o2_3 - o2_4) + abs(o2_2 - o2_4)) / 6.0f;
+      const float c1 = fp32_div(abs(o1_1 - o1_2) + abs(o1_1 - o1_3) + abs(o1_1 - o1_4) + abs(o1_2 - o1_3)
+                                + abs(o1_3 - o1_4) + abs(o1_2 - o1_4), 6.0f);
+      const float c2 = fp32_div(abs(o2_1 - o2_2) + abs(o2_1 - o2_3) + abs(o2_1 - o2_4) + abs(o2_2 - o2_3)
+                                + abs(o2_3 - o2_4) + abs(o2_2 - o2_4), 6.0f);
 
-      if((o < maximum * 0.95f) && (c1 < maximum * thr) && (c2 < maximum * thr))
-        o = max(0.0f, o * m1 / m2);
+      if(o < 0.95f && c1 < thr && c2 < thr)
+        o = max(0.0f, fp32_div(o * m1, m2));
     }
   }
 #undef BUF
@@ -345,14 +349,12 @@ void green_equilibration_favg_apply(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   const float2 s = sums[0];
-  const float gr_ratio = (s.x > 0.0f && s.y > 0.0f) ? s.y / s.x : 1.0f;
+  const float gr_ratio = (s.x > 0.0f && s.y > 0.0f) ? fp32_div(s.y, s.x) : 1.0f;
 
-  float pixel = in.readsingle(x, y);
+  float pixel = in.Areadsingle(x, y);
 
-  const int c = FC(y, x, filters);
-
-  const bool isgreen1 = c == GREEN && (y & 1) == 0; // on even lines
-  if(isgreen1) pixel = max(0.0f, pixel * gr_ratio);
+  if(FC(y, x, filters) == GREEN && (y & 1) == 0) // only modify green locations on even lines
+    pixel = max(0.0f, pixel * gr_ratio);
   out.write(int2(x, y), float4(pixel));
 }
 
