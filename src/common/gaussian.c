@@ -1291,8 +1291,8 @@ int dt_gaussian_mean_blur_slang(dt_slang_gpu_buffer_t *buf,
   snprintf(transpose, sizeof(transpose), "gaussian_transpose_%dc", ch);
 
   const size_t size = sizeof(float) * ch * width * height;
-  dt_slang_gpu_buffer_t *temp1 = dt_slang_gpu_buffer_new(size, NULL);
-  dt_slang_gpu_buffer_t *temp2 = dt_slang_gpu_buffer_new(size, NULL);
+  dt_slang_gpu_buffer_t *temp1 = dt_slang_gpu_buffer_new_uninit(size);
+  dt_slang_gpu_buffer_t *temp2 = dt_slang_gpu_buffer_new_uninit(size);
 
   // the steps of dt_gaussian_blur_cl_buffer(): vertical pass, transpose,
   // vertical pass over the transposed buffer, transpose back
