@@ -1960,7 +1960,8 @@ int process_tiling_slang_fast(dt_dev_pixelpipe_iop_t *piece,
   const int valid = strip - 2 * border;
   if(valid < 1) return 1;
 
-  const int strips = (height + valid - 1) / valid;
+  // the first and the last strip end at the image, where they need no overlap
+  const int strips = strip >= height ? 1 : (height - 2 * border + valid - 1) / valid;
   dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_TILING,
                 "  *fast tiled* slang", pipe, module, DT_DEVICE_NONE, roi, NULL,
                 "%d strips of %d rows, overlap=%d, avail=%zuMB",
@@ -1975,10 +1976,11 @@ int process_tiling_slang_fast(dt_dev_pixelpipe_iop_t *piece,
   for_four_channels(k) processed_maximum_saved[k] = pipe->dsc.processed_maximum[k];
 
   pipe->tiling = TRUE;
-  for(int group = 0; group < height && ok; group += valid)
+  int rows = 0;
+  for(int group = 0; group < height && ok; group += rows)
   {
     const int first_in = MIN(MAX(group - border, 0), height - strip);
-    const int rows = MIN(valid, height - group);
+    rows = (first_in + strip >= height ? height : first_in + strip - border) - group;
     const dt_iop_roi_t troi = { roi->x, roi->y + first_in, width, strip, roi->scale };
     dt_print_pipe(DT_DEBUG_TILING | DT_DEBUG_VERBOSE, "    strip", pipe, module, DT_DEVICE_NONE, &troi, NULL,
                   "rows %d-%d of the output", group, group + rows - 1);
