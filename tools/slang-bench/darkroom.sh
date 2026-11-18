@@ -125,7 +125,7 @@ median() { sort -n | awk '{ v[NR] = $1 } END { if(NR) printf "%d", (NR % 2) ? v[
   echo "it was cached (fit usually is) or still running (raise WAIT_MS)"
   echo
   for p in $PATHS; do
-    echo "- tiled on $p: $(grep -oE "(fast tiling|\*tiled\*|process tiled)[^[]*\[T?(full|preview)\] +[a-z0-9_]+" "$OUT/$p.log" | awk '{print $NF}' | sort | uniq -c | awk '{printf "%s(%s) ", $2, $1}')"
+    echo "- tiled on $p: $(grep -oE "(fast tiling|\*tiled\*)[^[]*\[T?(full|preview)\] +[a-z0-9_]+" "$OUT/$p.log" | awk '{print $NF}' | sort | uniq -c | awk '{printf "%s(%s) ", $2, $1}')"
   done
   [ -f "$OUT/slang.log" ] && echo "- slang fallbacks/failures: $(grep -ciE 'slang (fallback|failure)' "$OUT/slang.log")"
 } > "$OUT/summary.md"
