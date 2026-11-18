@@ -1924,15 +1924,15 @@ gboolean process_slang(dt_iop_module_t *self,
   const int diffusion_scales = num_steps_to_reach_equivalent_sigma(B_SPLINE_SIGMA, final_radius);
   const int scales = CLAMP(diffusion_scales, 1, MAX_NUM_SCALES);
 
-  // the device holds 4 + scales images of the full size besides the input
-  // and output; without the memory for them the module runs on the CPU
-  dt_slang_gpu_image_t *temp1 = dt_slang_gpu_image_new(width, height, 4, NULL);
-  dt_slang_gpu_image_t *temp2 = dt_slang_gpu_image_new(width, height, 4, NULL);
+  // the device holds up to 4 + scales images of the full size besides the
+  // input and output; without the memory for them the module runs on the CPU
+  dt_slang_gpu_image_t *temp1 = _needs_temp1(data) ? dt_slang_gpu_image_new(width, height, 4, NULL) : NULL;
+  dt_slang_gpu_image_t *temp2 = _needs_temp2(data) ? dt_slang_gpu_image_new(width, height, 4, NULL) : NULL;
   dt_slang_gpu_image_t *mask = dt_slang_gpu_image_new(width, height, 1, NULL);
   dt_slang_gpu_image_t *LF_even = dt_slang_gpu_image_new(width, height, 4, NULL);
   dt_slang_gpu_image_t *LF_odd = dt_slang_gpu_image_new(width, height, 4, NULL);
   dt_slang_gpu_image_t *HF[MAX_NUM_SCALES] = { NULL };
-  int err = !temp1 || !temp2 || !mask || !LF_even || !LF_odd;
+  int err = (_needs_temp1(data) && !temp1) || (_needs_temp2(data) && !temp2) || !mask || !LF_even || !LF_odd;
   for(int s = 0; s < scales && !err; s++)
   {
     HF[s] = dt_slang_gpu_image_new(width, height, 4, NULL);
