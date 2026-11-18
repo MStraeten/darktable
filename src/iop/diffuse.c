@@ -1837,12 +1837,24 @@ static int _wavelets_process_slang(dt_slang_gpu_image_t *in,
     dt_slang_gpu_image_t *buffer_in = s == 0 ? in : s % 2 != 0 ? LF_odd : LF_even;
     dt_slang_gpu_image_t *buffer_out = s == 0 ? LF_odd : s % 2 != 0 ? LF_even : LF_odd;
 
-    if(dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_horizontal", width, height,
-         SLIMG_DEV(buffer_in), SLIMG_DEV(HF[s]), SLARG(width), SLARG(height), SLARG(mult))
-       || dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_vertical", width, height,
-         SLIMG_DEV(HF[s]), SLIMG_DEV(buffer_out), SLARG(width), SLARG(height), SLARG(mult))
-       || dt_slang_gpu_run_2d_args("bspline", "wavelets_detail_level", width, height,
-         SLIMG_DEV(buffer_in), SLIMG_DEV(buffer_out), SLIMG_DEV(HF[s]), SLARG(width), SLARG(height)))
+    if(s + 1 < scales)
+    {
+      // HF[s + 1] is not written yet and holds the horizontal blur; the
+      // vertical blur writes the low-frequency scale and HF = detail - LF
+      // in one pass
+      if(dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_horizontal", width, height,
+           SLIMG_DEV(buffer_in), SLIMG_DEV(HF[s + 1]), SLARG(width), SLARG(height), SLARG(mult))
+         || dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_vertical_detail", width, height,
+           SLIMG_DEV(HF[s + 1]), SLIMG_DEV(buffer_in), SLIMG_DEV(buffer_out), SLIMG_DEV(HF[s]),
+           SLARG(width), SLARG(height), SLARG(mult)))
+        return 1;
+    }
+    else if(dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_horizontal", width, height,
+              SLIMG_DEV(buffer_in), SLIMG_DEV(HF[s]), SLARG(width), SLARG(height), SLARG(mult))
+            || dt_slang_gpu_run_2d_args("bspline", "blur_2D_Bspline_vertical", width, height,
+              SLIMG_DEV(HF[s]), SLIMG_DEV(buffer_out), SLARG(width), SLARG(height), SLARG(mult))
+            || dt_slang_gpu_run_2d_args("bspline", "wavelets_detail_level", width, height,
+              SLIMG_DEV(buffer_in), SLIMG_DEV(buffer_out), SLIMG_DEV(HF[s]), SLARG(width), SLARG(height)))
       return 1;
 
     residual = buffer_out;

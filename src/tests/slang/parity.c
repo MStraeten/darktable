@@ -1731,6 +1731,9 @@ static int make_tests(test_t *t)
 
     TEST("blur_2D_Bspline_vertical", "bspline", "blur_2D_Bspline_vertical",
          IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("mult", 8));
+    TEST("blur_2D_Bspline_vertical_detail", "bspline", "blur_2D_Bspline_vertical_detail",
+         IMG_IN("in", image_in), IMG_IN("detail", image_lab), IMG_OUT("LF"), IMG_OUT("HF"), INT("width", W),
+         INT("height", H), INT("mult", 8));
     TEST("blur_2D_Bspline_horizontal", "bspline", "blur_2D_Bspline_horizontal",
          IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("mult", 4));
     TEST("wavelets_detail_level", "bspline", "wavelets_detail_level",

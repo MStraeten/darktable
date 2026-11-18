@@ -48,6 +48,33 @@ void blur_2D_Bspline_vertical(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), max(accumulator, float4(0.f)));
 }
 
+// blur_2D_Bspline_vertical followed by wavelets_detail_level in one pass:
+// LF is the vertical blur of `in`, HF = detail - LF
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void blur_2D_Bspline_vertical_detail(uint3 gid : SV_DispatchThreadID,
+                                     uniform ImageIn in, uniform ImageIn detail,
+                                     uniform ImageOut LF, uniform ImageOut HF,
+                                     uniform int width, uniform int height, uniform int mult)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 accumulator = float4(0.f);
+
+  [unroll]
+  for(int jj = 0; jj < FSIZE; ++jj)
+  {
+    const int yy = mult * (jj - FSTART) + y;
+    accumulator += filter[jj] * in.Areadpixel(x, clamp(yy, 0, height - 1));
+  }
+
+  const float4 lf = max(accumulator, float4(0.f));
+  LF.write(int2(x, y), lf);
+  HF.write(int2(x, y), detail.Areadpixel(x, y) - lf);
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void blur_2D_Bspline_horizontal(uint3 gid : SV_DispatchThreadID,
